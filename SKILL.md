@@ -1,6 +1,6 @@
 ---
 name: claude-account-guard
-description: 检测并自动清理 Claude Code 的本机环境——出口 IP 与 ASN 类型、系统代理与终端残留、DNS 与 WebRTC 泄漏、IPv6、时区分层与两道闸、settings.json 里的中转端点、钥匙串条目、shell 与 npm/git 的代理配置、第三方客户端痕迹、CLI 完整性与多账号痕迹。适用于登录前环境自检、被封后换环境前的排查、日常巡检；只针对 Claude Code，不涉及账号申诉、付款或网页端设置。
+description: 检测并自动清理 Claude Code 的本机环境（macOS）。一条命令跑完 25 项：出口 IP 与 ASN 类型是不是住宅、出口是否和上次一致、系统代理残留、DNS 与 WebRTC 有没有泄漏真实 IP、IPv6 有没有绕过隧道、时区分层与两道闸、浏览器 Intl 区域设置、settings.json 里的中转端点与凭据、遥测三键、第三方客户端痕迹、CLI 签名完整性、多账号痕迹、失效权限条目、过期工作树注册；检测完可自动清掉安全可逆的残留，改前先备份。Use when the user asks to check, audit, clean or harden a Claude Code / Claude environment on macOS：环境体检、登录前自检、被封后换环境前的排查、代理残留、DNS 泄漏、WebRTC 泄漏、出口 IP 与节点检查、时区不一致、账号风控排查。Claude Code environment audit, proxy / DNS / WebRTC leak check, exit IP and ASN, macOS only；不涉及账号申诉、付款或网页端设置。
 ---
 
 # Claude Code 环境检测与自动清理
