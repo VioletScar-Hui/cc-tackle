@@ -168,11 +168,20 @@ python3 tests/test_account_guard.py
 
 ## 参考来源
 
-检查项的取材与逐条对照见 `references/article-mapping.md`，主要来源是一篇公开长文：
+检查项的取材与逐条对照见 `references/article-mapping.md`。主要来源是一篇公开长文：
 
-《你的 Claude 账号是怎么被封的》 https://x.com/AYi_AInotes/status/2106639522586829094
+**《你的 Claude 账号是怎么被封的》**
+https://x.com/AYi_AInotes/status/2106639522586829094
 
-文中引用的三篇复盘贴也一并记在映射文件里。原文自带的两个推广链接（住宅代理服务商、新加坡卡）没有收录。
+原文自己引用的三篇材料也一并留着，免得日后只剩结论、丢了出处：
+
+- 陈大黄复盘贴 https://x.com/realchendahuang/status/2104455272614035947
+- 实践哥复盘贴 https://x.com/MinLiBuilds/status/2105890192108536029 —— 「内容也别碰红线」那一条的出处（§4）
+- wangray《半年稳定的配置》 https://x.com/wangray/status/2105658146685608265
+
+原文文末自带两条推广（住宅代理服务商 `equaldcdn.com/?ref=…`、新加坡卡 `sg.starryblu.com/x/…`），原文自己标了广告，没有收进来，也没有作为任何检查项的依据。
+
+检查项里用到的检测网站，逐条标了对应的文章小节，见 `SKILL.md` 的「手工核对清单与检测网站」一节；`python3 scripts/account_guard.py --commands` 会把同一份清单打出来。
 
 ## License
 
