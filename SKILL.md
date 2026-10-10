@@ -507,3 +507,14 @@ curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/configs \
 ```
 
 第一条全 0、第二条是预期出口、第三条是 `rule`（或 `global`），就没大问题。
+
+## 参考来源
+
+检查项的取材与逐条对照见 `references/article-mapping.md`。来源是一篇公开长文，以及它自己引用的三篇材料：
+
+- 《你的 Claude 账号是怎么被封的》 https://x.com/AYi_AInotes/status/2106639522586829094
+- 陈大黄复盘贴 https://x.com/realchendahuang/status/2104455272614035947
+- 实践哥复盘贴 https://x.com/MinLiBuilds/status/2105890192108536029
+- wangray《半年稳定的配置》 https://x.com/wangray/status/2105658146685608265
+
+原文文末自带的两条推广（住宅代理服务商、新加坡卡）没有收进来，也没有作为任何检查项的依据。
