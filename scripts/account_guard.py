@@ -54,6 +54,15 @@ GEO_WORDS = (
     "Beijing", "Shanghai", "Shenzhen", "China", "mainland",
 )
 
+# 地理词的匹配式：前后不许紧挨着斜杠或字母数字。
+# 因为 `Asia/Shanghai`、`ZoneInfo('Asia/Shanghai')`、`ChinaMobile` 这类是技术写法，
+# 字面含地名却跟「写自己人在哪」无关 —— 实测撞过一次：某个仓的 CLAUDE.md 里写着
+# 「业务日按 Asia/Shanghai」，被报成「地理位置词 1 处，会随 prompt 送给模型」。
+# 尾部的点不能排除（句号收尾的 China. 是真命中），所以只排除字母数字和下划线。
+GEO_WORD_RE = re.compile(
+    r"(?<![A-Za-z0-9_/])(?:" + "|".join(re.escape(w) for w in GEO_WORDS) + r")(?![A-Za-z0-9_])"
+)
+
 CLASH_SOCK = pathlib.Path("/tmp/verge/verge-mihomo.sock")
 # Clash Verge 出厂就带这个 secret，没改过的话它适用于所有本机部署；
 # 改过就用环境变量 CLASH_SECRET 覆盖，别把某个人的 secret 写进代码。
@@ -1142,9 +1151,9 @@ def check_geo_words() -> dict:
         except OSError:
             continue
         out["scanned"] += 1
-        for w in GEO_WORDS:
-            if w in text:
-                out["hits"].append({"file": sp, "word": w})
+        for m in GEO_WORD_RE.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            out["hits"].append({"file": sp, "word": m.group(0), "line": line})
     if not project_roots():
         out["note"] = "只扫了家目录；设置 CLAUDE_GUARD_PROJECT_ROOTS 可连项目级 CLAUDE.md 一起扫"
     return out
@@ -2755,6 +2764,17 @@ def check_local_git() -> dict:
             out["note"] = f"目录不存在：{root}"
             continue
         out["roots"].append(str(root))
+        # 根本身就是一个仓时只用它自己，不再往下数：skill 装在仓里时
+        # （`.claude/skills/<名字>/`）项目根就是那个仓，往下扫会把 backend、docs
+        # 这些普通子目录报成「没做版本控制」，那是假警报。
+        # 注意 `.git` 在 worktree 里是文件不是目录，所以判存在而不是判目录。
+        if (root / ".git").exists():
+            out["repos"].append(str(root))
+            code, body = run(["git", "-C", str(root), "status", "--porcelain"], timeout=30)
+            if code == 0 and body.strip():
+                out["dirty"].append({"repo": str(root),
+                                     "changed": len(body.strip().splitlines())})
+            continue
         # 只看一到两层，避免在大仓库里扫穿
         for child in sorted(root.iterdir()):
             if not child.is_dir() or child.name.startswith("."):

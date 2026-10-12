@@ -200,14 +200,40 @@ SUMMARY_RE = re.compile(
 )
 
 
-def check_audit():
+def project_roots_default() -> tuple:
+    """A14 / A24 要扫的项目根：环境变量没给时按什么来。
+
+    三级兜底，选中的那一级会打出来 —— 扫描范围静默换掉比不扫更糟：
+      1. 环境变量 CLAUDE_GUARD_PROJECT_ROOTS 已经给了，用它的；
+      2. 本 skill 装在某个 git 仓里（形如 `.claude/skills/<名字>/`），就用那个仓的根，
+         这正是 A14「代码有没有落在本地 Git」要问的那个仓；
+      3. 老位置 `~/ipe`（本机一直这么跑，保留以免换个默认值就少判两项）。
+    三级都读不到就留空，体检自己会说明怎么开。
+    """
+    given = os.environ.get("CLAUDE_GUARD_PROJECT_ROOTS", "").strip()
+    if given:
+        return given, "环境变量指定"
+    code, out = sh(["git", "-C", str(SKILL), "rev-parse", "--show-toplevel"], timeout=20)
+    top = out.strip().splitlines()[0].strip() if out.strip() else ""
+    if code == 0 and top.startswith("/"):
+        return top, f"本 skill 所在的 git 仓 {top}"
+    legacy = Path.home() / "ipe"
+    if legacy.is_dir():
+        return str(legacy), f"默认位置 {legacy}"
+    return "", "没有可用的项目根，这一项会被跳过"
+
+
+def check_audit(project_roots: str = ""):
     """跑完整体检，返回 (报告路径, 报告字典)。
 
     第二项留给调用方展开成逐条明细。读不出来时为 None —— 那种情况下汇总行已经
     打印了，不值得为了展开不了而把整项判成失败。
     """
     env = dict(os.environ)
-    env.setdefault("CLAUDE_GUARD_PROJECT_ROOTS", str(Path.home() / "ipe"))
+    if project_roots:
+        env["CLAUDE_GUARD_PROJECT_ROOTS"] = project_roots
+    else:
+        env.pop("CLAUDE_GUARD_PROJECT_ROOTS", None)
     code, out = sh([sys.executable, str(HERE / "account_guard.py"), "--audit"],
                    timeout=900, cwd=SKILL, env=env)
     m = SUMMARY_RE.search(out)
@@ -238,6 +264,9 @@ def main() -> int:
     ap.add_argument("--no-audit", action="store_true", help="跳过完整环境体检")
     args = ap.parse_args()
 
+    # 项目根先定下来：它会决定体检里 A14 / A24 扫哪儿，选中的那一级要打出来。
+    roots, roots_source = project_roots_default()
+
     print(f"claude-account-guard 一键自检  ——  {SKILL}")
     print("只读，不改任何配置。\n")
 
@@ -255,7 +284,7 @@ def main() -> int:
     if args.no_audit:
         add("完整环境体检", HINT, "--no-audit 跳过了")
     else:
-        report_path, report = check_audit()
+        report_path, report = check_audit(roots)
 
     # 逐条展开用报告自己算，不把判定重写一遍 —— 否则展开和 --audit 迟早各说各话。
     sub_rows = g.build_summary(report) if report else []
@@ -277,6 +306,7 @@ def main() -> int:
     if report_path:
         print()
         print(f"  完整体检报告（未截断的全文在里面）：{report_path}")
+    print(f"  项目根（A14 / A24 扫这里）：{roots or '未指定'}　—　{roots_source}")
     if n_bad:
         print(f"\n  有 {n_bad} 项没过。逐项看：python3 scripts/account_guard.py --commands")
     else:
