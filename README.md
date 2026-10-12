@@ -47,7 +47,7 @@ python3 scripts/account_guard.py --audit
 python3 scripts/selfcheck.py
 ```
 
-把语法编译、单元测试、LaunchAgent、Clash 内核状态、系统代理四开关、完整环境体检串成七项，跑完出两张表。加 `--fast` 跳过单测（约 20 秒）。
+把「技能文件齐全 → 语法编译 → 单元测试 → LaunchAgent → Clash 内核状态 → 系统代理四开关 → 完整环境体检」串成七项，跑完出两张表（第二张是体检那 25 项的逐条展开）。加 `--fast` 跳过单测（约 20 秒）。脚本按自己的位置定位，从任何工作目录调用都行。
 
 ## 完整加固（会改状态）
 
@@ -96,7 +96,7 @@ python3 scripts/account_guard.py --check-locale  # 同上，复核浏览器 Intl
 
 ## 两个环境变量
 
-- `CLAUDE_GUARD_PROJECT_ROOTS` —— 项目根目录，冒号分隔，例如 `$HOME/code`。不给会跳过「项目级 .claude 规模」与「过期工作树注册」两项。
+- `CLAUDE_GUARD_PROJECT_ROOTS` —— 项目根目录，冒号分隔，例如 `$HOME/code`。不设时按「本 skill 所在的 git 仓 → 默认位置」的顺序自动找（skill 装在仓库里就是那个仓库），都找不到才跳过「项目级 .claude 规模」与「过期工作树注册」两项。一键自检会在末尾打印最终选中的是哪一个。
 - `CLASH_SECRET` —— Clash 的 external-controller secret，默认 `set-your-secret`（Clash Verge 的默认占位值）。改过 secret 就设这个变量，否则 Clash 相关的几项读不到。
 
 ## 退出码
@@ -155,7 +155,7 @@ git clone https://github.com/VioletScar-Hui/claude-account-guard.git ~/.claude/s
 │   ├── account_guard.py        # 主体
 │   └── selfcheck.py            # 七项自检
 ├── tests/
-│   └── test_account_guard.py   # 413 个用例
+│   └── test_account_guard.py   # 422 个用例
 └── references/
     └── article-mapping.md      # 每一项对应到参考文章哪一节
 ```

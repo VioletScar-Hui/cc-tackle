@@ -4318,6 +4318,78 @@ class TestTerminalEnvRedactsCredentials(unittest.TestCase):
         self.assertNotIn("u:p@", blob)
 
 
+class TestGeoWordMatching(unittest.TestCase):
+    """地理词不许匹配技术写法 —— `Asia/Shanghai` 不是「写自己人在哪」。"""
+
+    def test_timezone_identifier_is_not_a_hit(self):
+        for text in ("业务日按 Asia/Shanghai", "ZoneInfo('Asia/Shanghai')",
+                     "TZ=Asia/Shanghai", "America/Chicago 与 Asia/Shanghai"):
+            self.assertIsNone(g.GEO_WORD_RE.search(text), text)
+
+    def test_glued_brand_names_are_not_hits(self):
+        for text in ("ChinaMobile 的接口", "ShenzhenAirport", "beijing_time"):
+            self.assertIsNone(g.GEO_WORD_RE.search(text), text)
+
+    def test_a_plain_mention_is_still_a_hit(self):
+        for text in ("我人在北京", "办公地点在上海。", "China.", "based in Shenzhen"):
+            self.assertIsNotNone(g.GEO_WORD_RE.search(text), text)
+
+    def test_a_sentence_final_period_does_not_hide_the_hit(self):
+        """句号收尾是真命中，尾部不能把点也排除掉。"""
+        m = g.GEO_WORD_RE.search("数据中心在 China.")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(0), "China")
+
+    def test_hits_carry_the_line_number(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-geo-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "CLAUDE.md").write_text("第一行\n我人在北京\n", encoding="utf-8")
+        with mock.patch.object(g, "HOME", tmp), \
+             mock.patch.object(g, "project_roots", return_value=[]):
+            out = g.check_geo_words()
+        self.assertEqual(len(out["hits"]), 1)
+        self.assertEqual(out["hits"][0]["line"], 2)
+
+
+class TestLocalGitRootMayBeARepo(unittest.TestCase):
+    """项目根本身就是一个仓时，必须算它，且不许把子目录报成没版本控制。"""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-git-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_root_that_is_a_repo_is_counted(self):
+        repo = self.tmp / "myrepo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "backend").mkdir()
+        (repo / "docs").mkdir()
+        with mock.patch.dict(g.os.environ, {"CLAUDE_GUARD_PROJECT_ROOTS": str(repo)}), \
+             mock.patch.object(g, "run", return_value=(0, "")):
+            out = g.check_local_git()
+        self.assertEqual(out["repos"], [str(repo)])
+        self.assertEqual(out["no_git"], [], "子目录不是独立仓库，不该报没版本控制")
+
+    def test_worktree_git_file_also_counts(self):
+        """worktree 里的 .git 是文件不是目录 —— 判存在不判目录。"""
+        repo = self.tmp / "wt"
+        repo.mkdir()
+        (repo / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n", encoding="utf-8")
+        with mock.patch.dict(g.os.environ, {"CLAUDE_GUARD_PROJECT_ROOTS": str(repo)}), \
+             mock.patch.object(g, "run", return_value=(0, "")):
+            out = g.check_local_git()
+        self.assertEqual(out["repos"], [str(repo)])
+
+    def test_container_root_still_scans_children(self):
+        """老用法（根是放仓的容器目录）不能改坏。"""
+        (self.tmp / "repo-a" / ".git").mkdir(parents=True)
+        (self.tmp / "plain").mkdir()
+        with mock.patch.dict(g.os.environ, {"CLAUDE_GUARD_PROJECT_ROOTS": str(self.tmp)}), \
+             mock.patch.object(g, "run", return_value=(0, "")):
+            out = g.check_local_git()
+        self.assertEqual(out["repos"], [str(self.tmp / "repo-a")])
+        self.assertEqual(out["no_git"], [str(self.tmp / "plain")])
+
+
 if __name__ == "__main__":
     # 这个块必须待在文件最末尾。2026-10-10 发现它一度停在中间（第 2403 行），
     # 于是它后面定义的 6 个类、40 个用例从来没被执行过——`unittest.main()` 在第 2403
