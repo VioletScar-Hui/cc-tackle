@@ -155,7 +155,7 @@ git clone https://github.com/VioletScar-Hui/claude-account-guard.git ~/.claude/s
 │   ├── account_guard.py        # 主体
 │   └── selfcheck.py            # 七项自检
 ├── tests/
-│   └── test_account_guard.py   # 348 个用例
+│   └── test_account_guard.py   # 413 个用例
 └── references/
     └── article-mapping.md      # 每一项对应到参考文章哪一节
 ```
