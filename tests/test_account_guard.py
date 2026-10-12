@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import pathlib
 import plistlib
 import shutil
@@ -3109,57 +3110,136 @@ class TestClearBrowserLocale(unittest.TestCase):
 class TestChromeNeedsRestart(unittest.TestCase):
     """应用语言改完之后 Chrome 要重启才吃得到；判定不许猜。"""
 
-    def _pref_home(self, age_seconds: float = 600):
-        tmp = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        pref = tmp / "Library/Preferences" / (g.CHROME_APP_DOMAIN + ".plist")
-        pref.parent.mkdir(parents=True)
-        pref.write_text("x", encoding="utf-8")
-        started = g.dt.datetime.fromtimestamp(pref.stat().st_mtime - age_seconds)
-        return tmp, started.strftime("%a %b %d %H:%M:%S %Y")
-
-    def test_started_before_the_change_needs_restart(self):
-        home, lstart = self._pref_home(age_seconds=600)
-
+    def _fake(self, lstart):
         def fake(cmd, **kw):
             if cmd[0] == "pgrep":
                 return 0, "711\n"
             if cmd[0] == "env":
                 return 0, lstart + "\n"
             return 0, ""
+        return fake
 
-        with mock.patch.object(g, "HOME", home), mock.patch.object(g, "run", side_effect=fake):
-            self.assertTrue(g.chrome_needs_restart())
+    def _lstart(self, when):
+        return when.strftime("%a %b %d %H:%M:%S %Y")
+
+    def test_started_before_the_change_needs_restart(self):
+        now = g.dt.datetime.now()
+        with mock.patch.object(g, "run",
+                               side_effect=self._fake(self._lstart(now - g.dt.timedelta(hours=2)))):
+            self.assertTrue(
+                g.chrome_needs_restart((now - g.dt.timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")))
 
     def test_started_after_the_change_is_already_effective(self):
-        home, _ = self._pref_home(age_seconds=-600)  # 进程比改动晚启动
-
-        def fake(cmd, **kw):
-            if cmd[0] == "pgrep":
-                return 0, "711\n"
-            if cmd[0] == "env":
-                return 0, g.dt.datetime.now().strftime("%a %b %d %H:%M:%S %Y") + "\n"
-            return 0, ""
-
-        with mock.patch.object(g, "HOME", home), mock.patch.object(g, "run", side_effect=fake):
-            self.assertFalse(g.chrome_needs_restart())
+        now = g.dt.datetime.now()
+        with mock.patch.object(g, "run", side_effect=self._fake(self._lstart(now))):
+            self.assertFalse(
+                g.chrome_needs_restart((now - g.dt.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")))
 
     def test_no_chrome_running_is_unknown(self):
         with mock.patch.object(g, "run", return_value=(1, "")):
-            self.assertIsNone(g.chrome_needs_restart())
+            self.assertIsNone(g.chrome_needs_restart("2026-10-01 00:00"))
 
     def test_unparsable_lstart_is_unknown(self):
-        home, _ = self._pref_home()
+        with mock.patch.object(g, "run", side_effect=self._fake("周五 10月  9 12:00:00 2026")):
+            self.assertIsNone(g.chrome_needs_restart("2026-10-01 00:00"))
 
-        def fake(cmd, **kw):
-            if cmd[0] == "pgrep":
-                return 0, "711\n"
-            if cmd[0] == "env":
-                return 0, "周五 10月  9 12:00:00 2026\n"  # 本地化过的 ps 输出
-            return 0, ""
+    def test_plist_mtime_alone_is_not_evidence(self):
+        """这是被修掉的假阳性：没有「这份值什么时候改的」记录时不许下结论。
 
-        with mock.patch.object(g, "HOME", home), mock.patch.object(g, "run", side_effect=fake):
-            self.assertIsNone(g.chrome_needs_restart())
+        Chrome 运行时会重写它自己那份偏好 plist，mtime 天天动；拿 mtime 判会
+        在什么都没改的情况下天天报「要重启」。
+        """
+        now = g.dt.datetime.now()
+        with mock.patch.object(g, "run",
+                               side_effect=self._fake(self._lstart(now - g.dt.timedelta(hours=2)))):
+            self.assertIsNone(g.chrome_needs_restart(None))
+            self.assertIsNone(g.chrome_needs_restart(""))
+
+    def test_unparsable_change_time_is_unknown(self):
+        now = g.dt.datetime.now()
+        with mock.patch.object(g, "run", side_effect=self._fake(self._lstart(now))):
+            self.assertIsNone(g.chrome_needs_restart("昨天"))
+
+
+class TestLocaleChangeTime(unittest.TestCase):
+    """改动的时刻只有「我们亲手改过」才有依据，不许拿启发式凑一个。"""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-rollback-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._home, self._rb = g.HOME, g.LOCALE_ROLLBACK_FILE
+        g.HOME = self.tmp
+        g.LOCALE_ROLLBACK_FILE = self.tmp / "state" / "browser-locale-rollback.json"
+        self.addCleanup(lambda: setattr(g, "HOME", self._home))
+        self.addCleanup(lambda: setattr(g, "LOCALE_ROLLBACK_FILE", self._rb))
+
+    def _rollback(self, payload):
+        g.LOCALE_ROLLBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(payload, str):
+            g.LOCALE_ROLLBACK_FILE.write_text(payload, encoding="utf-8")
+        else:
+            g.LOCALE_ROLLBACK_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_no_rollback_file_means_no_evidence(self):
+        self.assertIsNone(g.locale_change_time(["en-US"]))
+
+    def test_our_own_edit_is_evidence(self):
+        self._rollback({"at": "2026-10-09 22:00", "after": ["en-US"]})
+        self.assertEqual(g.locale_change_time(["en-US"]), "2026-10-09 22:00")
+
+    def test_a_different_value_is_not_evidence(self):
+        """凭据里改成的是 zh-CN，而现在读出来是 en-US —— 说明这次改动不是我们做的。"""
+        self._rollback({"at": "2026-10-09 22:00", "after": ["zh-CN"]})
+        self.assertIsNone(g.locale_change_time(["en-US"]))
+
+    def test_corrupt_rollback_file_is_not_evidence(self):
+        self._rollback("{ 不是 json")
+        self.assertIsNone(g.locale_change_time(["en-US"]))
+
+    def test_non_dict_rollback_file_is_not_evidence(self):
+        self._rollback("[1, 2, 3]")
+        self.assertIsNone(g.locale_change_time(["en-US"]))
+
+    def test_missing_after_key_is_not_evidence(self):
+        self._rollback({"at": "2026-10-09 22:00"})
+        self.assertIsNone(g.locale_change_time(["en-US"]))
+
+    def test_missing_at_key_is_not_evidence(self):
+        self._rollback({"after": ["en-US"]})
+        self.assertIsNone(g.locale_change_time(["en-US"]))
+
+    def test_no_languages_means_no_evidence(self):
+        self._rollback({"at": "2026-10-09 22:00", "after": ["en-US"]})
+        self.assertIsNone(g.locale_change_time(None))
+
+
+class TestUndeterminedRestartIsStated(unittest.TestCase):
+    """判断不了的时候要在 facts 里说清，不能默默显示成没问题。"""
+
+    def _call(self):
+        with mock.patch.object(g, "load_browser_locale", return_value={}), \
+             mock.patch.object(g, "chrome_app_languages", return_value=["en-US"]), \
+             mock.patch.object(g, "chrome_needs_restart", return_value=None), \
+             mock.patch.object(g, "locale_change_time", return_value=None), \
+             mock.patch.object(g, "run", return_value=(1, "")), \
+             mock.patch.object(g, "check_export_ip", return_value={"country": "US"}):
+            return g.check_browser_locale()
+
+    def test_facts_say_it_cannot_be_determined(self):
+        out = self._call()
+        self.assertIsNone(out["needs_restart"])
+        self.assertTrue(any("判断不了" in f for f in out["facts"]))
+
+    def test_unmeasured_restart_does_not_turn_the_row_pending(self):
+        """没有依据时表里不许报「待处理」——报绿也不许，要走 measured 那条判定。"""
+        with mock.patch.object(g, "check_browser_locale", side_effect=lambda *a, **k: {
+                "measured": "en-US", "source": "浏览器实测", "country": "US",
+                "target": "en-US", "cn": False, "needs_restart": None, "facts": []}):
+            row = None
+            for r in g.build_summary({"A27_browser_locale": g.check_browser_locale()}):
+                if r[0] == "浏览器 Intl 区域设置":
+                    row = r
+        self.assertEqual(row[1], g.S_OK)
 
 
 class TestBrowserLocaleInAutoCleanPlan(unittest.TestCase):
@@ -3722,6 +3802,520 @@ class TestExportHistory(unittest.TestCase):
         status, detail = self._row(self._info())
         self.assertEqual(status, g.S_OK)
         self.assertIn("第一次记录", detail)
+
+
+class TestCliInstallMethod(unittest.TestCase):
+    """A11：这份 claude 是怎么装上去的。
+
+    口径借自 CCBaga 的 scripts/claude-cli.sh —— 四条通道各自验特征，
+    两种「读不出来」分开报，四条都对不上就给 unknown，绝不默认成正常。
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-cli-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._home = g.HOME
+        g.HOME = self.tmp
+        self.addCleanup(lambda: setattr(g, "HOME", self._home))
+
+    def _native(self, version="1.2.3"):
+        """造一份官方安装器的标准形状：versions/<版本> 真文件 + bin/claude 软链。"""
+        d = self.tmp / ".local" / "share" / "claude" / "versions"
+        d.mkdir(parents=True)
+        exe = d / version
+        exe.write_text("#!/bin/sh\n", encoding="utf-8")
+        b = self.tmp / ".local" / "bin"
+        b.mkdir(parents=True)
+        (b / "claude").symlink_to(exe)
+        return exe
+
+    def _quiet(self):
+        """让 brew / npm 都探测不到，把干扰隔离掉。"""
+        return mock.patch.object(g.shutil, "which", return_value=None)
+
+    def test_native_install_is_identified_with_its_shape(self):
+        exe = self._native()
+        with self._quiet():
+            out = g.detect_cli_install_method(str(self.tmp / ".local" / "bin" / "claude"), str(exe))
+        self.assertEqual(out["method"], "native")
+        self.assertTrue(out["layout_ok"])
+        self.assertEqual(out["probes"]["native_layout"]["launcher_in_versions"], True)
+        self.assertEqual(out["error"], "")
+
+    def test_versions_dir_being_a_symlink_is_flagged(self):
+        """versions 目录本身是软链，说明文件不在它说自己所在的地方。"""
+        real = self.tmp / "elsewhere"
+        (real / "versions").mkdir(parents=True)
+        d = self.tmp / ".local" / "share"
+        d.mkdir(parents=True)
+        (d / "claude").symlink_to(real)
+        exe = real / "versions" / "1.2.3"
+        exe.write_text("x", encoding="utf-8")
+        with self._quiet():
+            out = g.detect_cli_install_method("/x", str(exe))
+        self.assertFalse(out["layout_ok"])
+
+    def test_launcher_pointing_outside_versions_is_flagged(self):
+        """bin/claude 是指向别处的软链 —— 形状不对，不是官方安装。"""
+        self._native()
+        outside = self.tmp / "fake-claude"
+        outside.write_text("#!/bin/sh\n", encoding="utf-8")
+        b = self.tmp / ".local" / "bin" / "claude"
+        b.unlink()
+        b.symlink_to(outside)
+        with self._quiet():
+            out = g.detect_cli_install_method(str(b), str(outside))
+        self.assertFalse(out["layout_ok"])
+        self.assertEqual(out["probes"]["native_layout"]["launcher_in_versions"], False)
+
+    def test_npm_install_is_identified_by_package_json(self):
+        root = self.tmp / "npmroot"
+        pkg = root / "@anthropic-ai" / "claude-code"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(
+            json.dumps({"name": "@anthropic-ai/claude-code", "version": "9.9.9"}),
+            encoding="utf-8")
+        with self._quiet(), mock.patch.object(g, "_node_global_roots",
+                                              return_value=([root], [])):
+            out = g.detect_cli_install_method("/usr/local/bin/claude", "/usr/local/bin/claude")
+        self.assertEqual(out["method"], "npm")
+        self.assertIn("9.9.9", out["evidence"])
+
+    def test_package_json_with_a_different_name_is_not_evidence(self):
+        """同名目录里放着别的包，不算命中。"""
+        root = self.tmp / "npmroot"
+        pkg = root / "@anthropic-ai" / "claude-code"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(
+            json.dumps({"name": "something-else", "version": "1.0.0"}), encoding="utf-8")
+        with self._quiet(), mock.patch.object(g, "_node_global_roots",
+                                              return_value=([root], [])):
+            out = g.detect_cli_install_method("/x/claude", "/x/claude")
+        self.assertEqual(out["method"], "unknown")
+
+    def test_bun_install_is_identified(self):
+        pkg = (self.tmp / ".bun" / "install" / "global" / "node_modules"
+               / "@anthropic-ai" / "claude-code")
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(
+            json.dumps({"name": "@anthropic-ai/claude-code", "version": "3.3.3"}),
+            encoding="utf-8")
+        with self._quiet():
+            out = g.detect_cli_install_method("/x/claude", "/x/claude")
+        self.assertEqual(out["method"], "bun")
+        self.assertIn("3.3.3", out["evidence"])
+
+    def test_unknown_install_is_reported_not_guessed(self):
+        """PATH 下有 claude，但四条通道一条都对不上 —— 给 unknown，不猜。"""
+        with self._quiet():
+            out = g.detect_cli_install_method("/opt/whatever/claude", "/opt/whatever/claude")
+        self.assertEqual(out["method"], "unknown")
+        self.assertIn("一条都对不上", out["evidence"])
+
+    def test_no_cli_at_all_is_also_unknown(self):
+        with self._quiet():
+            out = g.detect_cli_install_method(None, None)
+        self.assertEqual(out["method"], "unknown")
+        self.assertIn("没有 claude", out["evidence"])
+
+    def test_probe_failure_is_not_reported_as_not_installed(self):
+        """探测本身读不出来，必须单独记在 error 里，不能混成「没装」。"""
+        with self._quiet(), mock.patch.object(
+                g, "_node_global_roots", return_value=([], ["npm 读不出全局根"])):
+            out = g.detect_cli_install_method("/x/claude", "/x/claude")
+        self.assertEqual(out["method"], "unknown")
+        self.assertIn("npm", out["error"])
+
+    def test_unreadable_shape_is_not_a_verdict(self):
+        """什么都读不到时 layout_ok 保持 True —— 没有正面证据就不冤判。"""
+        with self._quiet():
+            out = g.detect_cli_install_method("/opt/whatever/claude", "/opt/whatever/claude")
+        self.assertTrue(out["layout_ok"])
+
+
+class TestRunEnv(unittest.TestCase):
+    """run() 的环境变量是**叠加**不是替换。"""
+
+    def test_env_is_added_on_top_of_os_environ(self):
+        code, body = g.run(["bash", "-c", "echo $GUARD_PROBE_X"], env={"GUARD_PROBE_X": "hello"})
+        self.assertEqual(code, 0)
+        self.assertEqual(body.strip(), "hello")
+
+    def test_existing_environment_survives(self):
+        """只传一两个变量，PATH 之类必须还在，否则命令都跑不起来。"""
+        code, body = g.run(["bash", "-c", "echo $PATH"], env={"GUARD_PROBE_X": "1"})
+        self.assertEqual(code, 0)
+        self.assertTrue(body.strip())
+
+    def test_without_env_nothing_is_added(self):
+        code, body = g.run(["bash", "-c", "echo ${GUARD_PROBE_X:-unset}"])
+        self.assertEqual(body.strip(), "unset")
+
+
+class TestCliIntegrityRow(unittest.TestCase):
+    """表里的「CLI 完整性」一行：签名有效 ≠ 这份就是现在该在用的那份。"""
+
+    def _rep(self, **over):
+        ci = {
+            "cli_path": "/x/claude", "cli_real": "/x/versions/1.2.3",
+            "cli_version": "1.2.3 (Claude Code)", "current_version": "1.2.3",
+            "versions": [{"name": "1.2.3", "bytes": 1}], "version_count": 1,
+            "stale_count": 0, "stale_bytes": 0, "total_bytes": 1,
+            "version_runs": True, "version_ok": True, "current_present": True,
+            "install": {"method": "native", "layout_ok": True, "evidence": "x", "error": ""},
+            "signature": {"checked": True, "verified": True,
+                          "authority": "Developer ID Application: Anthropic PBC (Q6L2SF6YDW)"},
+            "note": "",
+        }
+        ci.update(over)
+        return {"A11_client_integrity": ci}
+
+    def _row(self, report):
+        for r in g.build_summary(report):
+            if r[0] == "CLI 完整性":
+                return r
+        self.fail("表里没有「CLI 完整性」这一行")
+
+    def test_native_with_verified_signature_stays_green(self):
+        row = self._row(self._rep())
+        self.assertEqual(row[1], g.S_OK)
+        self.assertIn("native 安装", row[2])
+        self.assertIn("验签通过", row[2])
+
+    def test_unknown_install_method_is_flagged(self):
+        row = self._row(self._rep(install={"method": "unknown", "layout_ok": True,
+                                           "evidence": "", "error": ""}))
+        self.assertEqual(row[1], g.S_FIX)
+        self.assertIn("安装方式未知", row[2])
+
+    def test_binary_that_does_not_run_is_flagged(self):
+        row = self._row(self._rep(version_runs=False, version_ok=False))
+        self.assertEqual(row[1], g.S_FIX)
+        self.assertIn("跑不出 --version", row[2])
+
+    def test_odd_version_string_is_flagged(self):
+        row = self._row(self._rep(version_ok=False))
+        self.assertEqual(row[1], g.S_FIX)
+        self.assertIn("版本号不像正常版本", row[2])
+
+    def test_broken_symlink_target_is_flagged(self):
+        row = self._row(self._rep(current_present=False))
+        self.assertEqual(row[1], g.S_FIX)
+        self.assertIn("不在 versions 目录里", row[2])
+
+    def test_wrong_link_shape_is_flagged(self):
+        row = self._row(self._rep(install={"method": "native", "layout_ok": False,
+                                           "evidence": "x", "error": ""}))
+        self.assertEqual(row[1], g.S_FIX)
+        self.assertIn("链接形状不对", row[2])
+
+    def test_problems_outrank_the_unverified_branch(self):
+        """这两个毛病同时存在时，不能落到「（未能验签）」那个绿灯分支。"""
+        row = self._row(self._rep(install={"method": "unknown", "layout_ok": True,
+                                           "evidence": "", "error": ""},
+                                  signature={"checked": False}))
+        self.assertEqual(row[1], g.S_FIX)
+        self.assertNotIn("未能验签", row[2])
+
+    def test_old_report_without_install_key_is_not_accused(self):
+        """本次改动之前生成的报告没有 install 键 —— 不能凭空指控「安装方式未知」。"""
+        import copy
+        rep = copy.deepcopy(self._rep())
+        rep["A11_client_integrity"].pop("install")
+        row = self._row(rep)
+        self.assertEqual(row[1], g.S_OK)
+        self.assertNotIn("未知", row[2])
+
+    def test_row_without_cli_is_unmeasured_not_green(self):
+        row = self._row(self._rep(cli_path=None, cli_version=None))
+        self.assertEqual(row[1], g.S_NA)
+
+
+class TestVerifyRoute(unittest.TestCase):
+    """本地复核服务的令牌路由。"""
+
+    TOKEN = "a" * 48
+
+    def test_token_root_forms(self):
+        for path in ("/" + self.TOKEN, "/" + self.TOKEN + "/"):
+            self.assertEqual(g._verify_route(path, self.TOKEN), "/")
+
+    def test_token_result_route(self):
+        self.assertEqual(g._verify_route("/" + self.TOKEN + "/result", self.TOKEN), "/result")
+
+    def test_wrong_token_is_rejected(self):
+        self.assertIsNone(g._verify_route("/" + "b" * 48 + "/", self.TOKEN))
+        self.assertIsNone(g._verify_route("/" + "b" * 48 + "/result", self.TOKEN))
+
+    def test_missing_token_is_rejected(self):
+        self.assertIsNone(g._verify_route("/", self.TOKEN))
+        self.assertIsNone(g._verify_route("/result", self.TOKEN))
+
+    def test_a_longer_segment_is_not_a_token_match(self):
+        """令牌只是一段前缀还不够，整段必须完全相等。"""
+        self.assertIsNone(g._verify_route("/" + self.TOKEN + "x/", self.TOKEN))
+
+    def test_query_and_fragment_are_ignored(self):
+        self.assertEqual(g._verify_route("/" + self.TOKEN + "/?x=1", self.TOKEN), "/")
+        self.assertEqual(
+            g._verify_route("/" + self.TOKEN + "/result#y", self.TOKEN), "/result")
+
+    def test_extra_segments_are_rejected(self):
+        self.assertIsNone(g._verify_route("/" + self.TOKEN + "/result/extra", self.TOKEN))
+
+    def test_tokens_are_random_and_long_enough(self):
+        a, b = g._verify_token(), g._verify_token()
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(a), g.VERIFY_TOKEN_BYTES * 2)
+
+
+class TestVerifyServerToken(unittest.TestCase):
+    """端到端：真起一次本地复核服务，看令牌是不是真的拦得住。"""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-token-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._home, self._cache = g.HOME, g.MEDIA_CACHE
+        g.HOME, g.MEDIA_CACHE = self.tmp, self.tmp / "media.json"
+
+        def restore():
+            g.HOME, g.MEDIA_CACHE = self._home, self._cache
+
+        self.addCleanup(restore)
+
+    def test_token_gates_both_the_page_and_the_report(self):
+        import re
+        import threading
+        import time
+        import urllib.error
+        import urllib.request
+
+        token = "c" * 48
+        buf = io.StringIO()
+        box: dict = {}
+
+        def serve():
+            with contextlib.redirect_stdout(buf):
+                box["out"] = g.verify_media_permission(timeout=8)
+
+        with mock.patch.object(g, "_verify_token", return_value=token):
+            t = threading.Thread(target=serve, daemon=True)
+            t.start()
+            url = None
+            for _ in range(100):
+                m = re.search(r"http://127\.0\.0\.1:\d+/" + token + r"/", buf.getvalue())
+                if m:
+                    url = m.group(0)
+                    break
+                time.sleep(0.1)
+        self.assertIsNotNone(url, f"没等到带令牌的 URL，服务输出：{buf.getvalue()!r}")
+        bare = url.replace(token + "/", "")
+
+        # ① 不知道令牌的本地进程连页面都取不到
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(bare, timeout=5)
+        self.assertEqual(cm.exception.code, 404)
+
+        # ② 带令牌能取到页面，且页面按当前路径回传（不是写死的 /result）
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            page = resp.read().decode("utf-8")
+            self.assertEqual(resp.status, 200)
+        self.assertIn("location.pathname.replace", page)
+
+        # ③ 不带令牌投一份「摄像头已拒绝」→ 404，采集器收不到
+        body = b'{"camera":"denied","microphone":"denied"}'
+        headers = {"Content-Type": "application/json"}
+        req_bad = urllib.request.Request(bare + "result", data=body, headers=headers, method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as cm2:
+            urllib.request.urlopen(req_bad, timeout=5)
+        self.assertEqual(cm2.exception.code, 404)
+
+        # ④ 带令牌投同一份 → 204，函数确实拿到了
+        req_ok = urllib.request.Request(url + "result", data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req_ok, timeout=5) as resp2:
+            self.assertEqual(resp2.status, 204)
+        t.join(timeout=10)
+        self.assertEqual(box["out"].get("camera"), "denied")
+
+    def test_oversized_report_is_truncated_not_swallowed_whole(self):
+        """声明 200KB，只读前 64KB —— 别让谁塞个巨大 body 把内存吃满。"""
+        self.assertEqual(g.VERIFY_MAX_BODY, 65536)
+
+
+class TestRunLock(unittest.TestCase):
+    """加固流程一次只跑一个（借自 CCBaga 的任务锁）。"""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-lock-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._home = g.HOME
+        g.HOME = self.tmp
+        self.addCleanup(lambda: setattr(g, "HOME", self._home))
+
+    def test_second_acquire_is_refused_while_held(self):
+        ok, _ = g.acquire_run_lock()
+        self.assertTrue(ok)
+        ok2, note2 = g.acquire_run_lock()
+        self.assertFalse(ok2)
+        self.assertIn("已经有另一个加固流程在跑", note2)
+
+    def test_release_frees_the_lock(self):
+        g.acquire_run_lock()
+        g.release_run_lock()
+        self.assertFalse(g.run_lock_path().exists())
+        ok, _ = g.acquire_run_lock()
+        self.assertTrue(ok)
+
+    def test_lock_file_records_pid_and_is_owner_only(self):
+        g.acquire_run_lock()
+        path = g.run_lock_path()
+        self.assertEqual(path.read_text(encoding="utf-8").split()[0], str(os.getpid()))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_stale_lock_from_a_dead_process_is_taken_over(self):
+        """上次 Ctrl-C 或断电留下的锁不能把机器锁死。"""
+        path = g.run_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("99999999 2026-01-01 00:00\n", encoding="utf-8")
+        ok, _ = g.acquire_run_lock()
+        self.assertTrue(ok)
+        self.assertEqual(path.read_text(encoding="utf-8").split()[0], str(os.getpid()))
+
+    def test_empty_lock_file_counts_as_stale(self):
+        path = g.run_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        ok, _ = g.acquire_run_lock()
+        self.assertTrue(ok)
+
+    def test_release_does_not_remove_someone_elses_lock(self):
+        path = g.run_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("99999999 2026-01-01 00:00\n", encoding="utf-8")
+        g.release_run_lock()
+        self.assertTrue(path.exists(), "不该删掉别人正在用的锁")
+
+    def test_release_without_a_lock_is_a_noop(self):
+        g.release_run_lock()  # 不该抛
+        self.assertFalse(g.run_lock_path().exists())
+
+
+class TestBrowserTimezoneFact(unittest.TestCase):
+    """A27 顺手把浏览器时区报成事实 —— 只报事实，不下判定。"""
+
+    def _call(self, cached, exit_ip):
+        with mock.patch.object(g, "load_browser_locale", return_value=cached), \
+             mock.patch.object(g, "run", return_value=(1, "")), \
+             mock.patch.object(g, "check_export_ip", return_value=exit_ip):
+            return g.check_browser_locale()
+
+    def test_browser_timezone_is_reported(self):
+        out = self._call({"intlLocale": "en-US", "timeZone": "Asia/Taipei"},
+                         {"country": "US", "timezone": "America/New_York"})
+        self.assertEqual(out["browser_timezone"], "Asia/Taipei")
+        self.assertTrue(any("Asia/Taipei" in f for f in out["facts"]))
+
+    def test_mismatch_with_the_exit_is_a_stated_combination_not_a_fault(self):
+        out = self._call({"intlLocale": "en-US", "timeZone": "Asia/Taipei"},
+                         {"country": "US", "timezone": "America/New_York"})
+        joined = " ".join(out["facts"])
+        self.assertIn("America/New_York", joined)
+        self.assertIn("不是故障", joined)
+        # 判定只看 locale：时区不一致绝不能把这一项翻成大陆简体
+        self.assertFalse(out["cn"])
+
+    def test_matching_timezones_are_reported_as_matching(self):
+        out = self._call({"intlLocale": "en-US", "timeZone": "America/New_York"},
+                         {"country": "US", "timezone": "America/New_York"})
+        self.assertTrue(any("一致" in f for f in out["facts"]))
+
+    def test_no_timezone_in_the_cache_adds_no_timezone_fact(self):
+        out = self._call({"intlLocale": "en-US"}, {"country": "US",
+                                                   "timezone": "America/New_York"})
+        self.assertIsNone(out["browser_timezone"])
+        self.assertFalse(any("浏览器时区" in f for f in out["facts"]))
+
+    def test_exit_timezone_unknown_still_reports_the_browser_side(self):
+        out = self._call({"intlLocale": "en-US", "timeZone": "Asia/Taipei"}, {"country": "US"})
+        self.assertEqual(out["browser_timezone"], "Asia/Taipei")
+        self.assertFalse(any("一致" in f for f in out["facts"]))
+
+
+class TestRedactCredentials(unittest.TestCase):
+    """带凭据的代理 URL 不许原样进报告（借自 CCBaga 的 SECURITY 数据流表）。"""
+
+    def test_user_and_password_are_replaced(self):
+        self.assertEqual(g.redact_credentials("http://user:pass@1.2.3.4:8080"),
+                         "http://***@1.2.3.4:8080")
+
+    def test_all_schemes_are_covered(self):
+        for scheme in ("http", "https", "socks5", "socks5h", "socks"):
+            self.assertEqual(g.redact_credentials(f"{scheme}://u:p@h:1"),
+                             f"{scheme}://***@h:1")
+
+    def test_user_without_a_password_is_also_redacted(self):
+        self.assertEqual(g.redact_credentials("http://token@host"), "http://***@host")
+
+    def test_it_works_inside_a_longer_line(self):
+        self.assertEqual(
+            g.redact_credentials("export HTTPS_PROXY=http://u:p@127.0.0.1:7897"),
+            "export HTTPS_PROXY=http://***@127.0.0.1:7897")
+
+    def test_an_email_is_not_mistaken_for_a_credential(self):
+        """没有 scheme:// 的 @ 不能抹 —— 否则邮箱、用户名都会被毁掉。"""
+        self.assertEqual(g.redact_credentials("user@example.com"), "user@example.com")
+
+    def test_plain_hosts_are_untouched(self):
+        for text in ("http://127.0.0.1:7897", "1.2.3.4:8080", ""):
+            self.assertEqual(g.redact_credentials(text), text)
+
+
+class TestTerminalEnvRedactsCredentials(unittest.TestCase):
+    """脱敏要发生在**进报告**那一步，不然 JSON 报告里还是明文。"""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-redact-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._home = g.HOME
+        g.HOME = self.tmp
+        self.addCleanup(lambda: setattr(g, "HOME", self._home))
+        (self.tmp / ".npmrc").write_text(
+            "proxy=http://u:p@127.0.0.1:7897\n", encoding="utf-8")
+        (self.tmp / ".zshrc").write_text(
+            'export HTTPS_PROXY=http://u:p@127.0.0.1:7897\n', encoding="utf-8")
+
+    def _env(self):
+        def fake(cmd, **kw):
+            if cmd[:3] == ["npm", "config", "get"]:
+                return 0, "null\n"
+            if cmd[0] == "git":
+                return 0, "\n"
+            return 1, ""
+        with mock.patch.object(g, "run", side_effect=fake), \
+             mock.patch.dict(g.os.environ, {"HTTPS_PROXY": "http://u:p@10.0.0.1:3128"}):
+            return g.check_terminal_env()
+
+    def test_npmrc_line_is_redacted(self):
+        out = self._env()
+        self.assertTrue(out["npmrc"])
+        self.assertNotIn("u:p@", out["npmrc"][0]["text"])
+        self.assertIn("***@", out["npmrc"][0]["text"])
+
+    def test_shell_config_line_is_redacted(self):
+        out = self._env()
+        for hits in out["rc_files"].values():
+            for hit in hits:
+                self.assertNotIn("u:p@", hit["text"])
+
+    def test_environment_variable_value_is_redacted(self):
+        out = self._env()
+        self.assertTrue(out["env_hits"])
+        self.assertFalse(any("u:p@" in h for h in out["env_hits"]))
+
+    def test_nothing_secret_survives_a_json_round_trip(self):
+        """整份报告序列化一遍，也不许出现明文凭据。"""
+        blob = json.dumps(self._env(), ensure_ascii=False)
+        self.assertNotIn("u:p@", blob)
 
 
 if __name__ == "__main__":

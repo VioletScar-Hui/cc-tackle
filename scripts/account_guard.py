@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hmac
 import json
 import os
 import pathlib
 import re
+import secrets
 import shutil
 import subprocess
 import unicodedata
@@ -130,13 +132,70 @@ def classify_asn(org: str) -> str:
 
 # ────────────────────────── 基础工具 ──────────────────────────
 
-def run(cmd: list[str], timeout: int = 20) -> tuple[int, str]:
-    """执行命令，返回 (退出码, 合并输出)。任何异常都降级为退出码 1。"""
+def run(cmd: list[str], timeout: int = 20, env: dict | None = None) -> tuple[int, str]:
+    """执行命令，返回 (退出码, 合并输出)。任何异常都降级为退出码 1。
+
+    env 是**叠加**在现有环境上的变量，不是替换。体检时调 CLI 必须传
+    DISABLE_AUTOUPDATER=1（见 check_client_integrity）：不传的话这次体检会
+    顺手把 CLI 升到最新，而同一个函数下面正要数 versions 目录里留了几份、
+    占多少空间 —— 等于一边量一边把被测对象改了。
+    """
+    full = {**os.environ, **env} if env else None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           check=False, env=full)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except (OSError, subprocess.TimeoutExpired):
         return 1, ""
+
+
+VERIFY_TOKEN_BYTES = 24
+VERIFY_MAX_BODY = 65536
+
+
+def _verify_token() -> str:
+    """本地复核服务的一次性令牌。
+
+    为什么需要：media / WebRTC / Intl 这三处复核各自起一个本地 HTTP 服务，
+    绑在 127.0.0.1、端口随机。**端口随机不等于有鉴权** —— 本机任何进程都能
+    扫到这个端口，往上 POST 一份「摄像头=denied」，表就会把没测过的东西
+    报成已解决。令牌当 URL 路径前缀，不知道令牌就取不到页面、也投不进结果。
+    """
+    return secrets.token_hex(VERIFY_TOKEN_BYTES)
+
+
+def _verify_route(path: str, token: str) -> str | None:
+    """把请求路径归一化成路由名；令牌不对一律返回 None（调用方回 404）。
+
+    用 compare_digest 而不是 == ：都是本机的东西，但比较令牌不该有短路。
+    """
+    clean = path.split("?", 1)[0].split("#", 1)[0]
+    parts = [seg for seg in clean.split("/") if seg]
+    if not parts or not hmac.compare_digest(parts[0], token):
+        return None
+    if len(parts) == 1:
+        return "/"
+    if len(parts) == 2 and parts[1] == "result":
+        return "/result"
+    return None
+
+
+# 带凭据的 URL：scheme://user:pass@host。要求必须有 scheme://，
+# 免得把邮箱（user@example.com）也当成凭据抹掉。
+URL_CRED_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s]*@")
+
+
+def redact_credentials(text: str) -> str:
+    """把 URL 里的用户名密码抹掉：scheme://user:pass@host → scheme://***@host。
+
+    为什么要做：这些字符串会同时进终端输出**和** audit JSON 报告，而报告会被
+    贴进聊天、存进备份目录、也可能被当成附件发出去。`proxy=http://user:pass@1.2.3.4:8080`
+    是很常见的写法，照原样打出来等于把凭据又抄了一份到别处。
+    先抹再截断 —— 反过来的话凭据可能被截成半截，正则就匹配不上了。
+    """
+    if not text:
+        return text
+    return URL_CRED_RE.sub(lambda m: m.group(1) + "***@", text)
 
 
 def running_under_claude() -> bool:
@@ -380,9 +439,9 @@ def check_terminal_env() -> dict:
     for k, v in os.environ.items():
         kl = k.lower()
         if "proxy" in kl:
-            out["env_hits"].append(f"{k}={v[:80]}")          # 代理变量：要处理
+            out["env_hits"].append(f"{k}={redact_credentials(v)[:80]}")   # 代理变量：要处理
         elif k.startswith(("ANTHROPIC_", "CLAUDE_", "CLAUDE_CODE_")) and route_keys.search(k):
-            out["env_hits"].append(f"{k}={v[:80]}")          # 指向别处的端点/凭据：要处理
+            out["env_hits"].append(f"{k}={redact_credentials(v)[:80]}")   # 端点/凭据：要处理
         elif "claude" in kl or "anthropic" in kl:
             out["env_info"].append(f"{k}={v[:60]}")          # 其余同名变量：仅知会
     for name in (".zshrc", ".zprofile", ".profile", ".bashrc", ".zshenv", ".bash_profile", ".zlogin"):
@@ -393,7 +452,8 @@ def check_terminal_env() -> dict:
         hits = []
         for n, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
             if re.search(r"proxy|ANTHROPIC|CLAUDE", line, re.I) and not line.strip().startswith("#"):
-                hits.append({"line": n, "text": line.strip()[:120]})
+                hits.append({"line": n,
+                             "text": redact_credentials(line.strip())[:120]})
         out["rc_files"][name] = hits
     data = read_json(SETTINGS, {})
     out["settings_env"] = dict(data.get("env", {}) or {})
@@ -408,7 +468,8 @@ def check_terminal_env() -> dict:
     if npmrc.exists():
         for n, line in enumerate(npmrc.read_text(errors="replace").splitlines(), 1):
             if re.search(r"proxy", line, re.I) and not line.strip().startswith(("#", ";")):
-                out["npmrc"].append({"line": n, "text": line.strip()[:120]})
+                out["npmrc"].append({"line": n,
+                                     "text": redact_credentials(line.strip())[:120]})
     for key, cmd in (
         ("npm_proxy", ["npm", "config", "get", "proxy"]),
         ("npm_https_proxy", ["npm", "config", "get", "https-proxy"]),
@@ -433,7 +494,8 @@ def check_terminal_env() -> dict:
         for line in body.splitlines():
             m = re.match(r"\s*((?:https?|all|no)_proxy)\s*:\s*(\S.*?)\s*$", line, re.I)
             if m:
-                out["brew"]["proxy"].append(f"{m.group(1).lower()}={m.group(2)}")
+                out["brew"]["proxy"].append(
+                    f"{m.group(1).lower()}={redact_credentials(m.group(2))}")
     return out
 
 
@@ -811,6 +873,160 @@ def check_cli_signature(cli_real) -> dict:
     return out
 
 
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+")
+CLAUDE_PKG = "@anthropic-ai/claude-code"
+
+
+def _claude_pkg_version(path: pathlib.Path) -> str | None:
+    """读 npm/bun 全局包目录里的 package.json。名字对得上才算数。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict) and data.get("name") == CLAUDE_PKG:
+        v = data.get("version")
+        return v if isinstance(v, str) else ""
+    return None
+
+
+def _node_global_roots() -> tuple[list, list]:
+    """找出本机所有 node 全局根，以及探测过程中的读取失败。
+
+    npm 装在全局时命令不一定在 PATH 里（nvm 的版本目录常不在），所以除了
+    which("npm") 还要按 nvm 的固定布局兜一遍；同一个根只算一次。
+    返回 (根列表, 错误列表)——读不出来和「没装」必须分开。
+    """
+    roots: list = []
+    errors: list = []
+    seen: set = set()
+    cands: list = []
+    npm = shutil.which("npm")
+    if npm:
+        cands.append(npm)
+    nvm = HOME / ".nvm" / "versions" / "node"
+    if nvm.is_dir():
+        try:
+            for d in sorted(nvm.iterdir()):
+                cand = d / "bin" / "npm"
+                if cand.exists():
+                    cands.append(str(cand))
+        except OSError:
+            errors.append("nvm 版本目录读不出来")
+    for npm_bin in cands:
+        code, body = run([npm_bin, "root", "-g"], timeout=30)
+        root = body.strip().splitlines()[0].strip() if body.strip() else ""
+        if code != 0 or not root.startswith("/"):
+            errors.append(f"{npm_bin} 读不出全局根")
+            continue
+        if root in seen:
+            continue
+        seen.add(root)
+        roots.append(pathlib.Path(root))
+    return roots, errors
+
+
+def _native_link_shape() -> dict:
+    """官方安装器的链接形状。
+
+    正常长这样：~/.local/share/claude 是真目录，~/.local/bin/claude 是指向
+    versions/<版本> 的软链。任何一环被换成别的东西，只凭「路径里含 versions」
+    下结论就不牢 —— 先看形状，再谈版本。
+    """
+    out = {"dir_is_symlink": None, "launcher_is_symlink": None,
+           "launcher_parent_is_symlink": None, "launcher_in_versions": None,
+           "launcher_target": None}
+    d = HOME / ".local" / "share" / "claude"
+    if d.exists() or d.is_symlink():
+        out["dir_is_symlink"] = d.is_symlink()
+    b = HOME / ".local" / "bin" / "claude"
+    if b.exists() or b.is_symlink():
+        out["launcher_parent_is_symlink"] = b.parent.is_symlink()
+        out["launcher_is_symlink"] = b.is_symlink()
+        if b.is_symlink():
+            try:
+                tgt = os.readlink(b)
+            except OSError:
+                tgt = ""
+            out["launcher_target"] = tgt
+            if tgt:
+                real = pathlib.Path(tgt)
+                if not real.is_absolute():
+                    real = b.parent / real
+                out["launcher_in_versions"] = "versions" in real.parts
+    return out
+
+
+def detect_cli_install_method(cli_path, cli_real) -> dict:
+    """A11：这份 claude 是怎么装上去的。
+
+    四条通道各自有可验证的特征，不靠 PATH 里的名字猜：native 认官方安装器的
+    versions 目录，npm / bun 认包管理器自己的全局根里那份 package.json，
+    Homebrew 认 cask 清单。
+
+    两种「读不出来」必须分开报 —— 探测通道自己报错（brew list 跑不起来）
+    和「确实没装」是两回事，混在一起会把探测失败说成环境干净。
+    四条都识别不出来时给 unknown，交回上层写进表里，绝不默认成正常。
+    """
+    real = str(cli_real or "")
+    native_dir = HOME / ".local" / "share" / "claude"
+    native_bin = HOME / ".local" / "bin" / "claude"
+    native_present = native_dir.exists() or native_bin.exists()
+    layout = _native_link_shape()
+    probes: dict = {"native": native_present, "native_layout": layout}
+
+    def shape_ok() -> bool:
+        # 只有拿到「形状确实不对」的正面证据才判 False；读不到（None）不冤判。
+        return not (layout.get("dir_is_symlink") is True
+                    or layout.get("launcher_parent_is_symlink") is True
+                    or layout.get("launcher_in_versions") is False)
+
+    if real and f"{os.sep}versions{os.sep}" in real and native_present:
+        # 已经认出来了，不再去问 brew / npm —— 那两个各要起一个子进程，白等。
+        return {"method": "native", "layout_ok": shape_ok(), "probes": probes, "error": "",
+                "evidence": f"可执行文件在官方 versions 目录下（{real}）"}
+
+    errors: list = []
+    roots, npm_errors = _node_global_roots()
+    errors += npm_errors
+    npm_hits = []
+    for r in roots:
+        v = _claude_pkg_version(r / CLAUDE_PKG / "package.json")
+        if v is not None:
+            npm_hits.append({"root": str(r), "version": v})
+    probes["npm_roots"] = [str(r) for r in roots]
+    probes["npm"] = npm_hits
+
+    bun_pkg = HOME / ".bun" / "install" / "global" / "node_modules" / CLAUDE_PKG / "package.json"
+    bun_v = _claude_pkg_version(bun_pkg)
+    probes["bun"] = bun_v
+
+    brew_hits: list = []
+    if sys.platform == "darwin":
+        if shutil.which("brew"):
+            code, body = run(["brew", "list", "--cask"], timeout=60)
+            if code != 0:
+                errors.append("brew list --cask 读不出来")
+            else:
+                brew_hits = [ln.strip() for ln in body.splitlines()
+                             if ln.strip() in ("claude-code", "claude-code@latest")]
+        probes["brew"] = brew_hits
+
+    if npm_hits:
+        hit = npm_hits[0]
+        method = "npm"
+        evidence = f"全局 npm 根 {hit['root']} 里有 {CLAUDE_PKG}（{hit['version']}）"
+    elif bun_v is not None:
+        method, evidence = "bun", f"bun 全局包目录里有 {CLAUDE_PKG}（{bun_v}）"
+    elif brew_hits:
+        method, evidence = "homebrew", f"Homebrew cask 已安装：{'、'.join(brew_hits)}"
+    elif cli_path:
+        method, evidence = "unknown", "PATH 下能找到 claude，但四条通道一条都对不上"
+    else:
+        method, evidence = "unknown", "PATH 下没有 claude"
+    return {"method": method, "evidence": evidence, "layout_ok": shape_ok(),
+            "probes": probes, "error": "；".join(errors)}
+
+
 def check_client_integrity() -> dict:
     """A11 Claude Code 客户端完整性。文章 §5「不要改客户端二进制，不要用魔改版」。
 
@@ -823,6 +1039,8 @@ def check_client_integrity() -> dict:
         "cli_path": None, "cli_real": None, "cli_version": None, "current_version": None,
         "versions": [], "version_count": 0, "stale_count": 0, "stale_bytes": 0, "total_bytes": 0,
         "desktop_present": pathlib.Path("/Applications/Claude.app").exists(),
+        "version_runs": False, "version_ok": None,
+        "install": {}, "current_present": None,
         "signature": {},
         "note": "",
     }
@@ -833,9 +1051,14 @@ def check_client_integrity() -> dict:
             out["cli_real"] = str(pathlib.Path(cli).resolve())
         except OSError:
             out["cli_real"] = None
-        code, body = run([cli, "--version"], timeout=30)
-        if body.strip():
-            out["cli_version"] = body.strip().splitlines()[0][:80]
+        code, body = run([cli, "--version"], timeout=30, env={"DISABLE_AUTOUPDATER": "1"})
+        line = body.strip().splitlines()[0][:80] if body.strip() else None
+        if line:
+            out["cli_version"] = line
+        # 「文件在」和「跑起来报的版本正常」是两件事，分开记：
+        # 前者只证明磁盘上有这个文件，后者才证明它还能用、还是那个东西。
+        out["version_runs"] = bool(line)
+        out["version_ok"] = bool(line and VERSION_RE.match(line))
     vdir = HOME / ".local" / "share" / "claude" / "versions"
     if vdir.is_dir():
         # 官方安装在这里放的是**可执行文件**（每个 200MB 上下），不是子目录；
@@ -854,11 +1077,31 @@ def check_client_integrity() -> dict:
         stale = [e for e in entries if e["name"] != out["current_version"]]
         out["stale_count"] = len(stale)
         out["stale_bytes"] = sum(e["bytes"] for e in stale)
+        # 软链指向的那个版本必须真的在目录里；不在说明链接断了或被人改过，
+        # 这时候「版本号」是从一个不存在的路径名里读出来的，不能当证据用。
+        if out["current_version"]:
+            out["current_present"] = out["current_version"] in {e["name"] for e in entries}
     out["signature"] = check_cli_signature(out["cli_real"])
+    out["install"] = detect_cli_install_method(cli, out["cli_real"])
+    notes: list = []
     if not cli:
-        out["note"] = "PATH 下找不到 claude 命令，无法校验 CLI 完整性"
+        notes.append("PATH 下找不到 claude 命令，无法校验 CLI 完整性")
     elif out["cli_real"] and str(vdir) not in out["cli_real"]:
-        out["note"] = f"claude 不在官方版本目录下（真实路径 {out['cli_real']}），请确认不是魔改版或手工替换的二进制"
+        notes.append(f"claude 不在官方版本目录下（真实路径 {out['cli_real']}），"
+                     f"请确认不是魔改版或手工替换的二进制")
+    inst = out["install"]
+    if cli and inst.get("method") == "unknown":
+        notes.append("四条安装通道（native / Homebrew / npm / bun）一条都对不上，"
+                     "安装方式未知 —— 不猜，请人工确认这份 claude 是哪来的")
+    if inst.get("error"):
+        notes.append(f"安装探测本身有读不出来的地方：{inst['error']}（这与「没装」不是一回事）")
+    if cli and not out["version_runs"]:
+        notes.append("二进制在，但跑不出 --version，没法确认它还能用")
+    elif cli and out["version_ok"] is False:
+        notes.append(f"版本号看着不像正常版本：{out['cli_version']!r}")
+    if out["current_present"] is False:
+        notes.append(f"软链指向的 {out['current_version']} 不在 versions 目录里，链接可能已断或被改")
+    out["note"] = "；".join(notes)
     return out
 
 
@@ -992,7 +1235,7 @@ function finish(){
  if(done)return;done=true;
  const payload={count:raw.length,raw:raw,error:err,media:media};
  document.getElementById("out").textContent=JSON.stringify(payload);
- fetch("/result",{method:"POST",headers:{"Content-Type":"application/json"},
+ fetch(location.pathname.replace(/\/+$/,"")+"/result",{method:"POST",headers:{"Content-Type":"application/json"},
                   body:JSON.stringify(payload)}).catch(()=>{});
 }
 async function go(){
@@ -1179,7 +1422,7 @@ const fmt = s => s==="denied" ? '<span class="bad">denied（已禁止）</span>'
       ? "⚠ 权限挡住了但仍出现 IP：" + ips.join(", ") + " —— 这不该发生，请把结果发我。"
       : "✗ 仍能拿到媒体权限，mDNS 混淆会关掉，候选里露出了：" + (ips.join(", ") || "(无)");
 
-  fetch("/result", {method:"POST", headers:{"Content-Type":"application/json"},
+  fetch(location.pathname.replace(/\/+$/,"")+"/result", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({camera:cam, microphone:mic, request:req, detail:detail,
                           candidates:raw, ips:ips, mdns:mdns, ok:good})}).catch(()=>{});
 })();
@@ -1213,12 +1456,18 @@ def verify_media_permission(timeout: int = 240) -> dict:
 
     got: dict = {}
     ready = threading.Event()
+    token = _verify_token()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def do_GET(self):
+            if _verify_route(self.path, token) != "/":
+                # 不认的路径就是 404：不知道这次令牌的本地进程连页面都取不到，
+                # 也就拿不到页面里那段回传逻辑。
+                self.send_error(404)
+                return
             body = MEDIA_VERIFY_PAGE.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1227,7 +1476,11 @@ def verify_media_permission(timeout: int = 240) -> dict:
             self.wfile.write(body)
 
         def do_POST(self):
-            n = int(self.headers.get("Content-Length") or 0)
+            if _verify_route(self.path, token) != "/result":
+                self.send_error(404)
+                return
+            # 上限 64KB：回传的就那么几个字段，别让谁塞个几百兆进来把内存吃满。
+            n = min(int(self.headers.get("Content-Length") or 0), VERIFY_MAX_BODY)
             try:
                 got.update(json.loads(self.rfile.read(n) or b"{}"))
             except (json.JSONDecodeError, ValueError):
@@ -1249,8 +1502,9 @@ def verify_media_permission(timeout: int = 240) -> dict:
     # TTY 时（后台跑、管道接出去）会缓冲——不刷新的话 URL 根本打不出来，
     # 用户看不到要打开哪个地址，就一直等到超时。
     print(f"\n  用你日常那个 Chrome 打开：\n", flush=True)
-    print(f"      http://127.0.0.1:{port}/\n", flush=True)
-    print(f"  页面会自动检测并把结果回传，最多等 {timeout} 秒（Ctrl-C 可取消）...", flush=True)
+    print(f"      http://127.0.0.1:{port}/{token}/\n", flush=True)
+    print(f"  链接里那串是本次随机令牌，别改也别分享；页面会自动检测并回传，最多等 {timeout} 秒（Ctrl-C 可取消）...",
+          flush=True)
     try:
         ready.wait(timeout=timeout)
     except KeyboardInterrupt:
@@ -1348,12 +1602,18 @@ def _webrtc_run(browser: str, media: bool = False) -> dict | None:
 
     collected: dict = {}
     ready = threading.Event()
+    token = _verify_token()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def do_GET(self):
+            if _verify_route(self.path, token) != "/":
+                # 不认的路径就是 404：不知道这次令牌的本地进程连页面都取不到，
+                # 也就拿不到页面里那段回传逻辑。
+                self.send_error(404)
+                return
             body = WEBRTC_PROBE_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1362,7 +1622,10 @@ def _webrtc_run(browser: str, media: bool = False) -> dict | None:
             self.wfile.write(body)
 
         def do_POST(self):
-            n = int(self.headers.get("Content-Length") or 0)
+            if _verify_route(self.path, token) != "/result":
+                self.send_error(404)
+                return
+            n = min(int(self.headers.get("Content-Length") or 0), VERIFY_MAX_BODY)
             try:
                 collected.update(json.loads(self.rfile.read(n) or b"{}"))
             except (json.JSONDecodeError, ValueError):
@@ -1389,7 +1652,7 @@ def _webrtc_run(browser: str, media: bool = False) -> dict | None:
         if media:
             # 假设备 + 自动同意，避免弹窗；测的是「拿到权限之后会怎样」
             argv += ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"]
-        argv.append(f"http://127.0.0.1:{port}/" + ("#media" if media else ""))
+        argv.append(f"http://127.0.0.1:{port}/{token}/" + ("#media" if media else ""))
         try:
             proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
@@ -1566,11 +1829,36 @@ def chrome_app_languages() -> list | None:
     return [bare] if bare else None
 
 
-def chrome_needs_restart() -> bool | None:
-    """Chrome 正在跑，但它是在应用语言改过之前启动的 —— 那就要重启才生效。
+def locale_change_time(languages) -> str | None:
+    """这份 Chrome 应用语言是什么时候被改的 —— **只有我们亲手改过才有依据**。
 
-    判据是进程启动时间和应用域偏好文件 mtime 谁更晚。判断不了就返回 None，
-    绝不猜：猜错会让人以为改了个没生效的值。
+    依据来自 clear_browser_locale 写下的回滚凭据（里面记着改动时刻和改成什么）。
+    对得上就返回那个时刻；对不上（用户自己在系统设置里改的、或者状态目录被清过）
+    就返回 None，不猜。
+
+    早前试过「自己记一份值 + 发现值变了就记当前时间」，那个规则本身会误判：
+    上次跑是两天前、Chrome 昨天重启过，就会把「两次巡检之间变了」当成「刚刚变的」，
+    报出根本不存在的「要重启」。宁可说不判断，也不给一个看着像证据的猜。
+    """
+    try:
+        data = json.loads(LOCALE_ROLLBACK_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not languages:
+        return None
+    after = data.get("after")
+    if not after or list(after) != list(languages):
+        return None
+    at = data.get("at")
+    return at if isinstance(at, str) else None
+
+
+def chrome_needs_restart(changed_at: str | None = None) -> bool | None:
+    """Chrome 正在跑，但它启动得比「应用语言改动的时刻」早 —— 那要重启才生效。
+
+    changed_at 由 locale_change_time() 给出：只有我们亲手改过才有这个时刻。**没有这个时刻就返回 None**：
+    偏好文件的 mtime 不是证据（Chrome 自己会重写它），拿它判会误报。判断不了
+    就说不判断，让人用 --check-locale 看浏览器自己报的读数。
     """
     code, body = run(["pgrep", "-x", "Google Chrome"])
     if code != 0 or not body.strip():
@@ -1585,14 +1873,13 @@ def chrome_needs_restart() -> bool | None:
         started = dt.datetime.strptime(body.strip(), "%a %b %d %H:%M:%S %Y")
     except ValueError:
         return None
-    pref = HOME / "Library" / "Preferences" / (CHROME_APP_DOMAIN + ".plist")
-    try:
-        changed = dt.datetime.fromtimestamp(pref.stat().st_mtime)
-    except OSError:
+    if not changed_at:
         return None
-    # ps 的 lstart 精度只到秒，mtime 带微秒。不对齐的话「同一秒内改完又启动」
-    # 会被判成 started < changed，报出一个根本不存在的「要重启」。
-    return started < changed.replace(microsecond=0)
+    try:
+        changed = dt.datetime.strptime(changed_at, "%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return None
+    return started < changed
 
 
 def check_browser_locale(ip: dict | None = None) -> dict:
@@ -1603,7 +1890,8 @@ def check_browser_locale(ip: dict | None = None) -> dict:
     """
     out = {"measured": None, "source": None, "checked_at": None, "predicted": None,
            "app_override": None, "system_languages": None, "country": None,
-           "target": None, "cn": False, "needs_restart": None, "facts": []}
+           "target": None, "cn": False, "needs_restart": None, "facts": [],
+           "browser_timezone": None, "exit_timezone": None}
     ip = ip if ip is not None else check_export_ip()
     out["country"] = (ip.get("country") or "").upper() or None
     out["target"] = LOCALE_BY_COUNTRY.get(out["country"] or "", DEFAULT_LOCALE)
@@ -1620,6 +1908,10 @@ def check_browser_locale(ip: dict | None = None) -> dict:
         out["measured"] = cached["intlLocale"]
         out["checked_at"] = cached.get("checkedAt")
         out["source"] = "浏览器实测"
+        # 时区是同一张复核页顺手带回来的（页面本来就在收 timeZone），
+        # 以前收了没用。这里只报事实、不下判定 —— 见下面 facts 里的说明。
+        if cached.get("timeZone"):
+            out["browser_timezone"] = cached["timeZone"]
     elif out["predicted"]:
         out["measured"] = out["predicted"]
         out["source"] = "按 AppleLanguages 推定，未跑浏览器复核"
@@ -1631,9 +1923,28 @@ def check_browser_locale(ip: dict | None = None) -> dict:
         out["facts"].append("既没跑过浏览器复核，也读不到 AppleLanguages，这一项没测到")
     if out["app_override"]:
         out["facts"].append("Chrome 应用语言已被设为 " + "、".join(out["app_override"]))
-        out["needs_restart"] = chrome_needs_restart()
+        out["needs_restart"] = chrome_needs_restart(locale_change_time(out["app_override"]))
         if out["needs_restart"]:
-            out["facts"].append("Chrome 现在这个进程是改之前启动的，要完全退出再打开才生效")
+            out["facts"].append(
+                "Chrome 现在这个进程是这份值改之前启动的，要完全退出再打开才生效")
+        elif out["needs_restart"] is None:
+            out["facts"].append(
+                "判断不了 Chrome 这个进程有没有吃上这份值（没有「它是什么时候改的」"
+                "记录）；要确认就跑 --check-locale，看浏览器自己报的读数")
+    btz = out.get("browser_timezone")
+    if btz:
+        out["facts"].append(f"浏览器时区 {btz}（实测）")
+        extz = (ip or {}).get("timezone")
+        out["exit_timezone"] = extz
+        if extz and btz != extz:
+            # 故意不判对错：文章 §2.2 让你把时区改台北，§2.3 又要求系统时区
+            # 跟出口同国，两条互斥。用户已经拍板按「台北 + 美国出口」走，
+            # 那这是决定不是故障，表里翻转成待处理等于替用户推翻他自己的决定。
+            out["facts"].append(
+                f"出口时区是 {extz}，两者不同 —— 这是「时区在东亚、出口在美国」的"
+                f"组合，文章 §2.2 与 §2.3 本身互相矛盾，按你拍板的走，不是故障")
+        elif extz:
+            out["facts"].append(f"与出口所在地时区一致（{extz}）")
     out["facts"].append(f"出口国家 {out['country'] or '未知'}，对应目标 locale {out['target']}")
     if out["cn"] and out["country"] and out["country"] != "CN":
         out["facts"].append(
@@ -1667,7 +1978,7 @@ LOCALE_VERIFY_PAGE = """<!doctype html><meta charset="utf-8">
   };
   document.getElementById("s").textContent =
     "Intl 区域设置 = " + payload.intlLocale + "    日期样例 = " + payload.sampleDate;
-  fetch("/result", {method:"POST", headers:{"Content-Type":"application/json"},
+  fetch(location.pathname.replace(/\/+$/,"")+"/result", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(payload)}).then(() => {
       document.getElementById("s").textContent += "    ✓ 已回传，可以关掉这一页";
     }).catch(() => {
@@ -1689,12 +2000,18 @@ def verify_browser_locale(timeout: int = 240) -> dict:
 
     got: dict = {}
     ready = threading.Event()
+    token = _verify_token()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def do_GET(self):
+            if _verify_route(self.path, token) != "/":
+                # 不认的路径就是 404：不知道这次令牌的本地进程连页面都取不到，
+                # 也就拿不到页面里那段回传逻辑。
+                self.send_error(404)
+                return
             body = LOCALE_VERIFY_PAGE.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1703,7 +2020,11 @@ def verify_browser_locale(timeout: int = 240) -> dict:
             self.wfile.write(body)
 
         def do_POST(self):
-            n = int(self.headers.get("Content-Length") or 0)
+            if _verify_route(self.path, token) != "/result":
+                self.send_error(404)
+                return
+            # 上限 64KB：回传的就那么几个字段，别让谁塞个几百兆进来把内存吃满。
+            n = min(int(self.headers.get("Content-Length") or 0), VERIFY_MAX_BODY)
             try:
                 got.update(json.loads(self.rfile.read(n) or b"{}"))
             except (json.JSONDecodeError, ValueError):
@@ -1724,8 +2045,9 @@ def verify_browser_locale(timeout: int = 240) -> dict:
     # flush 必须加：这里会阻塞等浏览器回传，而 Python 在 stdout 不是 TTY 时
     # 会缓冲 —— 不刷新的话 URL 根本打不出来，用户不知道开哪个地址，只能等到超时。
     print("\n  用你要检查的那个 Chrome 资料打开：\n", flush=True)
-    print(f"      http://127.0.0.1:{port}/\n", flush=True)
-    print(f"  页面会自动回传，最多等 {timeout} 秒（Ctrl-C 可取消）...", flush=True)
+    print(f"      http://127.0.0.1:{port}/{token}/\n", flush=True)
+    print(f"  链接里那串是本次随机令牌，别改也别分享；页面会自动回传，最多等 {timeout} 秒（Ctrl-C 可取消）...",
+          flush=True)
     try:
         ready.wait(timeout=timeout)
     except KeyboardInterrupt:
@@ -2210,12 +2532,35 @@ def build_summary(report: dict) -> list:
 
     if ci.get("cli_version"):
         stale = ci.get("stale_count", 0)
-        detail = f"CLI {ci['cli_version']}，versions 留 {ci.get('version_count', 0)} 份"
+        inst = ci.get("install") or {}
+        # method 缺失＝这份报告里根本没记（本次改动之前生成的报告），
+        # 跟「探测过、四条通道都对不上」是两回事 —— 老报告不能被指控成未知安装。
+        method = inst.get("method")
+        detail = (f"CLI {ci['cli_version']}"
+                  + (f"（{method} 安装）" if method else "")
+                  + f"，versions 留 {ci.get('version_count', 0)} 份")
         if stale:
             detail += f"，非当前版本 {stale} 份占 {ci.get('stale_bytes', 0) // 1048576} MB"
+        # 先收集「这份二进制本身有没有说不通的地方」，任一条命中就不报绿 ——
+        # 签名有效只说明「这份是官方发的那份」，不等于「它就是现在该在用的那份」。
+        problems = []
+        if method == "unknown":
+            problems.append("安装方式未知，四条通道一条都对不上")
+        elif method is None:
+            pass  # 没记过就不下结论，交给下面的签名判定
+        if ci.get("version_runs") is False:
+            problems.append("二进制在但跑不出 --version")
+        elif ci.get("version_ok") is False:
+            problems.append("版本号不像正常版本")
+        if ci.get("current_present") is False:
+            problems.append(f"软链指向的 {ci.get('current_version')} 不在 versions 目录里")
+        if inst.get("layout_ok") is False:
+            problems.append("官方安装的链接形状不对")
         sig = ci.get("signature") or {}
         authority = sig.get("authority") or ""
-        if sig.get("verified") and "anthropic" in authority.lower():
+        if problems:
+            add("CLI 完整性", S_FIX, detail + "；" + "、".join(problems))
+        elif sig.get("verified") and "anthropic" in authority.lower():
             add("CLI 完整性", S_OK, detail + f"；签名 {authority}，验签通过")
         elif not sig.get("checked"):
             # 没跑成 codesign（本机没有、或不是 Mach-O）时，signed 是默认的 False，
@@ -3230,6 +3575,71 @@ def print_manual_checks() -> None:
 
 # ────────────────────────── 写操作 ──────────────────────────
 
+def run_lock_path() -> pathlib.Path:
+    """加固流程的互斥锁文件。
+
+    做成函数不是模块级常量：常量在 import 那一刻就把 HOME 定死了，
+    测试里改不动（这个坑踩过一次）。
+    """
+    return HOME / ".local" / "state" / "claude-guard" / "run.lock"
+
+
+def acquire_run_lock() -> tuple:
+    """取加固流程的互斥锁，返回 (拿到没, 说明)。
+
+    为什么要锁：这个流程里有备份、有删除、有改配置三件事，并发跑会互相踩 ——
+    一边把文件删了，另一边正拿它当回滚凭据；两个备份目录的内容也会交错。
+    用 O_CREAT|O_EXCL 原子建文件，不用「先看存在再写」那种有竞态的写法。
+
+    锁里记 pid。**进程已经不在的锁是遗留锁**，直接接管并说明 —— 否则上次
+    Ctrl-C 或断电之后，同一台机器就再也跑不起来了。
+    """
+    path = run_lock_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return False, f"建不了状态目录 {path.parent}：{e}"
+    for attempt in (0, 1):
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if attempt:
+                return False, f"已经有另一个加固流程在跑（锁文件 {path}）"
+            try:
+                holder = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                holder = ""
+            pid = holder.split()[0] if holder else ""
+            if pid.isdigit() and run(["kill", "-0", pid])[0] == 0:
+                return False, f"已经有另一个加固流程在跑（pid {pid}，锁文件 {path}）"
+            try:
+                path.unlink()
+            except OSError as e:
+                return False, f"发现遗留锁但删不掉（{path}）：{e}"
+            continue
+        except OSError as e:
+            return False, f"建不了锁文件 {path}：{e}"
+        os.write(fd, f"{os.getpid()} {now_stamp()}\n".encode("utf-8"))
+        os.close(fd)
+        return True, f"已加互斥锁（{path}）"
+    return False, "取锁失败"
+
+
+def release_run_lock() -> None:
+    """放锁。只删 pid 还是自己的那份，不碰别人正在用的锁。"""
+    path = run_lock_path()
+    try:
+        holder = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if holder.split()[0] != str(os.getpid()):
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def create_backup(paths: list[pathlib.Path], sudo_paths: list[pathlib.Path] | None = None) -> pathlib.Path:
     """第一个写操作：把要动的文件复制到带时间戳的备份目录。
 
@@ -4167,6 +4577,15 @@ def print_audit(r: dict) -> None:
     if ci["cli_path"]:
         print(f"  Claude Code：{ci['cli_version'] or '版本未知'}")
         print(f"    路径 {ci['cli_real'] or ci['cli_path']}")
+        inst = ci.get("install") or {}
+        if inst.get("evidence"):
+            print(f"    安装方式 {inst.get('method')}：{inst['evidence']}")
+        if ci.get("version_runs") and ci.get("version_ok"):
+            print("    实跑 --version 通过（已传 DISABLE_AUTOUPDATER=1，体检不会顺手自升级）")
+        else:
+            print("    ⚠ 实跑 --version 没通过，或版本号看着不正常")
+        if ci.get("current_present") is False:
+            print(f"    ⚠ 软链指向的 {ci.get('current_version')} 不在 versions 目录里")
         sig = ci.get("signature") or {}
         if sig.get("verified"):
             print(f"    签名 {sig.get('authority')}，验签通过")
@@ -4455,6 +4874,14 @@ def main(argv: list[str] | None = None) -> int:
             print("已取消，没有修改任何内容。")
             return 1
 
+        # 锁取在 CONFIRM 之后：这之前一个字节都没写，不需要拦并发。
+        locked, lock_note = acquire_run_lock()
+        if not locked:
+            print(f"停止：{lock_note}", file=sys.stderr)
+            print("等它跑完再来；若确认那个进程已经不在了，删掉锁文件即可。", file=sys.stderr)
+            return 2
+        print(f"  {lock_note}")
+
         before = protected_snapshot()
         # Clash 配置也进备份：DNS 那一项要改生成物和 profile 的 Merge 增强文件两处，
         # 增强文件改错会让下次重算生成出坏配置。
@@ -4583,6 +5010,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("停止发生在第一个写操作之前，没有改动任何内容。", file=sys.stderr)
         return 2
+    finally:
+        # 放锁放在 finally：中断、出错、正常跑完三条路都要放，
+        # 否则一次 Ctrl-C 就会把这台机器锁到用户自己来删文件为止。
+        release_run_lock()
 
 
 def ask_yes(prompt: str) -> bool:
