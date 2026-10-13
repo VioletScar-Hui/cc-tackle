@@ -84,7 +84,7 @@ python3 scripts/account_guard.py --check-locale # 等待浏览器回传 Intl 区
 ```
 
 `--audit --webrtc` 会启动临时浏览器资料进行探测，并在结束后清理；它不会修改日常浏览器资料。`--check-media` 和 `--check-locale` 会在本机保存回传缓存。
-WebRTC 专项探测需要 Node.js 和 Playwright；其余核心检测使用 Python 标准库。
+WebRTC 专项探测会直接启动本机可用的 Chromium；其余核心检测使用 Python 标准库。
 
 ### 需要修改本机状态时
 

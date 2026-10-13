@@ -5105,7 +5105,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--save-audit", action="store_true",
                     help="审计完成后显式保存报告与出口历史（默认 --audit 不落盘）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出体检结果")
-    ap.add_argument("--webrtc", action="store_true", help="附加 WebRTC 泄漏探测（需要 Node + Playwright）")
+    ap.add_argument("--webrtc", action="store_true", help="附加 WebRTC 泄漏探测（直接启动可用 Chromium）")
     ap.add_argument("--check-media", action="store_true",
                     help="起一个本地页面，用你日常浏览器确认摄像头/麦克风权限（WebRTC 那一项靠它转正）")
     ap.add_argument("--check-locale", action="store_true",
