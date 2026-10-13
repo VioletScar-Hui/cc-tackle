@@ -4326,6 +4326,23 @@ class TestVerifyServerToken(unittest.TestCase):
         """声明 200KB，只读前 64KB —— 别让谁塞个巨大 body 把内存吃满。"""
         self.assertEqual(g.VERIFY_MAX_BODY, 65536)
 
+    def test_loopback_server_does_not_reverse_resolve_before_bind(self):
+        """CI 的反向 DNS 卡住时，本地复核服务仍须能绑定并关闭。"""
+        import http.server
+        import socket
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        with mock.patch.object(socket, "getfqdn", side_effect=AssertionError("reverse DNS")):
+            server = g._new_loopback_server(Handler)
+        try:
+            self.assertEqual(server.server_address[0], "127.0.0.1")
+            self.assertGreater(server.server_address[1], 0)
+        finally:
+            server.server_close()
+
 
 class TestRunLock(unittest.TestCase):
     """加固流程一次只跑一个（借自 CCBaga 的任务锁）。"""
