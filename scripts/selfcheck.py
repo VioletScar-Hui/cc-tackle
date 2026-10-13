@@ -143,20 +143,23 @@ def check_guards() -> None:
 
 # ── 5. Clash 内核：mode / TUN / 严格路由 ──────────────────────────────
 def check_kernel() -> None:
-    cmd = [
-        "curl", "-s", "--unix-socket", str(g.CLASH_SOCK),
-        "-H", f"Authorization: Bearer {g.CLASH_SECRET}",
-        "http://localhost/configs",
-    ]
-    code, out = sh(cmd, timeout=20)
-    if code != 0 or not out.lstrip().startswith("{"):
+    try:
+        status, out = g.clash_http("GET", "/configs", timeout=20)
+    except (RuntimeError, OSError, ValueError) as exc:
         add("Clash 内核", BAD,
-            f"控制接口读不到（内核没跑、socket 或 secret 变了）：{tail(out, 120)}")
+            f"控制接口读不到（内核没跑、socket 或 secret 变了）：{type(exc).__name__}")
+        return
+    if status < 200 or status >= 300 or not out.lstrip().startswith("{"):
+        add("Clash 内核", BAD,
+            f"控制接口读不到（HTTP {status}，内核没跑、socket 或 secret 变了）")
         return
     try:
         cfg = json.loads(out)
     except ValueError:
         add("Clash 内核", BAD, "控制接口返回的不是 JSON")
+        return
+    if not isinstance(cfg, dict):
+        add("Clash 内核", BAD, "控制接口返回的 JSON 不是对象")
         return
     mode = cfg.get("mode")
     tun = cfg.get("tun") or {}

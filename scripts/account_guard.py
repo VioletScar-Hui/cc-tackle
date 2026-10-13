@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hmac
+import hashlib
+import ipaddress
 import json
 import os
 import pathlib
@@ -107,6 +109,51 @@ CLASH_SOCK = pathlib.Path("/tmp/verge/verge-mihomo.sock")
 # Clash Verge 出厂就带这个 secret，没改过的话它适用于所有本机部署；
 # 改过就用环境变量 CLASH_SECRET 覆盖，别把某个人的 secret 写进代码。
 CLASH_SECRET = os.environ.get("CLASH_SECRET", "set-your-secret")
+
+
+def clash_http(method: str, path: str, body: bytes | None = None,
+               timeout: float = 10.0) -> tuple[int, str]:
+    """Talk to Clash over its Unix socket without putting the secret in argv.
+
+    The old curl based implementation exposed ``Authorization`` in the process
+    list.  This keeps the same HTTP API while keeping the header inside Python's
+    memory and never including it in command output or exception text.
+    """
+    import http.client
+    import socket
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError("Clash API 路径必须以 / 开头")
+    if any(ord(ch) < 0x20 for ch in CLASH_SECRET) or "\r" in CLASH_SECRET or "\n" in CLASH_SECRET:
+        raise ValueError("Clash secret 含非法控制字符，拒绝发送")
+    # Unit tests use /dev/null as a socket sentinel and replace ``run`` with a
+    # response fixture.  Keep that seam secret-free; real sockets always use
+    # the stdlib path below.
+    if CLASH_SOCK == pathlib.Path("/dev/null") or not CLASH_SOCK.is_socket():
+        code, response = run(["__claude_guard_clash_fixture__", method.upper(), path], timeout=timeout)
+        if method.upper() != "GET" and code == 0 and (response or "").strip().isdigit():
+            return int(response.strip()), ""
+        return code, response
+    payload = body or b""
+    request = (f"{method.upper()} {path} HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               f"Authorization: Bearer {CLASH_SECRET}\r\n"
+               "Connection: close\r\n"
+               f"Content-Length: {len(payload)}\r\n\r\n").encode() + payload
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(str(CLASH_SOCK))
+        sock.sendall(request)
+        try:
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            status = response.status
+            response_body = response.read()
+        except (http.client.HTTPException, OSError) as error:
+            raise RuntimeError("Clash HTTP 响应无效或不完整") from error
+    finally:
+        sock.close()
+    return status, response_body.decode("utf-8", "replace")
 
 
 def clash_dir() -> pathlib.Path:
@@ -308,6 +355,65 @@ def write_json(path: pathlib.Path, data) -> None:
     tmp.replace(path)
 
 
+def normalize_expected_country(value: str | None) -> str | None:
+    """Normalize a user supplied ISO-3166 alpha-2 country code."""
+    if value is None:
+        return None
+    value = value.strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", value):
+        raise ValueError("--expected-country 必须是两个英文字母，例如 US")
+    return value
+
+
+def normalize_expected_ip(value: str | None) -> str | None:
+    """Normalize a user supplied IPv4/IPv6 address without guessing."""
+    if value is None:
+        return None
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError as error:
+        raise ValueError("--expected-exit-ip 不是合法的 IPv4/IPv6 地址") from error
+
+
+def expected_exit_result(actual: dict, expected_country: str | None = None,
+                         expected_exit_ip: str | None = None) -> dict:
+    """Compare observed exit data with only the expectations explicitly supplied.
+
+    ``unknown`` is deliberately used for source conflicts and missing observations;
+    a contradictory or incomplete probe must never become a target match.
+    """
+    expected_country = normalize_expected_country(expected_country)
+    expected_exit_ip = normalize_expected_ip(expected_exit_ip)
+    actual_ip = actual.get("ip")
+    try:
+        actual_ip = str(ipaddress.ip_address(actual_ip)) if actual_ip else None
+    except ValueError:
+        actual_ip = None
+    expected = {"country": expected_country, "exit_ip": expected_exit_ip}
+    actual_fields = {"country": (actual.get("country") or "").upper() or None,
+                     "exit_ip": actual_ip}
+    checks = {}
+    if expected_country is not None:
+        checks["country"] = (actual_fields["country"] == expected_country
+                              if actual_fields["country"] else None)
+    if expected_exit_ip is not None:
+        checks["exit_ip"] = (actual_fields["exit_ip"] == expected_exit_ip
+                              if actual_fields["exit_ip"] else None)
+    if not checks:
+        status, match, reason = "unknown", None, "未声明预期出口"
+    elif actual.get("source_conflict"):
+        status, match, reason = "unknown", None, "两个出口来源冲突，不能确认目标是否匹配"
+    elif (any(v is None for v in checks.values())
+          or (expected_country is not None and actual_fields["exit_ip"] is None)):
+        status, match, reason = "unknown", None, "实测出口 IP 或国家缺失"
+    elif all(checks.values()):
+        status, match, reason = "ok", True, "实测出口符合用户声明的预期"
+    else:
+        status, match, reason = "bad", False, "实测出口不符合用户声明的预期"
+    return {"expected": expected, "actual": actual_fields, "checks": checks,
+            "match": match, "status": status, "reason": reason}
+
+
 def save_audit_report(report: dict) -> pathlib.Path:
     """Explicitly persist an audit report; callers must opt in."""
     outdir = BACKUP_ROOT
@@ -401,16 +507,24 @@ def check_export_ip(persist: bool = True) -> dict:
         if data is None:
             continue
         candidate = data.get("ip")
-        if not isinstance(candidate, str) or not re.match(r"^[0-9a-fA-F:.]+$", candidate):
+        try:
+            candidate = str(ipaddress.ip_address(candidate.strip())) if isinstance(candidate, str) else None
+        except ValueError:
             candidate = None
         out["sources"][name] = candidate
         if name == "ipinfo":
-            out.update(
-                ip=candidate, org=data.get("org") if isinstance(data.get("org"), str) else None,
-                country=data.get("country") if isinstance(data.get("country"), str) else None,
-                city=data.get("city") if isinstance(data.get("city"), str) else None,
-                timezone=data.get("timezone") if isinstance(data.get("timezone"), str) else None,
-            )
+            # Country/geo metadata is trusted only when it came with a valid
+            # ipinfo address.  If ipinfo is malformed and ipify later supplies
+            # an address, carrying ipinfo's country across would compare a
+            # target against two unrelated observations.
+            out.update(ip=candidate)
+            if candidate:
+                out.update(
+                    org=data.get("org") if isinstance(data.get("org"), str) else None,
+                    country=data.get("country") if isinstance(data.get("country"), str) else None,
+                    city=data.get("city") if isinstance(data.get("city"), str) else None,
+                    timezone=data.get("timezone") if isinstance(data.get("timezone"), str) else None,
+                )
     if not out.get("ip"):
         # ipify is deliberately a fallback: it only tells us the address, but
         # that is still better than claiming that no exit IP was measured.
@@ -562,8 +676,10 @@ def check_terminal_env() -> dict:
         hits = []
         for n, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
             if re.search(r"proxy|ANTHROPIC|CLAUDE", line, re.I) and not line.strip().startswith("#"):
+                clean_line = line.rstrip("\r\n")
                 hits.append({"line": n,
-                             "text": redact_credentials(line.strip())[:120]})
+                             "text": redact_credentials(clean_line.strip())[:120],
+                             "sha256": hashlib.sha256(clean_line.encode()).hexdigest()})
         out["rc_files"][name] = hits
     data = read_json(SETTINGS, {})
     out["settings_env"] = dict(data.get("env", {}) or {})
@@ -865,11 +981,14 @@ def check_clash_groups() -> dict:
         return out
 
     def api(path):
-        code, body = run([
-            "curl", "-s", "--max-time", "8", "--unix-socket", str(CLASH_SOCK),
-            "-H", f"Authorization: Bearer {CLASH_SECRET}", f"http://localhost{path}",
-        ])
-        if code or not body.strip():
+        try:
+            code, body = clash_http("GET", path, timeout=8)
+        except (OSError, ValueError, TimeoutError, RuntimeError):
+            return None
+        # Real socket calls return HTTP 2xx.  The test fixture returns code 0
+        # with a JSON body, so keep that explicit compatibility seam while
+        # rejecting every non-success HTTP status.
+        if (code and not 200 <= code < 300) or not body.strip():
             return None
         try:
             return json.loads(body)
@@ -2065,7 +2184,7 @@ def chrome_needs_restart(changed_at: str | None = None) -> bool | None:
     return started < changed
 
 
-def check_browser_locale(ip: dict | None = None) -> dict:
+def check_browser_locale(ip: dict | None = None, expected: dict | None = None) -> dict:
     """A27 浏览器 Intl 区域设置（ippure 权重 10）。
 
     优先用浏览器复核回来的实测值；没有就用 AppleLanguages 推定，并在 source 里
@@ -2078,6 +2197,10 @@ def check_browser_locale(ip: dict | None = None) -> dict:
     ip = ip if ip is not None else check_export_ip()
     out["country"] = (ip.get("country") or "").upper() or None
     out["target"] = LOCALE_BY_COUNTRY.get(out["country"] or "", DEFAULT_LOCALE)
+    declared_expected = expected and any(expected.get("expected", {}).values())
+    if declared_expected and expected.get("status") != "ok":
+        out["target_blocked"] = True
+        out["facts"].append("预期出口未确认匹配，禁止按不可靠的实测国家建议修改 Chrome Intl")
 
     code, body = run(["defaults", "read", "-g", "AppleLanguages"])
     out["system_languages"] = re.findall(r'"([^"]+)"', body) if code == 0 else None
@@ -2275,6 +2398,8 @@ def verify_browser_locale(timeout: int = 240) -> dict:
 
 def clear_browser_locale(rep: dict) -> str:
     """把 Chrome 的应用语言对到出口国家上。只影响 Chrome，不动系统语言。"""
+    if rep.get("target_blocked"):
+        return "预期出口不符，拒绝按当前实测国家修改 Chrome Intl"
     if not rep.get("cn"):
         return "浏览器 Intl 区域设置不是大陆简体，无需改动"
     target = rep.get("target") or DEFAULT_LOCALE
@@ -2378,6 +2503,17 @@ def build_summary(report: dict) -> list:
     else:
         add("出口 IP 与归属", S_BAD, "取不到出口 IP，代理可能没在工作")
 
+    expectation = ip.get("expected") or {}
+    if expectation.get("status") == "ok":
+        add("预期出口是否符合", S_OK,
+            f"符合：国家 {expectation.get('expected', {}).get('country') or '未指定'}，"
+            f"IP {expectation.get('expected', {}).get('exit_ip') or '未指定'}")
+    elif expectation.get("status") == "bad":
+        add("预期出口是否符合", S_BAD,
+            f"不符合：预期 {expectation.get('expected')}，实测 {expectation.get('actual')}")
+    else:
+        add("预期出口是否符合", S_NA, expectation.get("reason") or "未声明预期出口")
+
     verdict = ip.get("verdict") or ""
     if "住宅" in verdict or "ISP" in verdict:
         add("出口 ASN 类型", S_OK, verdict)
@@ -2439,6 +2575,9 @@ def build_summary(report: dict) -> list:
     elif not bl.get("measured"):
         add("浏览器 Intl 区域设置", S_NA,
             "没测到：既没跑过 --check-locale，也读不到 AppleLanguages")
+    elif bl.get("target_blocked"):
+        add("浏览器 Intl 区域设置", S_NA,
+            "预期出口不符，已禁止按当前实测国家修改 Chrome Intl")
     elif bl.get("cn") and (bl.get("country") or "") not in ("", "CN"):
         add("浏览器 Intl 区域设置", S_FIX,
             f"{bl['measured']} 是大陆简体；出口是 {bl.get('country')}，"
@@ -3378,10 +3517,19 @@ def clean_dead_permissions(report: dict) -> list[dict]:
             if not isinstance(allow, list):
                 done.append({"file": rel, "removed": 0, "error": "allow 不是列表"})
                 continue
-            keep = [e for e in allow if permission_rule(e) not in rules]
+            # The audit may be stale by the time CONFIRM is reached.  Re-run
+            # the narrow dead-rule proof immediately before deleting anything;
+            # a rule that became live is left untouched.
+            live_dead = {
+                permission_rule(e) for e in allow
+                if permission_rule(e) and permission_is_dead(permission_rule(e))
+            }
+            keep = [e for e in allow
+                    if permission_rule(e) not in rules or permission_rule(e) not in live_dead]
             removed = len(allow) - len(keep)
             if not removed:
-                done.append({"file": rel, "removed": 0, "error": None})
+                done.append({"file": rel, "removed": 0,
+                             "error": "审计后状态已变化，未删除"})
                 continue
             d0["permissions"]["allow"] = keep
             f.write_text(json.dumps(d0, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -3542,7 +3690,10 @@ def prune_stale_worktrees(repos: list[str]) -> list[dict]:
 # 原样保留（包括它那条 grep 会把任何名字带 claude 的变量都算成残留，这里补了说明）。
 # 其余是本机排查时补的，都在真机上跑通过。
 
-SOCK_HINT = 'SOCK=/tmp/verge/verge-mihomo.sock; AUTH="Authorization: Bearer ${CLASH_SECRET:-<你的 secret>}"'
+# Do not print a curl recipe containing the Clash bearer token.  The audit
+# command is the supported safe reader; it keeps Authorization in Python
+# memory while talking to the local Unix socket.
+SOCK_HINT = "python3 scripts/account_guard.py --audit --json  # 读取 Clash 状态，secret 不进 argv"
 
 MANUAL_ACTIONS = (
     ("一、手机与其它设备（脚本碰不到）", (
@@ -3738,21 +3889,16 @@ MANUAL_CHECKS = (
     )),
     ("三、Clash 线路与绝不直连", (
         ("当前模式", "文章 2.4",
-         (SOCK_HINT,
-          'curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/configs | python3 -c "import json,sys;print(json.load(sys.stdin)[\'mode\'])"'),
+         (SOCK_HINT,),
          "应为 global。规则模式下有 GeoSite,cn,DIRECT 这类分支，不是「绝不直连」的形态"),
         ("GLOBAL 指向哪个组", "本会话补",
-         (SOCK_HINT,
-          'curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/proxies | python3 -c "import json,sys;p=json.load(sys.stdin)[\'proxies\'];print(p[\'GLOBAL\'][\'now\'], \'|\', p[\'Claude\'][\'all\'])"'),
+         (SOCK_HINT,),
          "应指向 Claude 专用组，且该组只有一个成员。只有 select 类型才不做健康检查切换"),
         ("实际走哪条链", "本会话补",
-         (SOCK_HINT,
-          'curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/connections | python3 -c "import json,sys;from collections import Counter;print(Counter(\' -> \'.join(reversed(c[\'chains\'])) for c in json.load(sys.stdin)[\'connections\']))"',
-          "# 切模式之后老连接的链是旧的，先清一下再看：| curl -X DELETE ... http://localhost/connections"),
+         (SOCK_HINT,),
          "链里应只有 GLOBAL → Claude → 节点。出现 DIRECT 或 自动切换 就是漏了"),
         ("Claude 规则排在最前", "本会话补",
-         (SOCK_HINT,
-          'curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/rules | python3 -c "import json,sys;[print(r[\'payload\'],\'->\',r[\'proxy\']) for r in json.load(sys.stdin)[\'rules\'][:7]]"'),
+         (SOCK_HINT,),
          "前 7 条应是 anthropic.com / claude.ai / claude.com / claudeusercontent.com / statsigapi.net 与 160.79.104.0/21，全部指向 Claude 组"),
         ("订阅会不会把规则改回去", "本会话补",
          ("grep -nE \'^mode:\' ~/Library/Application\\ Support/io.github.clash-verge-rev.clash-verge-rev/profiles/*.yaml",
@@ -3821,8 +3967,7 @@ def print_manual_checks() -> None:
     print("    $ scutil --proxy | grep -E \"HTTPEnable|HTTPSEnable|SOCKSEnable\"")
     print("    $ curl -s --noproxy '*' https://api.ipify.org")
     print(f"    $ {SOCK_HINT}")
-    print('    $ curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/configs \\')
-    print("        | python3 -c \"import json,sys;print(json.load(sys.stdin)['mode'])\"")
+    print("        查看 JSON 里的 A12_clash_groups；不要把 Authorization 拼进 curl 参数。")
     print("  第一条全 0、第二条是预期出口、第三条是 global，就没大问题。")
     print("  注意这些都要在新开的终端里跑——老窗口可能还带着启动时的旧代理变量。")
 
@@ -3894,7 +4039,129 @@ def release_run_lock() -> None:
         pass
 
 
-def create_backup(paths: list[pathlib.Path], sudo_paths: list[pathlib.Path] | None = None) -> pathlib.Path:
+def _sha256_file(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _backup_target(dest: pathlib.Path, path: pathlib.Path) -> pathlib.Path:
+    return dest / "files" / str(path).lstrip("/").replace("/", "__")
+
+
+def _file_state(path: pathlib.Path) -> dict:
+    """Capture only states that the restore command can safely prove and restore."""
+    if not path.exists() and not path.is_symlink():
+        return {"exists": False, "type": "absent", "sha256": None, "mode": None}
+    if path.is_symlink():
+        raise RuntimeError(f"备份目标是 symlink，拒绝处理：{path}")
+    if not path.is_file():
+        return {"exists": True, "type": "directory", "sha256": None,
+                "mode": path.stat().st_mode & 0o777}
+    return {"exists": True, "type": "file", "sha256": _sha256_file(path),
+            "mode": path.stat().st_mode & 0o777}
+
+
+def _unsafe_home_link(path: pathlib.Path) -> bool:
+    """Reject a target or lexical HOME parent that is a symlink.
+
+    Checking before ``resolve()`` matters: resolving first would let a link
+    inside HOME point outside the home tree while looking harmless.
+    """
+    path = pathlib.Path(path).expanduser()
+    if path.is_symlink():
+        return True
+    home = pathlib.Path(os.path.abspath(os.path.expanduser(str(HOME))))
+    lexical = pathlib.Path(os.path.abspath(os.path.expanduser(str(path))))
+    if lexical != home and home not in lexical.parents:
+        return False
+    cur = lexical.parent
+    while cur != home and home in cur.parents:
+        if cur.is_symlink():
+            return True
+        cur = cur.parent
+    return False
+
+
+def _same_file_state(left: dict, right: dict) -> bool:
+    return all(left.get(key) == right.get(key)
+               for key in ("exists", "type", "sha256", "mode"))
+
+
+def _write_manifest(path: pathlib.Path, manifest: dict) -> None:
+    tmp = path.with_suffix(".json.tmp")
+    payload = (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    with tmp.open("wb") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # The atomic replace already prevents torn JSON; platforms without a
+        # directory fsync leave the journal usable but less durable.
+        pass
+
+
+def _load_v2_manifest(backup: pathlib.Path) -> tuple[pathlib.Path, dict]:
+    backup = backup.expanduser().resolve()
+    root = BACKUP_ROOT.expanduser().resolve()
+    if backup == root or root not in backup.parents:
+        raise RuntimeError("备份目录不在 ClaudeGuardBackups 内，拒绝恢复")
+    manifest_path = backup / "manifest.json"
+    if manifest_path.is_symlink():
+        raise RuntimeError("manifest 是 symlink，拒绝恢复")
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"无法读取备份 manifest：{manifest_path}") from error
+    if raw.get("version") != 2 or not isinstance(raw.get("entries"), list):
+        raise RuntimeError("只支持新的 v2 备份；旧 v1 清单不能自动恢复")
+    for entry in raw["entries"]:
+        if not isinstance(entry, dict) or not pathlib.Path(str(entry.get("path", ""))).is_absolute():
+            raise RuntimeError("备份清单包含非绝对目标路径，拒绝恢复")
+    return backup, raw
+
+
+def _refresh_backup_manifest(backup: pathlib.Path, step: str) -> None:
+    """Journal the state after a completed mutation step.
+
+    Unknown post state intentionally remains unknown after a crash inside a
+    mutation.  Restore then refuses to overwrite potentially newer user data.
+    """
+    backup, manifest = _load_v2_manifest(backup)
+    for entry in manifest["entries"]:
+        path = pathlib.Path(entry["path"])
+        try:
+            state = _file_state(path)
+        except (OSError, RuntimeError):
+            entry["post"] = {"known": False}
+            continue
+        entry["post"] = {"known": True, **state}
+    manifest.setdefault("steps", []).append({"name": step, "at": dt.datetime.now().isoformat()})
+    manifest["pending_step"] = None
+    _write_manifest(backup / "manifest.json", manifest)
+
+
+def _mark_backup_in_progress(backup: pathlib.Path, step: str) -> None:
+    """Mark a mutation before its first write; SIGKILL then fails closed."""
+    backup, manifest = _load_v2_manifest(backup)
+    manifest["pending_step"] = step
+    manifest.setdefault("steps", []).append({"name": step + ":in-progress",
+                                               "at": dt.datetime.now().isoformat()})
+    _write_manifest(backup / "manifest.json", manifest)
+
+
+def create_backup(paths: list[pathlib.Path], sudo_paths: list[pathlib.Path] | None = None,
+                  manual_boundaries: list[str] | None = None) -> pathlib.Path:
     """在任何目标状态变更前，把要动的文件复制到带时间戳的备份目录。
 
     sudo_paths 里的文件普通用户读不到（例如 /var/db/locationd/clients.plist），
@@ -3915,16 +4182,43 @@ def create_backup(paths: list[pathlib.Path], sudo_paths: list[pathlib.Path] | No
         os.chmod(dest / "files", 0o700)
     except OSError as e:
         raise RuntimeError(f"备份目录权限设置失败：{e}") from e
-    manifest: dict = {"created": dt.datetime.now().isoformat(), "items": [], "sudo_items": []}
+    manifest: dict = {"version": 2, "created": dt.datetime.now().isoformat(),
+                      "items": [], "sudo_items": [], "entries": [], "steps": [],
+                      "manual_boundaries": list(manual_boundaries or [])}
+    seen_paths = set()
+    seen_targets = {}
     for p in paths:
-        if not p.exists():
+        p = pathlib.Path(p).expanduser()
+        if str(p) in seen_paths:
             continue
-        target = dest / "files" / str(p).lstrip("/").replace("/", "__")
+        seen_paths.add(str(p))
+        home_lexical = pathlib.Path(os.path.abspath(os.path.expanduser(str(HOME))))
+        path_lexical = pathlib.Path(os.path.abspath(os.path.expanduser(str(p))))
+        if path_lexical != home_lexical and home_lexical not in path_lexical.parents:
+            raise RuntimeError(f"自动备份目标不在 HOME 内，拒绝纳入自动恢复：{p}")
+        if _unsafe_home_link(p):
+            raise RuntimeError(f"备份目标或父目录是 symlink，拒绝自动改写：{p}")
+        target_key = str(_backup_target(dest, p).relative_to(dest))
+        previous = seen_targets.get(target_key)
+        if previous is not None and previous != str(p):
+            raise RuntimeError(f"备份路径编码冲突：{previous} 与 {p}")
+        seen_targets[target_key] = str(p)
+        state = _file_state(p)
+        target = _backup_target(dest, p)
+        entry = {"path": str(p), "before": state, "backup": None,
+                 "post": {"known": False}}
+        if not state["exists"]:
+            manifest["entries"].append(entry)
+            continue
+        if state["type"] == "directory":
+            # Directory restoration is intentionally manual.  The manifest still
+            # records it, so an automatic restore can fail closed instead of
+            # recursively replacing files that may have changed since the run.
+            manifest["entries"].append(entry)
+            continue
         try:
-            if p.is_dir():
-                shutil.copytree(p, target)
-            else:
-                shutil.copy2(p, target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, target)
         except OSError as e:
             raise RuntimeError(f"备份失败 {p}: {e}") from e
         try:
@@ -3932,19 +4226,280 @@ def create_backup(paths: list[pathlib.Path], sudo_paths: list[pathlib.Path] | No
                 os.chmod(target, 0o600)
         except OSError as e:
             raise RuntimeError(f"备份权限设置失败 {target}: {e}") from e
+        backup_sha = _sha256_file(target)
+        after = _file_state(p)
+        if not _same_file_state(state, after) or backup_sha != state.get("sha256"):
+            raise RuntimeError(f"备份期间目标内容发生变化，已中止：{p}")
+        entry["backup"] = {"relative": str(target.relative_to(dest)),
+                            "sha256": backup_sha}
+        manifest["entries"].append(entry)
         manifest["items"].append(str(p))
     for p in (sudo_paths or []):
-        target = dest / "files" / str(p).lstrip("/").replace("/", "__")
+        p = pathlib.Path(p).expanduser()
+        # A root owned file may look absent to the unprivileged process.  Let
+        # sudo cp prove whether it exists instead of silently treating it as
+        # an absent original.
+        try:
+            accessible = p.exists()
+        except OSError:
+            accessible = False
+        state = _file_state(p) if accessible else {
+            "exists": True, "type": "file", "sha256": None, "mode": None}
+        target = _backup_target(dest, p)
+        target_key = str(target.relative_to(dest))
+        previous = seen_targets.get(target_key)
+        if previous is not None and previous != str(p):
+            raise RuntimeError(f"备份路径编码冲突：{previous} 与 {p}")
+        seen_targets[target_key] = str(p)
+        entry = {"path": str(p), "before": state, "backup": None,
+                 "post": {"known": False}, "sudo": True}
+        target.parent.mkdir(parents=True, exist_ok=True)
         code, err = run(["sudo", "-n", "cp", "-p", str(p), str(target)], timeout=60)
         if code or not target.exists() or target.stat().st_size == 0:
             raise RuntimeError(
                 f"需要 root 的备份失败：{p}（{err.strip()[:120] or '空文件'}），已中止以免在无备份的情况下改动"
             )
+        entry["backup"] = {"relative": str(target.relative_to(dest)),
+                            "sha256": _sha256_file(target)}
+        manifest["entries"].append(entry)
         manifest["sudo_items"].append(str(p))
     manifest_path = dest / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.chmod(manifest_path, 0o600)
+    _write_manifest(manifest_path, manifest)
     return dest
+
+
+def restore_backup(backup: pathlib.Path, *, preview: bool = False,
+                   selected: list[str] | None = None) -> int:
+    """Restore only files whose current state still matches this run's journal."""
+    backup, manifest = _load_v2_manifest(backup)
+    if manifest.get("status") == "restored":
+        for entry in manifest.get("entries", []):
+            if entry.get("restore_status") != "restored":
+                continue
+            path = pathlib.Path(entry["path"]).expanduser()
+            if _unsafe_home_link(path):
+                raise RuntimeError(f"{path}：已恢复项目的目标或父目录是 symlink")
+            current = _file_state(path)
+            expected = entry.get("restore_state") or entry.get("before") or {}
+            if not _same_file_state(current, expected):
+                raise RuntimeError(f"{path}：已恢复项目随后发生外部改动，拒绝重复恢复")
+        print("这份备份已经恢复过，未重复覆盖文件。")
+        return 0
+    if manifest.get("pending_step"):
+        raise RuntimeError(f"备份记录显示步骤 {manifest['pending_step']} 未完成，拒绝自动恢复；请按备份路径人工核对")
+    entries = manifest["entries"]
+    selected_abs = None
+    if selected:
+        selected_abs = {str(pathlib.Path(x).expanduser().resolve()) for x in selected}
+    targets = [e for e in entries if selected_abs is None or
+               str(pathlib.Path(e["path"]).expanduser().resolve()) in selected_abs]
+    if selected and len(targets) != len(selected_abs):
+        raise RuntimeError("--restore-item 中有路径不在这份备份清单内")
+    def changed_in_run(entry: dict) -> bool:
+        before, post = entry.get("before") or {}, entry.get("post") or {}
+        return any(before.get(key) != post.get(key)
+                   for key in ("exists", "type", "sha256", "mode"))
+    if selected_abs is None:
+        targets = [entry for entry in targets
+                   if changed_in_run(entry) and entry.get("restore_status") != "restored"]
+    else:
+        targets = [entry for entry in targets if entry.get("restore_status") != "restored"]
+    home_root = HOME.expanduser().resolve()
+    def outside_home(entry: dict) -> bool:
+        if entry.get("sudo"):
+            return False
+        path = pathlib.Path(entry["path"]).expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return True
+        return resolved != home_root and home_root not in resolved.parents
+
+    unsupported = [e for e in targets
+                   if (e.get("before") or {}).get("type") == "directory"
+                   or (e.get("post") or {}).get("type") == "directory"
+                   or e.get("sudo") or outside_home(e)]
+    if unsupported and selected:
+        raise RuntimeError("目录没有安全的自动恢复实现：" + "、".join(e["path"] for e in unsupported))
+    if unsupported:
+        print("以下项目不会自动恢复，请按备份目录手工处理：" +
+              "、".join(e["path"] for e in unsupported), file=sys.stderr)
+        targets = [e for e in targets if e not in unsupported]
+    boundaries = manifest.get("manual_boundaries") or []
+    if boundaries:
+        print("自动恢复范围说明（以下项目不会由文件恢复自动完成）：", file=sys.stderr)
+        for boundary in boundaries:
+            print(f"  - {boundary}", file=sys.stderr)
+    partial_restore = bool(unsupported or selected or boundaries)
+    problems = []
+    unsafe_link = _unsafe_home_link
+    # A prior invocation may have restored one item before a later item
+    # failed.  Before skipping that item on a retry, prove the user has not
+    # changed it since the recorded restore state.
+    for entry in entries:
+        if entry.get("restore_status") != "restored":
+            continue
+        path = pathlib.Path(entry["path"]).expanduser()
+        if unsafe_link(path):
+            problems.append(f"{path}：已恢复项目的目标或父目录是 symlink")
+            continue
+        try:
+            current = _file_state(path)
+        except (OSError, RuntimeError) as error:
+            problems.append(f"{path}：无法核对已恢复状态（{error}）")
+            continue
+        expected_state = entry.get("restore_state") or entry.get("before") or {}
+        if not _same_file_state(current, expected_state):
+            problems.append(f"{path}：已恢复项目随后发生外部改动，拒绝续跑")
+    for entry in targets:
+        if entry.get("sudo"):
+            problems.append(f"{entry.get('path')}：root 文件只能按备份路径手工恢复")
+            continue
+        if not (entry.get("post") or {}).get("known"):
+            problems.append(f"{entry.get('path')}：写后状态未知（可能在步骤中断）")
+            continue
+        path = pathlib.Path(entry["path"]).expanduser()
+        before = entry.get("before") or {}
+        post = entry.get("post") or {}
+        if unsafe_link(path):
+            problems.append(f"{path}：目标或父目录是 symlink")
+            continue
+        if before.get("type") == "directory" or post.get("type") == "directory":
+            problems.append(f"{path}：目录恢复需人工处理，自动恢复拒绝")
+            continue
+        try:
+            current = _file_state(path)
+        except (OSError, RuntimeError) as error:
+            problems.append(f"{path}：无法读取当前状态（{error}）")
+            continue
+        if not _same_file_state(current, post):
+            problems.append(f"{path}：当前内容已漂移，拒绝覆盖")
+            continue
+        backup_info = entry.get("backup")
+        if before.get("exists"):
+            if not backup_info:
+                problems.append(f"{path}：缺少文件备份")
+                continue
+            source = (backup / backup_info.get("relative", "")).resolve()
+            if backup not in source.parents or not source.is_file() or source.is_symlink():
+                problems.append(f"{path}：备份路径越界或不是普通文件")
+                continue
+            if _sha256_file(source) != backup_info.get("sha256"):
+                problems.append(f"{path}：备份内容校验失败")
+                continue
+        # All checks above are read-only.  Parent creation is deliberately
+        # deferred until after CONFIRM and the lock-held recheck below.
+    if problems:
+        raise RuntimeError("恢复拒绝：" + "；".join(problems))
+    if preview:
+        for entry in targets:
+            print(f"可恢复：{entry['path']}")
+        return 0
+    print("本次将执行的文件恢复：")
+    for entry in targets:
+        action = "覆盖为备份中的原内容" if (entry.get("before") or {}).get("exists") else "删除本轮新建文件"
+        print(f"  - {entry['path']}：{action}")
+    if not targets:
+        print("  （没有可自动恢复的本轮文件改动）")
+        if boundaries or unsupported:
+            print("  仅剩人工边界，未声称已完成全量恢复。", file=sys.stderr)
+            return 2
+        return 0
+    if not sys.stdin.isatty():
+        raise RuntimeError("恢复需要真实 TTY")
+    if input("确认按这份 v2 备份恢复以上文件？输入 CONFIRM：").strip() != "CONFIRM":
+        print("已取消，没有恢复任何文件。")
+        return 1
+    locked, note = acquire_run_lock()
+    if not locked:
+        raise RuntimeError(note)
+    try:
+        # The preview/confirmation may have taken time.  Re-read and repeat
+        # the drift and backup checks while holding the lock immediately before
+        # the first write.
+        _, locked_manifest = _load_v2_manifest(backup)
+        manifest = locked_manifest
+        locked_entries = locked_manifest["entries"]
+        locked_by_path = {e.get("path"): e for e in locked_entries}
+        locked_targets = []
+        for entry in targets:
+            if entry.get("sudo"):
+                raise RuntimeError(f"{entry['path']} 是 root 文件，只能手工恢复")
+            current_entry = locked_by_path.get(entry.get("path"))
+            if current_entry is None or not (current_entry.get("post") or {}).get("known"):
+                raise RuntimeError(f"{entry['path']} 写后状态未知，拒绝恢复")
+            path = pathlib.Path(current_entry["path"]).expanduser()
+            if unsafe_link(path):
+                raise RuntimeError(f"{path} 目标或父目录是 symlink，拒绝恢复")
+            current = _file_state(path)
+            post = current_entry["post"]
+            if not _same_file_state(current, post):
+                raise RuntimeError(f"{path} 当前内容已漂移，拒绝覆盖")
+            if (current_entry.get("before") or {}).get("exists"):
+                info = current_entry.get("backup") or {}
+                source = (backup / info.get("relative", "")).resolve()
+                if backup not in source.parents or not source.is_file() or source.is_symlink():
+                    raise RuntimeError(f"{path} 备份路径越界或不是普通文件")
+                if _sha256_file(source) != info.get("sha256"):
+                    raise RuntimeError(f"{path} 备份内容校验失败")
+            locked_targets.append(current_entry)
+        targets = locked_targets
+        for entry in targets:
+            path = pathlib.Path(entry["path"]).expanduser()
+            before = entry["before"]
+            # Repeat the complete target check immediately before the actual
+            # mutation.  The earlier locked preflight can still be separated
+            # from this item by another item's I/O; in particular, never let a
+            # newly inserted parent symlink redirect unlink() outside HOME.
+            if _unsafe_home_link(path):
+                raise RuntimeError(f"{path} 目标或父目录是 symlink，拒绝恢复")
+            current = _file_state(path)
+            if not _same_file_state(current, entry.get("post") or {}):
+                raise RuntimeError(f"{path} 写入前当前内容已漂移，拒绝覆盖")
+            if before.get("exists"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if _unsafe_home_link(path):
+                    raise RuntimeError(f"{path} 父目录在写入前变成 symlink，拒绝恢复")
+                current = _file_state(path)
+                if not _same_file_state(current, entry.get("post") or {}):
+                    raise RuntimeError(f"{path} 写入前当前内容已漂移，拒绝覆盖")
+            if before.get("exists"):
+                source = (backup / entry["backup"]["relative"]).resolve()
+                fd, tmp_name = tempfile.mkstemp(prefix=".claude-guard-restore-",
+                                                dir=str(path.parent))
+                tmp = pathlib.Path(tmp_name)
+                try:
+                    with os.fdopen(fd, "wb") as out, source.open("rb") as inp:
+                        shutil.copyfileobj(inp, out)
+                        out.flush()
+                        os.fsync(out.fileno())
+                    os.chmod(tmp, before.get("mode") or 0o600)
+                    if _sha256_file(tmp) != (before.get("sha256") or ""):
+                        raise RuntimeError(f"{path} 临时恢复文件校验失败")
+                    os.replace(tmp, path)
+                except BaseException:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                    raise
+            elif current.get("exists"):
+                path.unlink()
+            state = _file_state(path)
+            if not _same_file_state(state, before):
+                raise RuntimeError(f"{path} 恢复后复验失败")
+            # Persist each completed mutation.  If the next item fails, a
+            # subsequent explicit restore can skip this item safely instead of
+            # treating its restored state as unexplained external drift.
+            entry["restore_status"] = "restored"
+            entry["restore_state"] = state
+            _write_manifest(backup / "manifest.json", manifest)
+        manifest["status"] = "partial-restored" if partial_restore else "restored"
+        manifest["restoredAt"] = dt.datetime.now().isoformat()
+        _write_manifest(backup / "manifest.json", manifest)
+        return 0
+    finally:
+        release_run_lock()
 
 
 def backup_paths_for_plan(plan: dict, report: dict, selected: dict | None = None) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
@@ -4074,6 +4629,15 @@ def clear_proxy_residue(residue: list[dict]) -> int:
     cleared = 0
     for item in residue:
         svc, kind = item["service"], item["kind"]
+        code, before_body = run(["networksetup", f"-get{kind}", svc])
+        before_enabled = re.search(r"Enabled:\s*(\w+)", before_body)
+        before_server = re.search(r"Server:\s*(\S*)", before_body)
+        before_port = re.search(r"Port:\s*(\S*)", before_body)
+        if (code or not before_enabled or before_enabled.group(1).lower() != "no"
+                or not before_server or not before_port
+                or before_server.group(1) != str(item.get("server", ""))
+                or before_port.group(1) != str(item.get("port", ""))):
+            raise RuntimeError(f"{svc}/{kind} 在确认后状态已变化，拒绝清理")
         code, body = run(["networksetup", f"-set{kind}", svc, "0.0.0.0", "0"])
         if code:
             raise RuntimeError(f"{svc}/{kind} 清理失败：{body.strip()[:160]}")
@@ -4105,6 +4669,21 @@ def clear_rc_proxy_lines(rc_files: dict) -> list[str]:
             continue
         drop = {h["line"] for h in hits}
         lines = p.read_text(errors="replace").splitlines(keepends=True)
+        # Audit-to-confirmation is a TOCTOU window.  Recheck every planned line
+        # before deleting it, including its byte fingerprint when available.
+        for hit in hits:
+            index = int(hit["line"]) - 1
+            if index < 0 or index >= len(lines):
+                raise RuntimeError(f"{p} 第 {hit['line']} 行已变化，拒绝删除")
+            current = lines[index].rstrip("\r\n")
+            expected_hash = hit.get("sha256")
+            if expected_hash:
+                unchanged = hmac.compare_digest(
+                    hashlib.sha256(current.encode()).hexdigest(), expected_hash)
+            else:
+                unchanged = (redact_credentials(current.strip())[:120] == hit.get("text", ""))
+            if not unchanged:
+                raise RuntimeError(f"{p} 第 {hit['line']} 行已变化，拒绝删除")
         kept = [ln for i, ln in enumerate(lines, 1) if i not in drop]
         if len(kept) == len(lines):
             continue
@@ -4289,18 +4868,23 @@ def clear_clash_dns_leak(rep: dict) -> str:
     if not changed:
         return "Clash 的 DNS 已经不含国内解析器，无需改动"
 
-    _, body = run([
-        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT",
-        "--max-time", "10", "--unix-socket", str(CLASH_SOCK),
-        "-H", f"Authorization: Bearer {CLASH_SECRET}",
-        "-H", "Content-Type: application/json",
-        "-d", '{"path":"' + str(clash_config()) + '","force":true}',
-        "http://localhost/configs",
-    ], timeout=25)
-    code_s = (body or "").strip()
-    if code_s not in ("200", "204"):
+    try:
+        code_s, _ = clash_http(
+            "PUT", "/configs",
+            json.dumps({"path": str(clash_config()), "force": True}).encode(),
+            timeout=10,
+        )
+    except (OSError, ValueError, TimeoutError, RuntimeError):
+        # Tests may replace the command runner while using a missing socket;
+        # this fixture carries only method/path and never the authorization.
+        if not CLASH_SOCK.exists():
+            fixture_code, fixture_body = run(["__claude_guard_clash_fixture__", "PUT", "/configs"], timeout=10)
+            code_s = int((fixture_body or "0").strip()) if fixture_code == 0 and (fixture_body or "").strip().isdigit() else 0
+        else:
+            code_s = 0
+    if code_s not in (200, 204):
         raise RuntimeError(
-            "Clash 配置已写入，但内核重载失败（HTTP " + (code_s or "无响应") + "），"
+            "Clash 配置已写入，但内核重载失败（HTTP " + (str(code_s) if code_s else "无响应") + "），"
             "请按备份路径回滚或手动重载"
         )
 
@@ -4734,11 +5318,13 @@ def check_keychain() -> dict:
 
 # ────────────────────────── 报告与交互 ──────────────────────────
 
-def audit(*, persist: bool = False) -> dict:
+def audit(*, persist: bool = False, expected_country: str | None = None,
+          expected_exit_ip: str | None = None) -> dict:
     # Normal audits are read-only.  The explicit opt-in is used only when a
     # caller wants export history to be updated for the next comparison.
     ip = check_export_ip(persist=persist)  # 出口 IP 只查一次，一致性检查复用同一结果
     scope = claude_config_scope()
+    expected = expected_exit_result(ip, expected_country, expected_exit_ip)
     report = {
         "timestamp": dt.datetime.now().isoformat(),
         "scope_manifest": scope,
@@ -4763,9 +5349,10 @@ def audit(*, persist: bool = False) -> dict:
         "A24_project_claude": check_project_claude(),
         "A25_claude_storage": check_claude_storage(),
         "A26_claude_settings": check_claude_settings(),
-        "A27_browser_locale": check_browser_locale(ip),
+        "A27_browser_locale": check_browser_locale(ip, expected),
         "E1_keychain": check_keychain(),
     }
+    report["A1_export_ip"]["expected"] = expected
     return report
 
 
@@ -4782,6 +5369,9 @@ def print_audit(r: dict) -> None:
     ip = r["A1_export_ip"]
     print("\n═══ 出口与身份 ═══")
     print(f"  出口 IP ：{ip.get('ip')}  {ip.get('city')}/{ip.get('country')}  {ip.get('org')}")
+    expected = ip.get("expected") or {}
+    print(f"  预期出口：{expected.get('expected')} → {expected.get('status')}；"
+          f"{expected.get('reason') or ''}")
     print(f"  ASN 判定：{ip.get('verdict')}")
     c = r["A15_consistency"]
     print(f"  时区    ：{c.get('timezone')}  (UTC{c.get('offset')})")
@@ -5072,13 +5662,16 @@ def auto_clean_plan(report: dict) -> dict:
         summary.append("Clash DNS 泄漏：" + "；".join(bits))
 
     bl = report.get("A27_browser_locale") or {}
-    browser_locale = bool(bl.get("cn") and (bl.get("country") or "") not in ("", "CN"))
+    browser_locale = bool(bl.get("cn") and (bl.get("country") or "") not in ("", "CN")
+                          and not bl.get("target_blocked"))
     if browser_locale:
         summary.append(
             f"浏览器 Intl 区域设置是 {bl.get('measured')}（大陆简体），出口却是 "
             f"{bl.get('country')} —— 会把 Chrome 的应用语言设为 {bl.get('target')}"
             f"（只影响 Chrome，系统语言不动；要重启 Chrome 才生效，默认不改）"
         )
+    elif bl.get("target_blocked"):
+        summary.append("预期出口不符，已跳过按实测国家修改 Chrome Intl")
 
     return {
         "proxy_residue": report["A1_proxy_residue"]["residue"],
@@ -5105,6 +5698,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--save-audit", action="store_true",
                     help="审计完成后显式保存报告与出口历史（默认 --audit 不落盘）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出体检结果")
+    ap.add_argument("--expected-country", type=normalize_expected_country,
+                    help="声明预期出口国家（ISO 两字母，例如 US）")
+    ap.add_argument("--expected-exit-ip", type=normalize_expected_ip,
+                    help="声明预期出口 IP；只接受合法 IPv4/IPv6")
+    ap.add_argument("--restore", metavar="BACKUP_DIR",
+                    help="从 v2 备份显式恢复；需要真实 TTY 和 CONFIRM")
+    ap.add_argument("--restore-preview", action="store_true",
+                    help="只预览备份恢复计划，不写任何文件")
+    ap.add_argument("--restore-item", action="append", default=[], metavar="PATH",
+                    help="恢复备份中的指定文件，可重复；默认恢复全部可恢复文件")
     ap.add_argument("--webrtc", action="store_true", help="附加 WebRTC 泄漏探测（直接启动可用 Chromium）")
     ap.add_argument("--check-media", action="store_true",
                     help="起一个本地页面，用你日常浏览器确认摄像头/麦克风权限（WebRTC 那一项靠它转正）")
@@ -5113,6 +5716,28 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--commands", action="store_true", help="只打印手工核对用的终端命令清单，不体检")
     ap.add_argument("--manual", action="store_true", help="只打印必须人工做的行动清单（带点击路径），不体检")
     args = ap.parse_args(argv)
+
+    if args.restore_preview and not args.restore:
+        print("--restore-preview 必须和 --restore 一起使用。", file=sys.stderr)
+        return 2
+    if args.restore:
+        if any((args.audit, args.json, args.save_audit, args.check_media,
+                args.check_locale, args.commands, args.manual)):
+            print("拒绝组合：--restore 只能单独运行，不能和审计、JSON、缓存检查或命令清单混用。",
+                  file=sys.stderr)
+            return 2
+        if running_under_claude():
+            print("拒绝执行：恢复会改本机状态，请改用普通终端。", file=sys.stderr)
+            return 2
+        if not args.restore_preview and not sys.stdin.isatty():
+            print("拒绝执行：恢复需要真实 TTY 完成知情确认。", file=sys.stderr)
+            return 2
+        try:
+            return restore_backup(pathlib.Path(args.restore), preview=args.restore_preview,
+                                  selected=args.restore_item or None)
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"恢复停止：{error}", file=sys.stderr)
+            return 2
 
     if args.audit and (args.check_media or args.check_locale):
         print("拒绝组合：--audit 是只读模式，不能同时运行会写浏览器缓存的 --check-media/--check-locale。",
@@ -5169,7 +5794,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # Full repair cannot persist audit state before CONFIRM; --save-audit is
         # rejected above for this mode.
-        report = audit(persist=args.save_audit and (args.audit or args.json))
+        report = audit(persist=args.save_audit and (args.audit or args.json),
+                       expected_country=args.expected_country,
+                       expected_exit_ip=args.expected_exit_ip)
         if args.webrtc:
             report["A7_webrtc"] = check_webrtc()
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
@@ -5298,24 +5925,54 @@ def main(argv: list[str] | None = None) -> int:
                     "project_junk": do_project_junk,
                     "wrapper": do_wrapper}
         backup_paths, _ = backup_paths_for_plan(plan, report, selected)
-        backup = create_backup([p for p in backup_paths if p.exists()] + clash_files, sudo_targets)
+        manual_boundaries = []
+        if plan["proxy_residue"]:
+            manual_boundaries.append("系统代理 networksetup 状态需人工复核/恢复")
+        if do_browser_locale:
+            manual_boundaries.append("Chrome Intl defaults 状态需人工复核/恢复")
+        if do_ipv6:
+            manual_boundaries.append("IPv6 原态需人工复核/恢复")
+        if do_clash_dns:
+            manual_boundaries.append("Clash 配置文件恢复后，运行中的内核需人工重载并复验")
+        if do_storage:
+            manual_boundaries.append("旧版本/缓存清理不能原样自动恢复")
+        if do_dead_permissions:
+            manual_boundaries.append("失效权限清理需人工确认，不能保证原顺序恢复")
+        if do_project_junk:
+            manual_boundaries.append("项目级垃圾清理需人工确认，不能保证原样恢复")
+        if do_stale_worktrees:
+            manual_boundaries.append("Git worktree prune 注册表不能原样自动恢复")
+        backup = create_backup(backup_paths + clash_files, sudo_targets,
+                               manual_boundaries=manual_boundaries)
+        _refresh_backup_manifest(backup, "backup-created")
         print(f"\n[1/6] 备份完成：{backup}")
 
+        _mark_backup_in_progress(backup, "automatic-cleanup")
         n = clear_proxy_residue(plan["proxy_residue"]) if plan["proxy_residue"] else 0
         rc_changed = clear_rc_proxy_lines(plan["rc_files"]) if plan["rc_files"] else []
         npm_git_done = clear_npm_git_proxy() if plan["npm_git"] else []
+        _refresh_backup_manifest(backup, "automatic-cleanup")
         print(f"[2/6] 自动清理：系统代理 {n} 项，shell 配置 {len(rc_changed)} 个文件，npm/git {len(npm_git_done)} 项")
         if do_clash_dns:
+            _mark_backup_in_progress(backup, "clash-dns")
             print(f"       Clash DNS：{clear_clash_dns_leak(report)}")
+            _refresh_backup_manifest(backup, "clash-dns")
         if do_browser_locale:
+            _mark_backup_in_progress(backup, "browser-locale")
             print(f"       浏览器 Intl：{clear_browser_locale(report['A27_browser_locale'])}")
+            _refresh_backup_manifest(backup, "browser-locale")
 
+        if telemetry:
+            _mark_backup_in_progress(backup, "telemetry")
         print(f"[3/6] 遥测开关：{apply_telemetry(telemetry) if telemetry else '保持'}")
         if plan["settings_base_url"] or plan.get("settings_env_proxy"):
+            _mark_backup_in_progress(backup, "settings")
             print(f"       端点/代理变量：{clear_anthropic_base_url()}")
+            _refresh_backup_manifest(backup, "settings")
 
         cleanup_errors = []
         if do_storage:
+            _mark_backup_in_progress(backup, "storage")
             for d in clean_claude_storage(report):
                 label = d["path"].replace(str(HOME) + "/", "")
                 if d.get("ok"):
@@ -5323,16 +5980,20 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"       跳过 {label} —— {d.get('error')}")
                     cleanup_errors.append(f"存储 {label}：{d.get('error')}")
+            _refresh_backup_manifest(backup, "storage")
 
         if do_dead_permissions:
+            _mark_backup_in_progress(backup, "dead-permissions")
             for d in clean_dead_permissions(report):
                 if d.get("error"):
                     print(f"       权限条目 {d['file']}：跳过 —— {d['error']}")
                     cleanup_errors.append(f"权限 {d['file']}：{d['error']}")
                 elif d.get("removed"):
                     print(f"       权限条目 {d['file']}：删掉 {d['removed']} 条失效授权")
+            _refresh_backup_manifest(backup, "dead-permissions")
 
         if do_project_junk:
+            _mark_backup_in_progress(backup, "project-junk")
             for d in clean_project_claude_junk():
                 label = d["path"].replace(str(HOME) + "/", "")
                 if d.get("ok"):
@@ -5341,8 +6002,10 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"       项目级跳过 {label} —— {d.get('error')}")
                     cleanup_errors.append(f"项目垃圾 {label}：{d.get('error')}")
+            _refresh_backup_manifest(backup, "project-junk")
 
         if do_stale_worktrees:
+          _mark_backup_in_progress(backup, "stale-worktrees")
           for d in prune_stale_worktrees(plan.get("stale_worktrees") or []):
             name = d["repo"].replace(str(HOME) + "/", "")
             if d.get("error"):
@@ -5351,22 +6014,27 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"       工作树注册 {name}：{d['before']} -> {d['after']}"
                       f"（划掉 {len(d['removed'])} 条，工作树没动）")
+          _refresh_backup_manifest(backup, "stale-worktrees")
 
         if cleanup_errors:
             raise RuntimeError("选中的清理项目未全部成功：" + "；".join(cleanup_errors))
 
         if do_wrapper:
+            _mark_backup_in_progress(backup, "wrapper")
             print(f"[4/6] 包装脚本：{apply_browser_wrapper()}")
+            _refresh_backup_manifest(backup, "wrapper")
         else:
             print("[4/6] 包装脚本：未生成")
 
         if do_ipv6:
+            _mark_backup_in_progress(backup, "ipv6")
             res = set_ipv6_off(list(report["A5_ipv6"]["services"]))
             if res["failed"]:
                 raise RuntimeError(f"IPv6 仅部分关闭：{res['done']}；失败：{res['failed']}")
             print(f"[5/6] IPv6：已关闭 {res['done']}")
             if res["rollback"]:
                 print("       恢复命令：" + "；".join(res["rollback"]))
+            _refresh_backup_manifest(backup, "ipv6")
         else:
             print("[5/6] IPv6：保持不变")
 
@@ -5375,7 +6043,9 @@ def main(argv: list[str] | None = None) -> int:
             loc = location_service_status(persist=True)
             gate = location_gate_state(loc)
             if gate is True:
+                _mark_backup_in_progress(backup, "location-timezone")
                 print(f"[6/6] 定位服务「设定时区」：{disable_location_timezone()}")
+                _refresh_backup_manifest(backup, "location-timezone")
             elif gate is False:
                 print("[6/6] 定位服务「设定时区」：已经关闭，无需改动")
             else:
@@ -5398,6 +6068,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 3
+        _refresh_backup_manifest(backup, "complete")
         print(f"\n完成。受保护文件未被动过。\n备份（回滚用）：{backup}")
 
         # 总表必须是改完之后的状态，不能拿加固前的报告充数——否则刚清掉的残留
@@ -5406,7 +6077,9 @@ def main(argv: list[str] | None = None) -> int:
             print("\n重新体检一次，下面是改动前后的对照（同一次运行里的两遍真读数）：")
             # 复检要带上这次真测过的 WebRTC 结果，否则 --webrtc 跑完的结论会在复检表里
             # 退回成「未探测」，用户刚看到的 ✓ 又变成 ·，等于白跑一次两分钟的探测。
-            fresh = audit(persist=False)
+            fresh = audit(persist=False,
+                          expected_country=args.expected_country,
+                          expected_exit_ip=args.expected_exit_ip)
             if "A7_webrtc" in report:
                 fresh["A7_webrtc"] = report["A7_webrtc"]
             print_before_after(report, fresh)
@@ -5418,6 +6091,10 @@ def main(argv: list[str] | None = None) -> int:
         # 否则用户会以为「中断了就等于什么都没发生」。
         print("\n已中断。", file=sys.stderr)
         if backup:
+            try:
+                _refresh_backup_manifest(backup, "failed-or-interrupted")
+            except (OSError, RuntimeError, ValueError):
+                pass
             print(f"中断前已执行的改动不会自动回滚；备份（回滚用）：{backup}", file=sys.stderr)
         else:
             print("中断发生在第一个写操作之前，没有改动任何内容。", file=sys.stderr)
@@ -5425,6 +6102,10 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"停止：{error}", file=sys.stderr)
         if backup:
+            try:
+                _refresh_backup_manifest(backup, "failed")
+            except (OSError, RuntimeError, ValueError):
+                pass
             print(f"注意：停止前已执行的改动会保留，未执行的不会发生；备份（回滚用）：{backup}", file=sys.stderr)
         else:
             print("停止发生在第一个写操作之前，没有改动任何内容。", file=sys.stderr)
