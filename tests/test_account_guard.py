@@ -4252,31 +4252,47 @@ class TestVerifyServerToken(unittest.TestCase):
         self.addCleanup(restore)
 
     def test_token_gates_both_the_page_and_the_report(self):
-        import re
+        import http.server
         import threading
-        import time
         import urllib.error
         import urllib.request
 
         token = "c" * 48
         buf = io.StringIO()
         box: dict = {}
+        bound = threading.Event()
+
+        # Capture readiness after the real server has completed bind/listen.
+        # Polling redirected stdout is racy in CI while the worker waits for
+        # a browser response.  Keep the production HTTPServer implementation
+        # so this still exercises the real socket and token gate.
+        real_server = http.server.ThreadingHTTPServer
+
+        class CapturingServer(real_server):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                host, port = self.server_address[:2]
+                box["url"] = f"http://{host}:{port}/{token}/"
+                bound.set()
 
         def serve():
-            with contextlib.redirect_stdout(buf):
-                box["out"] = g.verify_media_permission(timeout=8)
+            try:
+                with contextlib.redirect_stdout(buf):
+                    box["out"] = g.verify_media_permission(timeout=8)
+            except BaseException as exc:
+                box["error"] = f"{type(exc).__name__}: {exc}"
+                raise
 
-        with mock.patch.object(g, "_verify_token", return_value=token):
+        with mock.patch.object(g, "_verify_token", return_value=token), \
+             mock.patch.object(http.server, "ThreadingHTTPServer", CapturingServer):
             t = threading.Thread(target=serve, daemon=True)
             t.start()
-            url = None
-            for _ in range(100):
-                m = re.search(r"http://127\.0\.0\.1:\d+/" + token + r"/", buf.getvalue())
-                if m:
-                    url = m.group(0)
-                    break
-                time.sleep(0.1)
-        self.assertIsNotNone(url, f"没等到带令牌的 URL，服务输出：{buf.getvalue()!r}")
+            self.assertTrue(
+                bound.wait(timeout=30),
+                f"本地复核服务未完成端口绑定（线程存活={t.is_alive()}，错误={box.get('error')!r}）",
+            )
+            url = box.get("url")
+        self.assertIsInstance(url, str)
         bare = url.replace(token + "/", "")
 
         # ① 不知道令牌的本地进程连页面都取不到
@@ -4303,6 +4319,7 @@ class TestVerifyServerToken(unittest.TestCase):
         with urllib.request.urlopen(req_ok, timeout=5) as resp2:
             self.assertEqual(resp2.status, 204)
         t.join(timeout=10)
+        self.assertFalse(t.is_alive(), "本地复核服务线程未在回传后退出")
         self.assertEqual(box["out"].get("camera"), "denied")
 
     def test_oversized_report_is_truncated_not_swallowed_whole(self):
