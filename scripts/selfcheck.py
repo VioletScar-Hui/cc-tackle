@@ -4,7 +4,7 @@
 把散在 SKILL.md 和桌面指令文档各节的复核命令串成一条。检查七件事：技能文件
 齐全 → 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四
 开关 → 完整环境体检，跑完出两张表：先一张七项自检的结论表，再把最后那项
-「完整环境体检」的 25 项逐条展开（明细取自体检自己写出的 JSON 报告，判定不在
+「完整环境体检」的 25 项逐条展开（明细取自体检自己输出的 JSON，判定不在
 这里重写一遍，免得两处各说各话）。
 
 用法：
@@ -14,8 +14,8 @@
 
 退出码：0 全过（可能带 ! 提示）；1 有项目失败；2 脚本自己的运行环境有问题。
 
-只读：本脚本不改任何配置。唯一的写操作是最后一步 --audit 会往
-~/ClaudeGuardBackups/ 落一份 JSON 报告，那是体检脚本本来的行为。
+只读：本脚本不改任何配置，也不依赖审计隐式写出的文件。需要保存报告时，单独给
+account_guard.py 传 --save-audit。
 """
 
 from __future__ import annotations
@@ -234,13 +234,19 @@ def check_audit(project_roots: str = ""):
         env["CLAUDE_GUARD_PROJECT_ROOTS"] = project_roots
     else:
         env.pop("CLAUDE_GUARD_PROJECT_ROOTS", None)
-    code, out = sh([sys.executable, str(HERE / "account_guard.py"), "--audit"],
+    code, out = sh([sys.executable, str(HERE / "account_guard.py"), "--audit", "--json"],
                    timeout=900, cwd=SKILL, env=env)
-    m = SUMMARY_RE.search(out)
-    if not m:
-        add("完整环境体检", BAD, f"没读出总表汇总行（退出码 {code}）：{tail(out)}")
+    try:
+        report = json.loads(out)
+    except (ValueError, TypeError):
+        add("完整环境体检", BAD, f"没读出 JSON 报告（退出码 {code}）：{tail(out)}")
         return "", None
-    total, solved, todo, bad, na = (int(x) for x in m.groups())
+    rows = g.build_summary(report)
+    total = len(rows)
+    solved = sum(1 for _n, status, _d in rows if status == g.S_OK)
+    todo = sum(1 for _n, status, _d in rows if status == g.S_FIX)
+    bad = sum(1 for _n, status, _d in rows if status == g.S_BAD)
+    na = sum(1 for _n, status, _d in rows if status == g.S_NA)
     detail = f"{total} 项：已解决 {solved}、待处理 {todo}、未解决 {bad}、未测到 {na}"
     if bad:
         add("完整环境体检", BAD, detail + "；有未解决项，跑不带参数的 account_guard.py 处理")
@@ -248,14 +254,7 @@ def check_audit(project_roots: str = ""):
         add("完整环境体检", HINT, detail + "；有待处理的，跑不带参数的 account_guard.py 处理")
     else:
         add("完整环境体检", OK, detail)
-    rp = re.search(r"报告已存：(\S+)", out)
-    if not rp:
-        return "", None
-    path = rp.group(1)
-    try:
-        return path, json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return path, None
+    return "", report
 
 
 def main() -> int:

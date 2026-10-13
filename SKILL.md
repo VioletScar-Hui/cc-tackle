@@ -1,22 +1,31 @@
 ---
 name: claude-account-guard
-description: 检测并自动清理 Claude Code 的本机环境（macOS）。一条命令跑完 25 项：出口 IP 与 ASN 类型是不是住宅、出口是否和上次一致、系统代理残留、DNS 与 WebRTC 有没有泄漏真实 IP、IPv6 有没有绕过隧道、时区分层与两道闸、浏览器 Intl 区域设置、settings.json 里的中转端点与凭据、遥测三键、第三方客户端痕迹、CLI 签名完整性、多账号痕迹、失效权限条目、过期工作树注册；检测完可自动清掉安全可逆的残留，改前先备份。Use when the user asks to check, audit, clean or harden a Claude Code / Claude environment on macOS：环境体检、登录前自检、被封后换环境前的排查、代理残留、DNS 泄漏、WebRTC 泄漏、出口 IP 与节点检查、时区不一致、账号风控排查。Claude Code environment audit, proxy / DNS / WebRTC leak check, exit IP and ASN, macOS only；不涉及账号申诉、付款或网页端设置。
+metadata:
+  version: "1.0.3"
+description: >-
+  检测并按用户选择修复 Claude Code 的本机环境——出口 IP 与 ASN 归属、系统代理与 shell/npm/git 残留、Clash 的 DNS 解析器与 WebRTC 泄漏、IPv6、时区分层与两道闸、`settings.json` 里的中转端点、钥匙串条目、第三方客户端痕迹、CLI 完整性与多账号痕迹。默认审计只读且不落盘；加固先展示完整计划，确认后备份优先、失败即停、每项写入后复验。
+  Use when 用户说「Claude 环境自检 / 保号体检 / 登录 Claude 前先检查环境 / 系统代理残留又出现了 / DNS 泄漏 / WebRTC 泄漏 / 出口 IP 是机房还是住宅 / 时区对不对 / settings.json 有没有中转残留 / 换订阅后 Claude 线路还通不通」，或换环境、换代理订阅、被封后重开之前要做环境排查时。
+  不用于：账号申诉、付款退款与 claude.ai 网页端设置（人工流程，本 skill 不涉及）；业务仓代码修复；本机网络链路或内核故障排查。
 ---
 
 # Claude Code 环境检测与自动清理
 
-一个脚本做两件事：**检测环境**，然后**自动清理环境里可安全清理的残留**。
+本 skill 的产出是「一张环境体检总表 + 用户明确选择后的改动记录」。它不改业务仓代码、不做账号申诉、不碰付款，也不处理其它工具（`~/.codex`、`~/.dsh`）自己的配置——那些只报告不代改。
 
-安全约定沿用 `claude-cleanup`：只读审计永远安全；写操作需要真实 TTY 和一次最终确认；备份是第一个写操作，失败即停；需要 root 时只在终端原生 sudo 隐藏提示里输密码，脚本从不读取或保存密码。
+一个脚本做两件事：**检测环境**，然后在用户确认后清理可安全清理的残留。
+
+安全约定沿用 `claude-cleanup`：只读审计永远安全且默认不落盘；写操作需要真实 TTY 和一次最终确认，确认前不请求 sudo、不建备份、不改状态；确认后先完成备份再改目标状态（并发锁只是控制元数据），备份失败即停；需要 root 时只在终端原生 sudo 隐藏提示里输密码，脚本从不读取或保存密码。
 
 ## 自动清理什么
 
-下面四类都幂等、可逆、有备份，所以**不再逐项询问**，跑一次直接清完：
+以下残留会在最终确认后按计划清理；Clash DNS、Chrome Intl 和不可原样回滚的清理动作会另行询问：
 
 - 未启用但存了值的系统代理残留（`127.0.0.1:7897` 这类，只在 `Enabled: No` 时才动）；
 - shell 配置（`.zshrc` / `.zprofile` / `.profile` 等）里的代理行；
 - npm 与 git 的全局代理配置；
 - Claude Code `settings.json` 的 `env` 里指向别处的端点、凭据与代理变量（`ANTHROPIC_BASE_URL`、`HTTPS_PROXY` 等）。
+
+这些目标和项目级 settings、npm/git 配置、浏览器回滚凭据都会纳入确认前展示的备份清单。系统级旧版本/缓存、失效 permissions、`.DS_Store`/`__pycache__` 和失效 worktree 注册不再默认清理：前两类不可原样回滚，worktree 是 Git 元数据变更；会单独列出并默认选否。
 
 清 shell 配置时只删命中那几行，注释、`EDITOR`、`alias` 之类全部原样保留；清 `settings.json` 时只动 `env` 里属于端点、凭据、代理的键，其余键以及非 `env` 键全部保留。每一项清完都复验。
 
@@ -24,29 +33,28 @@ description: 检测并自动清理 Claude Code 的本机环境（macOS）。一�
 
 ## 什么仍然由你决定
 
-因为**有副作用**，这三类保留询问，默认都选否：
+因为**有副作用**，以下操作逐项询问，默认都选否：
 
 - 遥测开关（`DISABLE_TELEMETRY` 等）——文章 §5 写明会连带关掉功能旗标，Remote Control 可能失效；
 - 关闭网络服务的 IPv6——需要管理员密码；
 - 关闭定位服务里的「设定时区」——改动系统隐私库，风险最高。
+- 修改 Clash DNS——写配置并请求内核重载。
+- 修改 Chrome Intl 应用语言——写 Chrome 偏好并需要重启。
+- 清理系统级旧版本/缓存、项目失效权限和 Git worktree 注册——分别按不可原样回滚或需备份的范围确认。
 
 ## 运行顺序
 
-想一次看全貌，先跑这一条（只读，约 1.5 分钟）：
-
-```bash
-python3 scripts/selfcheck.py
-```
-
-它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表：先一张七项结论表，再把「完整环境体检」那 25 项逐条展开，末尾给退出码（`0` 全过、`1` 有失败）。`--fast` 跳过单元测试，`--no-audit` 跳过体检。
+想先看全貌（只读，约 1.5 分钟），在本 skill 目录下跑 `python3 scripts/selfcheck.py`。它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表，并把体检那 25 项逐条展开；脚本按自己的位置定位，从任何工作目录调用都行，项目根没在 `CLAUDE_GUARD_PROJECT_ROOTS` 里指定时会自动用本 skill 所在的 git 仓并在末尾打出选中的是哪个。`--fast` 跳过单元测试，`--no-audit` 跳过体检。
 
 1. 如果当前执行者就是 Claude Code，只跑只读审计，并提醒用户换普通终端再执行加固（加固会改本机状态，不适合由正在使用它的进程发起）。
 
    ```bash
    python3 scripts/account_guard.py --audit
+   # 如需保存报告和出口历史，显式 opt-in：
+   python3 scripts/account_guard.py --audit --save-audit
    ```
 
-2. 由普通终端执行时，先跑审计并向用户说明：备份是第一个写操作；残留类会自动清、配置类会逐项问；密码只走 sudo 原生提示；每项改动后立即复验。
+2. 由普通终端执行时，先跑审计并向用户说明：确认前不写任何状态；确认后先备份再改目标状态；代理、shell、npm/git 和 Claude settings 会按计划处理，Clash DNS 与 Chrome Intl 分开询问且默认否；密码只走 sudo 原生提示；每项改动后立即复验。`--save-audit` 只与 `--audit` 或 `--json` 一起使用，完整加固模式会拒绝该组合。
 
 3. 用户明确要求继续后：
 
@@ -114,7 +122,7 @@ python3 scripts/selfcheck.py
 A9（扫项目级 `CLAUDE.md` 里的地理位置词）需要知道你的项目在哪。skill 不猜目录结构，用环境变量指定，冒号分隔：
 
 ```bash
-CLAUDE_GUARD_PROJECT_ROOTS="$HOME/CC_Project" python3 scripts/account_guard.py --audit
+CLAUDE_GUARD_PROJECT_ROOTS="$HOME/code" python3 scripts/account_guard.py --audit
 ```
 
 不设这个变量时这一项会跳过并说明怎么开。
@@ -133,13 +141,13 @@ CLAUDE_GUARD_PROJECT_ROOTS="$HOME/CC_Project" python3 scripts/account_guard.py -
 
 ## 范围
 
-只针对 Claude Code。以下明确不在范围内：账号申诉、付款与退款、claude.ai 网页端设置、Active sessions、订阅节奏与路线选择这类行为决策，以及 `~/.codex`、`~/.dsh` 等其它工具的配置——那些只报告，不代改。
+只针对 Claude Code。默认覆盖 `~/.claude`；如果设置了 `CLAUDE_CONFIG_DIR` 指向其它目录，审计会在 `scope_manifest.out_of_scope` 明确列出未覆盖的全局 settings，并把相关行标为未测；完整加固会在确认、并发锁和备份前直接拒绝，不扫描或修改该自定义目录。以下明确不在范围内：账号申诉、付款与退款、claude.ai 网页端设置、Active sessions、订阅节奏与路线选择这类行为决策，以及 `~/.codex`、`~/.dsh` 等其它工具的配置——那些只报告，不代改。
 
 本 skill 也不用于规避封禁、支付检查或任何平台风控。清残留是为了在支持地区正常使用官方客户端时少被误伤，不是给开新号铺路。
 
 ## 回滚
 
-所有写操作前都会在 `~/ClaudeGuardBackups/guard-<时间戳>/` 留下带 `manifest.json` 的备份：
+所有目标文件或系统设置变更前都会在 `~/ClaudeGuardBackups/guard-<时间戳>/` 留下带 `manifest.json` 的备份（并发锁只用于控制运行）：
 
 ```bash
 ls ~/ClaudeGuardBackups
@@ -147,7 +155,7 @@ cp ~/ClaudeGuardBackups/guard-<时间戳>/files/Users__*__settings.json ~/.claud
 cp ~/ClaudeGuardBackups/guard-<时间戳>/files/Users__*__.zshrc ~/.zshrc
 ```
 
-需要 root 的文件（`/var/db/locationd/clients.plist`）用 `sudo cp` 从同一目录还原。生成的 `~/.local/bin/claude-safe` 直接删除即可。只读审计的报告存在 `~/ClaudeGuardBackups/audit-<时间戳>.json`。
+需要 root 的文件（`/var/db/locationd/clients.plist`）用 `sudo cp` 从同一目录还原。`~/.local/bin/claude-safe` 如果是本次新建且备份目录的 `manifest.json` 中没有它，才直接删除；如果它原本已经存在，就从备份里的对应文件恢复，不能直接删除。只有显式 `--save-audit` 时才会把报告写到 `~/ClaudeGuardBackups/audit-<时间戳>.json`；普通 `--audit` 不写报告、出口历史或浏览器缓存。
 
 IPv6 是唯一不走文件备份的改动，它在系统网络配置里，恢复要显式执行；脚本在关闭成功后会把这组命令直接打印出来，照抄即可。
 
@@ -161,77 +169,36 @@ python3 -m unittest discover -s tests -v
 
 结果总表也有专门的一组测试：每行的显示宽度必须一致（守住 CJK 对齐）、截断按显示宽度算、缺字段不得默认成「干净」、读不到的闸门必须标成待处理而不是已关、别的工具的残留不得说成会被清理、WebRTC 的 0 候选必须标成结论不可用。
 
-安装方式与本地服务另有覆盖：四条安装通道各自的命中条件、探测读不出来不得混成「没装」、老报告里没有 `install` 键时不得凭空指控「安装方式未知」、三个复核服务的令牌路由（不知道令牌取页面与投结果都必须是 404，这条是起真服务端到端跑的）、并发锁（第二个进程必须被拒、死进程留下的遗留锁必须能接管、放锁不得删别人的锁）、浏览器时区与出口时区不一致时只报事实不翻转判定。
-
-Chrome「要不要重启才生效」这一项也修掉一个假阳性：原来拿偏好 plist 的 mtime 当「语言刚被改过」的凭据，可 Chrome 运行时会重写它自己那份 plist，mtime 天天动 —— 实测 10-09 22:25 启动的 Chrome，plist 在 10-10 13:24 被 Chrome 自己写了一次，判定立刻说「Chrome 是改之前启动的」，而那个值早就生效了。现在改成**只有我们亲手改过才有依据**：依据来自 `clear_browser_locale` 写下的回滚凭据（里面记着改动时刻和改成什么），值对得上才拿它跟 Chrome 的启动时间比；对不上（用户自己在系统设置里改的、或状态目录被清过）就返回 `None`，如实说判断不了并指向 `--check-locale` 的浏览器实测。
-
-中间试过一版「自己记一份值、发现值变了就记当前时间」，写完自检全绿、单独再跑一次又报待处理 —— 同一个输入两次结果不一致。原因是这个启发式本身会误判：上次巡检是两天前、Chrome 昨天重启过，就会把「两次巡检之间变了」当成「刚刚变的」。宁可说不判断，也不给一个看着像证据的猜。测试钉了「只有 mtime 不算证据」「凭据里的值对不上不算证据」两条。
-
 时区与钥匙串这两项另有针对性回归：历史时区事件不得翻转当前判定、同一窗口内多个定位源事件要取时间上最后那条、`dump-keychain` 的十六进制写法必须能解析、`svce` 与 `acct` 不得跨条目块拼接。「绝不直连」判据按模式分别测：全局模式下 GLOBAL 指错要判不成立；规则模式下 Claude 域名没规则、规则指向别处、兜底是 DIRECT，三种都要判不成立；两种模式下组类型是 fallback、成员不止一个，都要判不成立。另有一条专门盯着「不得把 mode=rule 本身当成故障」——那是修过的 bug，容易被改回去。
+
+安装方式与本地服务另有覆盖：四条安装通道各自的命中条件、探测读不出来不得混成「没装」、老报告里没有 `install` 键时不得凭空指控「安装方式未知」、三个复核服务的令牌路由（不知道令牌取页面与投结果都必须是 404，这条是起真服务端到端跑的）、并发锁（第二个进程被拒、死进程留下的遗留锁能接管、放锁不删别人的锁）、带凭据的代理 URL 进报告前必须脱敏。Chrome「要不要重启」那一项也修掉一个假阳性：原来拿偏好 plist 的 mtime 当「语言刚被改过」的凭据，而 Chrome 运行时会重写它自己那份 plist —— 实测 10-09 22:25 启动的 Chrome，plist 在 10-10 13:24 被 Chrome 自己写了一次，判定就说要重启，而那份值早就生效了。现在只有「我们亲手改过」（读回滚凭据里记的时刻）才算依据，判断不了就返回 `None` 并指向 `--check-locale`。
 
 ## 借来的做法（来源：liseami/CCBaga）
 
 有几条做法是照这个项目改过来的，都落在脚本内部，表里那 25 行不变。
 
-**两个横切规则。** 第一，不可验证的东西不参与通过判定：探测本身读取失败（`brew list` 跑不起来、node 全局根读不出来）和「确实没装」必须分开报，读不到就说读不到，不许拿空结果当成功。表里的「未测到」就是这个规则的落地。第二，改完必须回读断言：清完代理残留要再读一次 `Enabled`，改完 Clash DNS 要重跑一次判定，写完不复验等于没做。
+**两个横切规则。** 第一，不可验证的东西不参与通过判定：探测本身读取失败（`brew list` 跑不起来、node 全局根读不出来）和「确实没装」必须分开报，读不到就说读不到。第二，改完必须回读断言：清完代理残留要再读一次 `Enabled`，改完 Clash DNS 要重跑一次判定。
 
-**三个具体做法。** 三个本地复核服务（媒体权限、WebRTC、Intl）各起一个 127.0.0.1 的 HTTP 服务，端口随机，但端口随机不等于有鉴权 —— 本机任何进程都能扫到端口往上投一份「摄像头已拒绝」，表就会把没测过的东西报成已解决。现在每次起服务生成 24 字节随机令牌当 URL 路径前缀，不知道令牌取页面和投结果都是一律 404。加固流程加了并发锁：备份、删除、改配置三件事交错的后果是回滚凭据和实际状态对不上，所以用 `O_CREAT|O_EXCL` 原子建锁文件，锁里记 pid，持有进程已经消失的遗留锁自动接管（否则一次 Ctrl-C 之后同一台机器就再也跑不起来）。调 CLI 一律带 `DISABLE_AUTOUPDATER=1`。
+**三个具体做法。** 三个本地复核服务（媒体权限、WebRTC、Intl）各起一个 127.0.0.1 的 HTTP 服务，端口随机，但端口随机不等于有鉴权 —— 本机任何进程都能扫到端口往上投一份「摄像头已拒绝」，把没测过的项报成已通过；现在每次生成 24 字节随机令牌当 URL 路径前缀，不知道令牌取页面和投结果都是一律 404。加固流程加了并发锁：备份、删除、改配置交错会让回滚凭据和实际状态对不上，所以用 `O_CREAT|O_EXCL` 原子建锁文件，锁里记 pid，持有进程已消失的遗留锁自动接管。调 CLI 一律带 `DISABLE_AUTOUPDATER=1`。
 
-**代理凭据不进报告。** `proxy=http://user:pass@host:port` 是很常见的写法，这些字符串会同时进终端输出和 audit JSON，而报告会被贴进聊天、存进备份目录。现在进报告前统一过一遍 `redact_credentials`：URL 里的用户名密码抹成 `***`，没有 `scheme://` 的 `@` 不碰（免得把邮箱也毁掉），而且**先抹再截断**——反过来凭据可能被截成半截，正则就匹配不上了。
+**代理凭据不进报告。** `proxy=http://user:pass@host:port` 很常见，这些字符串会同时进终端输出和 audit JSON。进报告前统一过一遍 `redact_credentials`：URL 里的用户名密码抹成 `***`，没有 `scheme://` 的 `@` 不碰（免得把邮箱也毁掉），先抹再截断。
 
 ## WebRTC：只有「授权之后」才漏，而且它绕过 TUN
 
-先纠正一个常见误读：检测站报「WebRTC 有泄漏风险」多半是通用警告，它们压根没测。真正测的那个（browserleaks.com/webrtc）在未授权时给的是 `No Leak`，Local IP 和 Public IP 都是空的。
+未授权时 mDNS 混淆生效、不泄漏；**拿到摄像头/麦克风权限后，候选里会出现真实公网 IP 和内网地址，而且它绕过 TUN**。判据、实测数据与两条走不通的路见 `references/webrtc.md`。
+## 浏览器 Intl 区域设置
 
-但确实有一条真实路径。Chrome 的 mDNS 混淆（`enable-webrtc-hide-local-ips-with-mdns`，原文「Conceal local IP addresses with mDNS hostnames」）**只在页面没有摄像头/麦克风权限时生效**——设计如此，P2P 媒体流需要真实局域网地址。实测同一台机器：
+`Intl.DateTimeFormat().resolvedOptions().locale`，ippure 权重 10，只认大陆简体。见 mapping A27。
+浏览器媒体权限与 Intl 缓存必须同时满足 24 小时 freshness 和资料范围匹配：先在运行复核前显式设置 `CLAUDE_GUARD_BROWSER_PROFILE`（例如 `work-chrome-profile`）。缓存中的 `profileScope` 必须与当前环境值完全一致；未设置或切换资料后都按未测处理，不能作为通过证据。脚本无法从本地复核页自行识别 Chrome 资料路径，不会写入伪造的资料标签。
+`--audit` 不能和 `--check-media`、`--check-locale` 同时使用；后两项会写入浏览器复核缓存，需单独运行并明确选择资料范围。用户声明的资料标签不能由脚本验证身份，因此复用缓存时即使标签匹配，媒体与 Intl 结论仍按未确证处理。
 
-    未授权    1 个候选，mDNS 的 .local，看不到任何地址
-    已授权    5 个候选，其中一条是 typ srflx，带真实公网 IP + 内网 + TUN 地址
-
-已授权那次拿到的原始候选是这样：
-
-    candidate:2415635606 1 udp 1686052607 203.0.113.9 54364 typ srflx raddr 192.168.1.5 rport 54364 network-id 1
-
-`203.0.113.9` 是真实公网出口（示例值），`raddr 192.168.1.5` 是 en0 的内网地址，`network-id 1` 指向 Wi-Fi。也就是说 **STUN 是绑在物理网卡上直发出去的，根本没进 TUN**，Clash 那几条拦 UDP 的规则看不到它——Python 侧直测 19302/3478 等端口全部超时（那些走了 TUN），浏览器这条路径照样通。判断有没有绕过，看 `raddr` 是不是内网地址比数候选个数可靠。另外 `198.18.0.0/15` 属 RFC 2544 保留段，出现它等于自报在用 Clash 类代理。
-
-**有效开关有，但只在资料里，不在命令行。** 三样东西容易混成一件：
-
-| 设置方式 | 实测结果 |
-| :--- | :--- |
-| `webrtc.ip_handling_policy`（Chrome 资料的 pref，WebRTC Network Limiter 扩展就是设它） | 有效。`disable_non_proxied_udp` 与 `default_public_interface_only` 都让候选数归 0；`default_public_and_private_interfaces` 只剩 TUN 地址 |
-| `--force-webrtc-ip-handling-policy`（命令行开关） | 无效，写与不写候选数和地址一模一样 |
-| `defaults write com.google.Chrome WebRtcIPHandling`（用户级企业策略） | 无效，同样毫无变化。机器级 `/Library/Managed Preferences/` 需要管理员权限，未验证 |
-
-验证有效性的唯一办法是拿一个临时资料写进 pref，再跑一次真实 ICE 收集做对照——光看文档会把这三者的效果当成一回事，这一条我错过一次。
-
-所以修法有几条，按优先级排：
-
-1. **别让网站拿到权限**（Chrome 设置 → 隐私和安全 → 网站设置 → 摄像头/麦克风 → 不允许）。最彻底：授权那条路径不可达，泄漏就无从发生。
-2. **在资料里设 `webrtc.ip_handling_policy`**。文章 2.5② 推荐的 Chrome 官方扩展 WebRTC Network Limiter，选「Use my proxy server (if present)」，装的其实就是这个 pref——实测本机那个资料里 `webrtc.ip_handling_policy = disable_non_proxied_udp` 正是它写进去的（扩展来自 Chrome 应用店、`disable_reasons` 为空）。所以装扩展和手工设 pref 是一回事，扩展的好处只是不用手工改文件。
-3. **Firefox**：文章给的办法是在 `about:config` 里把 `media.peerconnection.enabled` 改成 `false`。这条没有在本机实测过（本机用 Chrome），照文章记下来；原理是把整个 WebRTC 关掉，代价同样是网页视频通话用不了。
-
-代价要说清楚：任何有效设置都会让网页视频通话建不起来（候选数为 0，P2P 建立不了），**可用性和不泄漏在这个网络结构下不可兼得**，所以要按资料分别决定，别一刀切。
-
-复核这一项要用户配合：脚本读不了 Chrome 的资料文件（TCC 挡着 `open()`），所以 `--check-media` 起一个本地页面，让用户在他真实的浏览器里打开，页面把权限状态 POST 回来并缓存到 `~/.local/state/claude-guard/media-permission.json`。**必须用那个资料打开**，用别的资料读到的是别的资料的权限。顺带一个已经踩过的坑：用 sudo 跑过之后这个状态目录可能是 root 的，写入会静默失败（`except OSError: pass` 吞掉），所以 `hand_back_ownership()` 会在 sudo 之下把属主交还给 `SUDO_UID`。
-
-
-这里面有个坑值得记下来：**探测用哪个浏览器会决定结论真假**。同样给了媒体权限，headless shell 只给 1 个候选、看不到任何 IP，完整 Chromium 给 4 个、露出真实地址。也就是说用 headless shell 测，「授权后会不会露」这个问题永远答「不会」——一个看起来干净的假阴性。所以 `find_chromium()` 现在把完整版排在前面，结果里也会标明用的是哪个。
-
-（曾试过把 TUN 地址从 `198.18.0.1` 换成普通的 `172.19.0.1`，让泄漏出来的地址不那么显眼。写了 `tun.inet4-address` 但 mihomo 在配置重载时不重建 TUN 接口，要生效得重启内核；而重启后接口地址与 fake-IP 段不在同一网段，可能影响 fake-IP 路由。这个改动只在「已经授权、真实内网 IP 也一起漏」的场景下才有意义，收益不值这个险，已回滚。）
-
-## 浏览器 Intl 区域设置：ippure 权重 10 的那一项
-
-量的是 `Intl.DateTimeFormat().resolvedOptions().locale`。ippure.com/claude.html 只给大陆简体计分，`en-US` 是 0 分。
-
-控制它的不是 Chrome 设置也不是命令行：`--lang=en-US` 实测无效，资料里的 `intl.accept_languages` 只改 `navigator.language`。真开关是 **macOS 应用域的 AppleLanguages**：`defaults write com.google.Chrome AppleLanguages -array en-US` 一改，`Intl` 的几个 API 和 `navigator.language` 全跟着变。只影响 Chrome，`defaults delete` 一条还原；代价是界面语言也变英文，且**要完全退出再打开才生效**。
-
-判定只认大陆简体，`zh-TW` / `zh-HK` 不算——判成命中等于拿正确设置报错。实测值跑 `--check-locale`。
+定位服务的 root 实测缓存只在 24 小时内有效，缺少时间戳或过期都按未测处理。只读审计不会创建临时探针文件；非 root 时不调用 sudo 探针，定位服务状态会如实显示为待复核。
 
 ## 项目级 settings：清「你给 Claude 的授权」
 
-前面几项清的是 Claude 留下的东西，这一项反过来——Claude Code 每同意一次「总是允许」就往 `permissions.allow` 里加一条，攒下来是本机 25 个文件 1127 条，其中 140 条证明不可能再命中：`Bash(kill 2220)` 这种一次性 PID、`/Users/别人/...` 这种别的机器的路径、还有指向已删目录的绝对路径。
+前面几项清的是 Claude 留下的东西，这一项反过来——Claude Code 每同意一次「总是允许」就往 `permissions.allow` 里加一条，攒下来是本机 25 个文件 1127 条，其中 140 条证明不可能再命中：`Bash(kill 2220)` 这种一次性 PID、别的机器家目录下的路径、还有指向已删目录的绝对路径。
 
-失效的自动清，偏危险的（`Read(**/.ssh/**)`、`Bash(pkill ...)`、`Bash(curl:*)`）只报告不代删——那会让 Claude 多弹确认，是取舍不是清理。
+失效 permissions 只有在配置类询问中单独确认后才清理；偏危险的（`Read(**/.ssh/**)`、`Bash(pkill ...)`、`Bash(curl:*)`）始终只报告不代删——那会让 Claude 多弹确认，是取舍不是清理。
 
 两个地方容易判错：`Bash(pnpm --filter @acme/schema build)` 里的 `/schema` 是包名不是路径，判死就把在用权限删了，所以只认 `/Users`、`/home` 这类真文件系统根；`pkill` 里也含 `kill`，但它是按模式杀，不是一次性 PID。
 
@@ -269,7 +236,7 @@ Chrome「要不要重启才生效」这一项也修掉一个假阳性：原来�
 python3 scripts/account_guard.py --manual
 ```
 
-分七组：手机与其它设备、浏览器与设备隔离、网页端设置、账号与支付节奏、使用行为、被封之后、出口这个节点本身。每项都带 `〔文章 §X〕` 出处、能直接照抄的点击路径，和一句「为什么」。它是只读的，不体检、不改任何东西。
+分六组：手机与其它设备、浏览器与设备隔离、网页端设置、账号与支付节奏、使用行为、被封之后。每项都带 `〔文章 §X〕` 出处、能直接照抄的点击路径，和一句「为什么」。它是只读的，不体检、不改任何东西。
 
 三条最容易漏的：
 
@@ -388,7 +355,7 @@ npm 两项应输出 `null`，git 两条应无输出。`~/.npmrc` 要直接看文
 brew config | grep -i proxy
 ```
 
-应无输出。实测 Homebrew 7 只把（小写的）`http_proxy` / `https_proxy` / `all_proxy` 打进 `config` —— 把大小写六个都设上再跑一次 diff，多出来的只有小写那三行，大写那三个它一个字都不提。所以这条能测出来的是 `env | grep -i proxy` 的子集，不是独立的一层。
+应无输出。实测 Homebrew 7 只把（小写的）`http_proxy` / `https_proxy` / `all_proxy` 打进 `config` —— 把大小写六个都设上再跑一次 diff，多出来的只有小写那三行，大写那三个它一个字都不提。所以这条能测出来的是 `env | grep -i proxy` 的子集。
 
 **settings.json 内容**（文章 2.5⑤）
 
@@ -481,9 +448,9 @@ ls -la ~/.local/share/claude/versions/
 du -sh ~/.local/share/claude/versions/
 ```
 
-`versions` 目录每份 200 MB 上下，安装器会自行清理旧版本。加 `DISABLE_AUTOUPDATER=1` 是因为不加的话，这次查看会顺手把 CLI 升到最新，而同一个动作后面正要数 `versions` 里留了几份、占多少空间 —— 等于一边量一边把被测对象改了。脚本里就是这么调的。
+`versions` 目录每份 200 MB 上下，安装器会自行清理旧版本。加 `DISABLE_AUTOUPDATER=1` 是因为不加的话，这次查看会顺手把 CLI 升到最新，而同一个动作后面正要数 `versions` 里留了几份 —— 等于一边量一边把被测对象改了。
 
-脚本在这上面查四件事，缺一件都不报绿：这份二进制怎么装上去的（native / Homebrew / npm / bun 四条通道各自验特征，一条都对不上就写「安装方式未知」，不猜）、链接形状对不对（官方安装是 `versions/<版本>` 真文件 + `bin/claude` 软链；软链指到 versions 外面、或 versions 目录本身是软链，都算形状不对）、实跑 `--version` 报出来的版本号正不正常、软链指向的那个版本在不在 `versions` 目录里（不在说明链接断了或被改过）。签名有效只证明「这份是官方发的那份」，不等于「它就是现在该在用的那份」——所以这两件事分开判。
+脚本在这上面查四件事，缺一件都不报绿：怎么装上去的（native / Homebrew / npm / bun 四条通道各自验特征，一条都对不上就写「安装方式未知」，不猜）、链接形状对不对（官方安装是 `versions/<版本>` 真文件 + `bin/claude` 软链；软链指到 versions 外面、或 versions 目录本身是软链，都算形状不对）、实跑 `--version` 报出来的版本号正不正常、软链指向的那个版本在不在 `versions` 目录里。签名有效只证明「这是官方发的那份」，不等于「它就是现在该在用的那份」。
 
 **钥匙串条目**（文章 2.6）
 
@@ -525,14 +492,3 @@ curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/configs \
 ```
 
 第一条全 0、第二条是预期出口、第三条是 `rule`（或 `global`），就没大问题。
-
-## 参考来源
-
-检查项的取材与逐条对照见 `references/article-mapping.md`。来源是一篇公开长文，以及它自己引用的三篇材料：
-
-- 《你的 Claude 账号是怎么被封的》 https://x.com/AYi_AInotes/status/2106639522586829094
-- 陈大黄复盘贴 https://x.com/realchendahuang/status/2104455272614035947
-- 实践哥复盘贴 https://x.com/MinLiBuilds/status/2105890192108536029
-- wangray《半年稳定的配置》 https://x.com/wangray/status/2105658146685608265
-
-原文文末自带的两条推广（住宅代理服务商、新加坡卡）没有收进来，也没有作为任何检查项的依据。
