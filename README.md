@@ -64,6 +64,16 @@ python3 scripts/account_guard.py --audit --json
 python3 scripts/account_guard.py --audit --save-audit
 ```
 
+如果你有明确的线路目标，可以把目标国家和出口 IP 一起写进审计：
+
+```bash
+python3 scripts/account_guard.py --audit \
+  --expected-country US \
+  --expected-exit-ip 203.0.113.10
+```
+
+这两个值必须由你自己指定；脚本不会从历史记录或当前实测结果自动猜目标。没有指定目标时，只能报告“未声明目标”；如果实测出口不符，先处理线路，脚本不会自动修改 Chrome 语言。
+
 ### 一键自检
 
 ```bash
@@ -93,6 +103,22 @@ python3 scripts/account_guard.py
 ```
 
 完整加固需要真实终端。脚本会先展示最终执行清单，只有在你明确输入 `CONFIRM` 后才锁定目标、创建备份和修改状态。Clash DNS、Chrome Intl、旧版本与缓存、失效权限、过期 worktree 和项目垃圾等项目会逐项询问，默认选择否；涉及管理员权限的操作仍会单独询问。不要在正在使用 Claude Code 的进程里发起会修改本机状态的操作。
+
+如果中途需要恢复，使用明确的备份目录：
+
+```bash
+# 先预览这份备份能恢复什么
+python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时间戳>" --restore-preview
+
+# 确认后恢复全部可验证文件
+python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时间戳>"
+
+# 也可以只恢复备份清单里的某个文件
+python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时间戳>" \
+  --restore-item "$HOME/.claude/settings.json"
+```
+
+恢复需要真实终端和再次确认。脚本只恢复能确认属于本轮改动、且之后没有被其他修改的文件；旧版 v1 备份、清单损坏或当前文件已漂移时会拒绝恢复。系统代理、Chrome Intl、IPv6、系统缓存、旧版本和 Git worktree 登记没有完整快照，仍要按输出的人工步骤处理。如果恢复了 Clash 配置文件，`--restore` 不会自动重载运行中的内核，请在 Clash Verge 中手动重载或重启后再跑一次 `--audit`。不能把恢复命令当成所有设置的一键还原。
 
 <a id="detection-scope"></a>
 
@@ -126,7 +152,7 @@ python3 scripts/account_guard.py
 安全边界按动作拆分：
 
 - 对系统代理残留、shell 代理行、npm/git 全局代理和 `settings.json` 中明确命中的端点/凭据/代理变量，脚本只改命中的键或行，并在修改后复验。
-- 主模式在 `CONFIRM` 前不创建运行锁、备份或修改目标；确认后先创建运行锁，并在任何目标文件或系统设置变更前完成备份。
+- 主模式在 `CONFIRM` 前不创建运行锁、备份或修改目标；确认后先创建运行锁，并在任何改动前为受支持的文件目标完成备份；系统设置和不可逆清理另列人工边界。
 - Clash DNS、Chrome Intl、旧版本与缓存、失效权限、过期 worktree 和项目垃圾等改动会逐项列出并默认选择否，可能影响后续网络、浏览器或本机空间。
 - 遥测开关、IPv6、定位服务时区等操作可能带来功能或系统权限影响，需要单独决定。
 - 只有确认并开始加固后，备份目录才会保存本次执行可恢复的输入与变更信息；恢复能力取决于具体项目、文件权限和外部系统状态，不能把它理解成所有系统状态的自动回滚。
@@ -144,7 +170,7 @@ python3 scripts/account_guard.py
 - 出口检查需要访问外部 IP/归属服务；这些服务只能看到本机发出的查询，不会收到项目文件。
 - WebRTC 和 Intl 检查通过本机回环页面等待浏览器回传；不会把完整审计报告上传到远端。
 - Clash 读取本机配置或 socket；自定义 secret 通过 `CLASH_SECRET` 传入，不要把它写进仓库。
-- 脚本不会读取或保存 sudo 密码。Clash secret 从 `CLASH_SECRET` 读取；调用本机 Clash API 时，它会进入 `curl` 的请求头参数，请保护该环境变量。
+- 脚本不会读取或保存 sudo 密码。Clash secret 从 `CLASH_SECRET` 读取；脚本调用本机 Clash API 时，会在 Python 内存中组装请求头，不把 secret 交给外部命令参数。仍请保护该环境变量，不要把它写入日志、脚本或仓库。
 - 默认项目范围可以通过 `CLAUDE_GUARD_PROJECT_ROOTS` 指定；自定义 `CLAUDE_CONFIG_DIR` 只会报告，不纳入加固范围。
 
 ### 环境变量
@@ -152,8 +178,9 @@ python3 scripts/account_guard.py
 ```bash
 export CLAUDE_GUARD_PROJECT_ROOTS="$HOME/code:$HOME/work"
 export CLAUDE_GUARD_BROWSER_PROFILE="my-claude-profile"
-export CLASH_SECRET="your-local-secret"
 ```
+
+如果本机 secret 不是默认值，请通过已有安全机制预先注入 `CLASH_SECRET` 环境变量；不要在命令行、shell 历史、脚本或仓库中写明文 secret。
 
 <a id="install"></a>
 

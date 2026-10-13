@@ -18,6 +18,7 @@ import os
 import pathlib
 import plistlib
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 
 import account_guard as g  # noqa: E402
+import selfcheck as selfcheck_module  # noqa: E402
 
 
 class TestClassifyAsn(unittest.TestCase):
@@ -140,9 +142,12 @@ class TestBackupSafety(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self._orig = g.BACKUP_ROOT
+        self._old_home = g.HOME
+        g.HOME = self.tmp
         g.BACKUP_ROOT = self.tmp / "backups"
 
     def tearDown(self):
+        g.HOME = self._old_home
         g.BACKUP_ROOT = self._orig
 
     def test_backs_up_regular_file(self):
@@ -193,19 +198,23 @@ class TestProxyResidueSafety(unittest.TestCase):
 
         def fake_run(cmd, timeout=20):
             if "networksetup" in cmd and "-getwebproxy" in cmd:
-                return 0, "Enabled: Yes\nServer: 0.0.0.0\nPort: 0\n"
+                return 0, "Enabled: Yes\nServer: 127.0.0.1\nPort: 7897\n"
             return 0, ""
 
         with mock.patch.object(g, "run", side_effect=fake_run):
             with self.assertRaises(RuntimeError) as ctx:
                 g.clear_proxy_residue(residue)
-        self.assertIn("仍处于启用状态", str(ctx.exception))
+        self.assertIn("状态已变化", str(ctx.exception))
 
     def test_counts_only_when_disabled(self):
         residue = [{"service": "Wi-Fi", "kind": "webproxy", "server": "127.0.0.1", "port": "7897"}]
 
+        calls = {"get": 0}
         def fake_run(cmd, timeout=20):
             if "networksetup" in cmd and "-getwebproxy" in cmd:
+                calls["get"] += 1
+                if calls["get"] == 1:
+                    return 0, "Enabled: No\nServer: 127.0.0.1\nPort: 7897\n"
                 return 0, "Enabled: No\nServer: 0.0.0.0\nPort: 0\n"
             return 0, ""
 
@@ -214,6 +223,18 @@ class TestProxyResidueSafety(unittest.TestCase):
 
     def test_empty_residue_is_noop(self):
         self.assertEqual(g.clear_proxy_residue([]), 0)
+
+    def test_refuses_when_residue_changed_after_audit(self):
+        residue = [{"service": "Wi-Fi", "kind": "webproxy", "server": "127.0.0.1", "port": "7897"}]
+
+        def fake_run(cmd, timeout=20):
+            if "networksetup" in cmd and "-getwebproxy" in cmd:
+                return 0, "Enabled: No\nServer: 127.0.0.1\nPort: 7898\n"
+            return 0, ""
+
+        with mock.patch.object(g, "run", side_effect=fake_run):
+            with self.assertRaisesRegex(RuntimeError, "状态已变化"):
+                g.clear_proxy_residue(residue)
 
 
 class TestEntryGates(unittest.TestCase):
@@ -273,7 +294,8 @@ class TestAutoClean(unittest.TestCase):
             "alias ll='ls -la'\n",
             encoding="utf-8",
         )
-        changed = g.clear_rc_proxy_lines({".zshrc": [{"line": 3, "text": "export HTTP_PROXY=..."}]})
+        changed = g.clear_rc_proxy_lines({".zshrc": [{"line": 3,
+                                                       "text": "export HTTP_PROXY=http://127.0.0.1:7897"}]})
         self.assertEqual(changed, [str(rc)])
         text = rc.read_text(encoding="utf-8")
         self.assertNotIn("HTTP_PROXY", text)
@@ -284,6 +306,16 @@ class TestAutoClean(unittest.TestCase):
     def test_rc_noop_when_nothing_matched(self):
         (self.tmp / ".zshrc").write_text("export EDITOR=vim\n", encoding="utf-8")
         self.assertEqual(g.clear_rc_proxy_lines({".zshrc": []}), [])
+
+    def test_rc_refuses_inserted_or_changed_line(self):
+        rc = self.tmp / ".zshrc"
+        rc.write_text("export EDITOR=vim\nexport HTTP_PROXY=http://127.0.0.1:7897\n",
+                      encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "已变化"):
+            g.clear_rc_proxy_lines({".zshrc": [{
+                "line": 2, "text": "export HTTP_PROXY=http://127.0.0.1:7897",
+                "sha256": "0" * 64,
+            }]})
 
     def test_settings_base_url_removed_others_kept(self):
         g.SETTINGS.write_text(
@@ -677,7 +709,8 @@ class TestAllowedChanges(unittest.TestCase):
         report = {
             "A1_proxy_residue": {"residue": [], "enabled": [], "scutil": {}, "network_services": []},
             "A1_terminal_env": {
-                "rc_files": {".zshrc": [{"line": 2, "text": "x"}]},
+                "rc_files": {".zshrc": [{"line": 2,
+                                          "text": "export HTTPS_PROXY=http://127.0.0.1:7897"}]},
                 "npm": {}, "git": {}, "env_hits": [], "env_info": [],
             },
             "A2_anthropic_base_url": {"hits": []},
@@ -2078,8 +2111,8 @@ class TestCleanDeadPermissions(unittest.TestCase):
         self.assertEqual(allow[0][0], "Bash(git add *)")
 
     def test_mixed_shapes_survive_together(self):
-        self._write(["Bash(a *)", ["Bash(b *)", None], "Bash(kill 1)"])
-        g.clean_dead_permissions(self._report(["Bash(kill 1)"]))
+        self._write(["Bash(a *)", ["Bash(b *)", None], "Bash(kill 2220)"])
+        g.clean_dead_permissions(self._report(["Bash(kill 2220)"]))
         d = json.loads(self.f.read_text(encoding="utf-8"))
         self.assertEqual(d["permissions"]["allow"], ["Bash(a *)", ["Bash(b *)", None]])
 
@@ -2092,6 +2125,15 @@ class TestCleanDeadPermissions(unittest.TestCase):
         self.assertEqual(g.clean_dead_permissions({"A26_claude_settings": {"dead": []}}), [])
         self.assertEqual(g.clean_dead_permissions({}), [])
         self.assertFalse(self.f.exists(), "没有死条目时不该建文件")
+
+    def test_rechecks_rule_before_deleting(self):
+        self._write(["Bash(kill 2220)"])
+        with mock.patch.object(g, "permission_is_dead", return_value=None):
+            done = g.clean_dead_permissions(self._report(["Bash(kill 2220)"]))
+        self.assertEqual(done[0]["removed"], 0)
+        self.assertIn("状态已变化", done[0]["error"])
+        self.assertEqual(json.loads(self.f.read_text())["permissions"]["allow"],
+                         ["Bash(kill 2220)"])
 
 
 class TestRiskyStandingGrants(unittest.TestCase):
@@ -3887,6 +3929,20 @@ class TestExportHistory(unittest.TestCase):
             g.check_export_ip()
         self.assertEqual(g.load_export_history()["ip"], "1.2.3.4")
 
+    def test_country_from_invalid_ipinfo_is_not_carried_to_ipify(self):
+        def mixed(cmd, timeout=20):
+            url = cmd[-1]
+            if url.endswith("ipinfo.io/json"):
+                return 0, json.dumps({"ip": None, "country": "US", "org": "wrong"})
+            if "ipify" in url:
+                return 0, json.dumps({"ip": "1.2.3.4"})
+            return 1, ""
+        with mock.patch.object(g, "run", side_effect=mixed):
+            info = g.check_export_ip(persist=False)
+        self.assertEqual(info["ip"], "1.2.3.4")
+        self.assertIsNone(info["country"])
+        self.assertEqual(g.expected_exit_result(info, "US")["status"], "unknown")
+
     # ── 总表那一行 ──
 
     def test_row_says_consistent(self):
@@ -4607,6 +4663,237 @@ class TestIterationOneSafety(unittest.TestCase):
         self.assertIn(tmp / ".gitconfig", paths)
         self.assertIn(tmp / ".claude/settings.local.json", paths)
         self.assertIn(tmp / ".local/bin/claude-safe", paths)
+
+
+class TestExpectedExitAndRecovery(unittest.TestCase):
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.old_home, self.old_backup = g.HOME, g.BACKUP_ROOT
+        g.HOME, g.BACKUP_ROOT = self.tmp, self.tmp / "backups"
+        self.addCleanup(setattr, g, "HOME", self.old_home)
+        self.addCleanup(setattr, g, "BACKUP_ROOT", self.old_backup)
+
+    def test_expected_country_and_ip_match_are_structured(self):
+        result = g.expected_exit_result(
+            {"ip": "1.2.3.4", "country": "us"}, "US", "1.2.3.4")
+        self.assertEqual(result["status"], "ok")
+        self.assertIs(result["match"], True)
+        self.assertEqual(result["actual"]["exit_ip"], "1.2.3.4")
+
+    def test_expected_mismatch_blocks_locale_repair(self):
+        expected = g.expected_exit_result({"ip": "1.2.3.4", "country": "JP"}, "US")
+        self.assertEqual(expected["status"], "bad")
+        rep = {"cn": True, "target": "en-US", "target_blocked": True}
+        self.assertIn("预期出口不符", g.clear_browser_locale(rep))
+        row = [r for r in g.build_summary({
+            "A1_export_ip": {"ip": "1.2.3.4", "country": "JP", "expected": expected},
+            "A27_browser_locale": rep}) if r[0] == "浏览器 Intl 区域设置"][0]
+        self.assertIs(row[1], g.S_NA)
+
+    def test_declared_but_unknown_exit_also_blocks_locale_repair(self):
+        expected = g.expected_exit_result(
+            {"ip": "1.2.3.4", "country": "US", "source_conflict": ["1.2.3.4", "2.2.2.2"]},
+            "US")
+        locale = g.check_browser_locale
+        with mock.patch.object(g, "run", return_value=(1, "")), \
+             mock.patch.object(g, "load_browser_locale", return_value={}):
+            rep = locale({"country": "US"}, expected)
+        self.assertTrue(rep["target_blocked"])
+
+    def test_conflict_and_missing_country_are_unknown(self):
+        for actual in (
+            {"ip": "1.2.3.4", "country": None},
+            {"ip": None, "country": "US"},
+            {"ip": "not-an-ip", "country": "US"},
+            {"ip": "1.2.3.4", "country": "US", "source_conflict": ["1.2.3.4", "2.2.2.2"]},
+        ):
+            result = g.expected_exit_result(actual, "US")
+            self.assertEqual(result["status"], "unknown")
+            self.assertIsNone(result["match"])
+
+    def test_restore_existing_and_new_file(self):
+        existing, created = self.tmp / "existing", self.tmp / "created"
+        existing.write_text("before", encoding="utf-8")
+        backup = g.create_backup([existing, created])
+        g._refresh_backup_manifest(backup, "before")
+        existing.write_text("after", encoding="utf-8")
+        created.write_text("new", encoding="utf-8")
+        g._refresh_backup_manifest(backup, "after")
+        with mock.patch.object(g.sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="CONFIRM"):
+            self.assertEqual(g.restore_backup(backup), 0)
+        self.assertEqual(existing.read_text(encoding="utf-8"), "before")
+        self.assertFalse(created.exists())
+
+    def test_restore_refuses_corrupt_backup_and_external_drift(self):
+        target = self.tmp / "target"
+        target.write_text("before", encoding="utf-8")
+        backup = g.create_backup([target])
+        g._refresh_backup_manifest(backup, "before")
+        target.write_text("after", encoding="utf-8")
+        g._refresh_backup_manifest(backup, "after")
+        (backup / "files" / next((p.name for p in (backup / "files").iterdir()))).write_text(
+            "corrupted", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "校验失败"):
+            g.restore_backup(backup, preview=True)
+
+    def test_restore_refuses_mode_drift_even_when_content_matches(self):
+        target = self.tmp / "mode-target"
+        target.write_text("before", encoding="utf-8")
+        backup = g.create_backup([target])
+        g._refresh_backup_manifest(backup, "before")
+        target.write_text("after", encoding="utf-8")
+        g._refresh_backup_manifest(backup, "after")
+        target.chmod(0o600 if (target.stat().st_mode & 0o777) != 0o600 else 0o644)
+        with self.assertRaisesRegex(RuntimeError, "漂移"):
+            g.restore_backup(backup, preview=True)
+
+    def test_restore_rejects_v1_and_symlink(self):
+        old = self.tmp / "v1"
+        old.mkdir()
+        (old / "manifest.json").write_text(json.dumps({"items": []}), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "备份目录|v2"):
+            g.restore_backup(old, preview=True)
+
+    def test_restore_rejects_preexisting_target_symlink(self):
+        target, victim = self.tmp / "target", self.tmp / "victim"
+        target.write_text("before", encoding="utf-8")
+        victim.write_text("keep", encoding="utf-8")
+        backup = g.create_backup([target])
+        g._refresh_backup_manifest(backup, "before")
+        target.write_text("after", encoding="utf-8")
+        g._refresh_backup_manifest(backup, "after")
+        target.unlink()
+        target.symlink_to(victim)
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            g.restore_backup(backup, preview=True)
+
+    def test_backup_rejects_home_parent_symlink(self):
+        outside = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        linked = self.tmp / "linked"
+        linked.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "父目录.*symlink"):
+            g.create_backup([linked / "settings.json"])
+
+    def test_backup_rechecks_source_after_copy(self):
+        target = self.tmp / "target"
+        target.write_text("before", encoding="utf-8")
+        real_state = g._file_state(target)
+        changed_state = dict(real_state, sha256="f" * 64)
+        with mock.patch.object(g, "_file_state", side_effect=[real_state, changed_state]):
+            with self.assertRaisesRegex(RuntimeError, "内容发生变化"):
+                g.create_backup([target])
+
+    def test_manual_clash_recipe_never_prints_secret_argv(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            g.print_manual_checks()
+        rendered = out.getvalue()
+        self.assertNotIn("AUTH=", rendered)
+        self.assertNotIn("$AUTH", rendered)
+        self.assertIn("--audit --json", rendered)
+
+    def test_restore_resume_after_second_target_write_failure(self):
+        first, second = self.tmp / "first", self.tmp / "second"
+        first.write_text("before-1", encoding="utf-8")
+        second.write_text("before-2", encoding="utf-8")
+        backup = g.create_backup([first, second])
+        g._refresh_backup_manifest(backup, "before")
+        first.write_text("after-1", encoding="utf-8")
+        second.write_text("after-2", encoding="utf-8")
+        g._refresh_backup_manifest(backup, "after")
+        real_replace = g.os.replace
+        failed = {"done": False}
+
+        def fail_second(src, dst):
+            if pathlib.Path(dst) == second and not failed["done"]:
+                failed["done"] = True
+                raise OSError("injected second target failure")
+            return real_replace(src, dst)
+
+        with mock.patch.object(g.os, "replace", side_effect=fail_second), \
+             mock.patch.object(g.sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="CONFIRM"):
+            with self.assertRaisesRegex(OSError, "second target"):
+                g.restore_backup(backup)
+        # The first item was journaled before the second failed; retry only
+        # handles the remaining post-state item.
+        with mock.patch.object(g.sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="CONFIRM"):
+            self.assertEqual(g.restore_backup(backup), 0)
+        self.assertEqual(first.read_text(), "before-1")
+        self.assertEqual(second.read_text(), "before-2")
+
+    def test_restore_new_file_rechecks_link_before_unlink(self):
+        created = self.tmp / "created-late"
+        backup = g.create_backup([created])
+        g._refresh_backup_manifest(backup, "before")
+        created.write_text("new", encoding="utf-8")
+        g._refresh_backup_manifest(backup, "after")
+        # Initial read-only preflight and lock-held preflight pass; the final
+        # check immediately before unlink detects the simulated parent swap.
+        with mock.patch.object(g, "_unsafe_home_link", side_effect=[False, False, True]), \
+             mock.patch.object(g.sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="CONFIRM"):
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                g.restore_backup(backup)
+        self.assertEqual(created.read_text(), "new")
+
+
+class TestClashSocketTransport(unittest.TestCase):
+    def test_selfcheck_kernel_uses_safe_python_transport(self):
+        selfcheck_module.ROWS.clear()
+        with mock.patch.object(selfcheck_module.g, "clash_http",
+                               return_value=(200, '{"mode":"rule","tun":{"enable":true,"strict-route":true}}')) as http, \
+             mock.patch.object(selfcheck_module, "sh",
+                               side_effect=AssertionError("不得经 shell 传递 Clash secret")):
+            selfcheck_module.check_kernel()
+        self.assertEqual(selfcheck_module.ROWS[-1][0], "Clash 内核")
+        self.assertEqual(selfcheck_module.ROWS[-1][1], selfcheck_module.OK)
+        http.assert_called_once_with("GET", "/configs", timeout=20)
+
+    def test_http_protocol_keeps_secret_out_of_command_runner(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        sock_path = tmp / "clash.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        server.listen(2)
+        received = []
+
+        def serve():
+            for _ in range(2):
+                conn, _ = server.accept()
+                data = conn.recv(8192)
+                received.append(data)
+                if data.startswith(b"GET"):
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                  b"18\r\n{\"mode\":\"rule\",\"tun\":{}}\r\n0\r\n\r\n")
+                else:
+                    conn.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                conn.close()
+            server.close()
+
+        import threading
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        old_sock, old_secret = g.CLASH_SOCK, g.CLASH_SECRET
+        g.CLASH_SOCK, g.CLASH_SECRET = sock_path, "test-secret"
+        self.addCleanup(setattr, g, "CLASH_SOCK", old_sock)
+        self.addCleanup(setattr, g, "CLASH_SECRET", old_secret)
+        with mock.patch.object(g, "run", side_effect=AssertionError("不得调用带 secret 的命令")):
+            get_code, get_body = g.clash_http("GET", "/configs")
+            put_code, put_body = g.clash_http("PUT", "/configs", b'{"force":true}')
+        thread.join(timeout=2)
+        self.assertEqual(get_code, 200)
+        self.assertIn('"mode":"rule"', get_body)
+        self.assertEqual(put_code, 204)
+        self.assertEqual(put_body, "")
+        self.assertEqual(len(received), 2)
+        self.assertTrue(all(b"Authorization: Bearer test-secret" in request for request in received))
+        self.assertIn(b'{"force":true}', received[1])
 
 
 if __name__ == "__main__":

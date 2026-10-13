@@ -1,9 +1,9 @@
 ---
 name: claude-account-guard
 metadata:
-  version: "1.0.3"
+  version: "1.0.4"
 description: >-
-  检测并按用户选择修复 Claude Code 的本机环境——出口 IP 与 ASN 归属、系统代理与 shell/npm/git 残留、Clash 的 DNS 解析器与 WebRTC 泄漏、IPv6、时区分层与两道闸、`settings.json` 里的中转端点、钥匙串条目、第三方客户端痕迹、CLI 完整性与多账号痕迹。默认审计只读且不落盘；加固先展示完整计划，确认后备份优先、失败即停、每项写入后复验。
+  检测并按用户选择修复 Claude Code 的本机环境——出口 IP 与 ASN 归属、用户指定的预期国家/IP、系统代理与 shell/npm/git 残留、Clash 的 DNS 解析器与 WebRTC 泄漏、IPv6、时区分层与两道闸、`settings.json` 里的中转端点、钥匙串条目、第三方客户端痕迹、CLI 完整性与多账号痕迹。默认审计只读且不落盘；加固先展示完整计划，确认后备份优先、失败即停、每项写入后复验；恢复必须使用显式备份目录并逐项验证。
   Use when 用户说「Claude 环境自检 / 保号体检 / 登录 Claude 前先检查环境 / 系统代理残留又出现了 / DNS 泄漏 / WebRTC 泄漏 / 出口 IP 是机房还是住宅 / 时区对不对 / settings.json 有没有中转残留 / 换订阅后 Claude 线路还通不通」，或换环境、换代理订阅、被封后重开之前要做环境排查时。
   不用于：账号申诉、付款退款与 claude.ai 网页端设置（人工流程，本 skill 不涉及）；业务仓代码修复；本机网络链路或内核故障排查。
 ---
@@ -16,7 +16,7 @@ description: >-
 
 安全约定沿用 `claude-cleanup`：只读审计永远安全且默认不落盘；写操作需要真实 TTY 和一次最终确认，确认前不请求 sudo、不建备份、不改状态；确认后先完成备份再改目标状态（并发锁只是控制元数据），备份失败即停；需要 root 时只在终端原生 sudo 隐藏提示里输密码，脚本从不读取或保存密码。
 
-## 自动清理什么
+## 确认后可清理什么
 
 以下残留会在最终确认后按计划清理；Clash DNS、Chrome Intl 和不可原样回滚的清理动作会另行询问：
 
@@ -61,6 +61,18 @@ description: >-
    ```bash
    python3 scripts/account_guard.py
    ```
+
+### 出口目标要由用户明确指定
+
+如果你有固定的线路目标，可以把目标国家和出口 IP 直接交给审计：
+
+```bash
+python3 scripts/account_guard.py --audit \
+  --expected-country US \
+  --expected-exit-ip 203.0.113.10
+```
+
+`--expected-country` 只接受 ISO 3166-1 两字母代码，`--expected-exit-ip` 接受合法的 IPv4 或 IPv6。两个值都只来自本次命令行输入，不会从上一次记录或当前实测结果自动填入。没有指定目标时，报告只能说「未声明目标」，不能说目标匹配；实测出口和目标不一致时先检查线路，脚本不会根据错误的国家自动改 Chrome 的语言或区域。
 
 退出码：`0` 正常完成；`1` 用户在 CONFIRM 处取消；`2` 拒绝执行或中途停止；`3` 加固已完成但检测到受保护文件被本脚本之外的进程改动（stderr 会给出文件和备份路径）。
 
@@ -147,7 +159,7 @@ CLAUDE_GUARD_PROJECT_ROOTS="$HOME/code" python3 scripts/account_guard.py --audit
 
 ## 回滚
 
-所有目标文件或系统设置变更前都会在 `~/ClaudeGuardBackups/guard-<时间戳>/` 留下带 `manifest.json` 的备份（并发锁只用于控制运行）：
+确认后、任何改动前，脚本会先为受支持的文件目标建立带 `manifest.json` 的备份；系统设置和不可逆清理另列人工边界（并发锁只用于控制运行）：
 
 ```bash
 ls ~/ClaudeGuardBackups
@@ -155,9 +167,27 @@ cp ~/ClaudeGuardBackups/guard-<时间戳>/files/Users__*__settings.json ~/.claud
 cp ~/ClaudeGuardBackups/guard-<时间戳>/files/Users__*__.zshrc ~/.zshrc
 ```
 
-需要 root 的文件（`/var/db/locationd/clients.plist`）用 `sudo cp` 从同一目录还原。`~/.local/bin/claude-safe` 如果是本次新建且备份目录的 `manifest.json` 中没有它，才直接删除；如果它原本已经存在，就从备份里的对应文件恢复，不能直接删除。只有显式 `--save-audit` 时才会把报告写到 `~/ClaudeGuardBackups/audit-<时间戳>.json`；普通 `--audit` 不写报告、出口历史或浏览器缓存。
+需要 root 的文件（`/var/db/locationd/clients.plist`）用 `sudo cp` 从同一目录还原。本次新建的 `~/.local/bin/claude-safe` 可直接删除；原本已存在的 wrapper 按 `manifest.json` 从备份恢复。只有显式 `--save-audit` 时才会把报告写到 `~/ClaudeGuardBackups/audit-<时间戳>.json`；普通 `--audit` 不写报告、出口历史或浏览器缓存。
 
-IPv6 是唯一不走文件备份的改动，它在系统网络配置里，恢复要显式执行；脚本在关闭成功后会把这组命令直接打印出来，照抄即可。
+系统代理、Chrome Intl 和 IPv6 的原态不在文件恢复快照里，恢复时必须按输出人工复核；系统级缓存、旧版本和 Git worktree 注册也没有完整的自动恢复范围。Clash 配置文件如果被恢复，运行中的内核不会由 `--restore` 自动重载，需在 Clash Verge 中重载或重启后再跑一次审计确认实时状态。
+
+### 显式恢复
+
+需要恢复时必须在普通真实终端里明确指定备份目录：
+
+```bash
+# 先只看这份备份能恢复什么
+python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时间戳>" --restore-preview
+
+# 确认后恢复全部可验证文件
+python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时间戳>"
+
+# 只恢复清单中的某个文件
+python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时间戳>" \
+  --restore-item "$HOME/.claude/settings.json"
+```
+
+恢复同样需要一次确认。脚本会检查备份清单、文件内容和当前文件是否仍是本轮改动后的版本，只恢复能确认由这次运行改动、且之后没有被其他人修改的项目。旧版 v1 备份、清单损坏、文件发生漂移或无法证明归属时会拒绝恢复，避免把新改动覆盖掉。IPv6、系统代理、Chrome Intl、系统级缓存、旧版本和 Git worktree 注册没有完整文件快照，仍需按输出的人工步骤处理；如果恢复了 Clash 配置文件，还要在 Clash Verge 中手动重载或重启内核并重新审计。不能把 `--restore` 当成所有系统状态的一键还原。
 
 ## 测试
 
@@ -179,7 +209,7 @@ python3 -m unittest discover -s tests -v
 
 **两个横切规则。** 第一，不可验证的东西不参与通过判定：探测本身读取失败（`brew list` 跑不起来、node 全局根读不出来）和「确实没装」必须分开报，读不到就说读不到。第二，改完必须回读断言：清完代理残留要再读一次 `Enabled`，改完 Clash DNS 要重跑一次判定。
 
-**三个具体做法。** 三个本地复核服务（媒体权限、WebRTC、Intl）各起一个 127.0.0.1 的 HTTP 服务，端口随机，但端口随机不等于有鉴权 —— 本机任何进程都能扫到端口往上投一份「摄像头已拒绝」，把没测过的项报成已通过；现在每次生成 24 字节随机令牌当 URL 路径前缀，不知道令牌取页面和投结果都是一律 404。加固流程加了并发锁：备份、删除、改配置交错会让回滚凭据和实际状态对不上，所以用 `O_CREAT|O_EXCL` 原子建锁文件，锁里记 pid，持有进程已消失的遗留锁自动接管。调 CLI 一律带 `DISABLE_AUTOUPDATER=1`。
+**三个具体做法。** 三个本地复核服务（媒体权限、WebRTC、Intl）各起一个 127.0.0.1 的 HTTP 服务，端口随机，但端口随机不等于有鉴权 —— 本机任何进程都能扫到端口往上投一份「摄像头已拒绝」，把没测过的项报成已通过；现在每次生成 24 字节随机令牌当 URL 路径前缀，不知道令牌取页面和投结果都是一律 404。加固流程加了并发锁：备份、删除、改配置交错会让回滚凭据和实际状态对不上，所以用 `O_CREAT|O_EXCL` 原子建锁文件，锁里记 pid，持有进程已消失的遗留锁自动接管。调 CLI 一律带 `DISABLE_AUTOUPDATER=1`。Clash API 的 secret 由 Python 在内存中组装请求头，不再放进 curl 的进程参数；仍需通过本机环境变量传入，并避免把环境变量复制到日志、脚本或仓库。
 
 **代理凭据不进报告。** `proxy=http://user:pass@host:port` 很常见，这些字符串会同时进终端输出和 audit JSON。进报告前统一过一遍 `redact_credentials`：URL 里的用户名密码抹成 `***`，没有 `scheme://` 的 `@` 不碰（免得把邮箱也毁掉），先抹再截断。
 
@@ -194,69 +224,19 @@ python3 -m unittest discover -s tests -v
 
 定位服务的 root 实测缓存只在 24 小时内有效，缺少时间戳或过期都按未测处理。只读审计不会创建临时探针文件；非 root 时不调用 sudo 探针，定位服务状态会如实显示为待复核。
 
-## 项目级 settings：清「你给 Claude 的授权」
+## 扩展维护说明
 
-前面几项清的是 Claude 留下的东西，这一项反过来——Claude Code 每同意一次「总是允许」就往 `permissions.allow` 里加一条，攒下来是本机 25 个文件 1127 条，其中 140 条证明不可能再命中：`Bash(kill 2220)` 这种一次性 PID、别的机器家目录下的路径、还有指向已删目录的绝对路径。
-
-失效 permissions 只有在配置类询问中单独确认后才清理；偏危险的（`Read(**/.ssh/**)`、`Bash(pkill ...)`、`Bash(curl:*)`）始终只报告不代删——那会让 Claude 多弹确认，是取舍不是清理。
-
-两个地方容易判错：`Bash(pnpm --filter @acme/schema build)` 里的 `/schema` 是包名不是路径，判死就把在用权限删了，所以只认 `/Users`、`/home` 这类真文件系统根；`pkill` 里也含 `kill`，但它是按模式杀，不是一次性 PID。
-
-还有一个格式上的坑，代价最大：权限条目有纯字符串和 `["规则", null]` 两种形态。第一版清理把保留项写成元组，序列化成 JSON 就变成了数组——241 条字符串被改写成 209 条 `["...", null]`，JSON 能解析、肉眼也像对的，但格式已经变了。发现后从备份回滚重做，并钉了回归用例。**写回用户文件时，原对象要原样放回，不重建、不归一化。**
-
-## 系统级占用：按类别清，不按大小清
-
-`A25_claude_storage` 把「能清的」和「不能清的」分开列。能清的是两类：被取代的旧版本（CLI 攒下的历史版本、桌面版内置的旧副本），和会自己重建的缓存（Electron 的 `Code Cache`、`Cache`、`GPUCache`、`Dawn*`）。不能清的是 `Local Storage`、`IndexedDB`、`Cookies`、`Preferences`、配置、会话、用量历史——那些可能是账号状态的一部分。
-
-判「哪份是旧的」看的是 `command -v claude` 的软链接指向，不是版本号比大小：`2.1.99` 和 `2.1.100` 按字符串比就会判反。
-
-这一轮实测清掉约 990 MB：CLI 历史版本 637 MB、桌面版内置旧副本 219 MB、Electron 缓存 133 MB。
-
-## 项目级 `.claude` 按需要清，不按体积清
-
-文章只讲了家目录那三处残留，但实测本机真正占地方的是项目里的 `.claude/worktrees`：55 个目录 8.5 GB，**99% 是工作树**——那是 Claude Code 的 git 工作树，里面是真实代码，还有 `backend/.env` 这类文件。
-
-所以脚本对项目级只做两件事，都指向「失效」而不是「占地方」：
-
-一是**报事实**。`A24_project_claude` 给出一共有几个目录、多大、worktrees 占多少、活工作树几个、失效注册几条。看到「8.5 GB」不要顺手去删，那 8.5 GB 里 8.46 GB 是你在跑的代码。
-
-二是**清失效注册**。`prune_stale_worktrees` 跑 `git worktree prune`，只处理「路径已经不存在」的条目——工作树目录早没了，剩的只是 `.git/worktrees/<name>` 里一条登记。活的工作树 `prune` 不会碰，脚本也不会碰。
-
-项目级对应的是 `clean_project_claude_junk`：清 `.DS_Store` 和 `__pycache__`，不碰 `skills/`、`settings*.json`、`agents/`、`hooks/`、`commands/`，也不进 `worktrees/`。实测这部分只有 5 个小东西（约 96 KB），真正的大头在系统级。
-
-一个必须按精确文件名清的坑：skill 目录下的 `*.log` 看着像日志，实际是 eval 的测试夹具（本机 294 个），按后缀扫会把 skill 自己的测试弄坏。
-
-还有两个实现上的坑，也是实测撞出来的：工作树里的 `.git` 是个**文件**（内容写着 `gitdir: ...`），用 `.exists()` 判断会把每个工作树当成一个仓库、把父仓库的整份列表重复数一遍，我第一次就报出了「活工作树 1464 个」；`.claude/worktrees/.DS_Store` 这类孤立文件按目录深度扫会当成工作树目录，要单独认。
-
-## 必须人工做的事（`--manual`）
-
-文章里有二十三项本机没有接口、脚本替不了，集中成一份人工行动清单（七组）：
-
-```bash
-python3 scripts/account_guard.py --manual
-```
-
-分六组：手机与其它设备、浏览器与设备隔离、网页端设置、账号与支付节奏、使用行为、被封之后。每项都带 `〔文章 §X〕` 出处、能直接照抄的点击路径，和一句「为什么」。它是只读的，不体检、不改任何东西。
-
-三条最容易漏的：
-
-**iPhone 的两道开关都要关。** 只关「自动设置」不够，还要进 设置 → 隐私与安全性 → 定位服务 → 系统服务 里关掉「设定时区」。文章原话是「两端要对齐，电脑说自己在台北，手机说自己在上海，这本身就是一对矛盾信号」。
-
-**验证邮件只在专用浏览器里点开。** 文章原话：「环境配得再干净，在日常浏览器里点一下 Claude 的登录链接，真实 IP 就交出去了」，并说注册阶段翻车最多的就是这一步。
-
-**额度见黄就停。** 文章原话「限额不等于封号，换号绕过限制才像滥用」。这条零成本，来自被封过多个号的人。
-
-另外两项在总表里能直接看到，不用去人工清单找：**浏览器资料是否隔离**（A23，只报数量）、**作息与出口时区**（A22，出口当地是不是深夜）。
+项目授权、缓存与工作树边界、人工清单和历史判断背景见 [`references/maintenance-notes.md`](references/maintenance-notes.md)。这些内容用于深入复查，不改变默认只读、用户确认和显式恢复规则。
 
 ## 手工核对清单与检测网站
 
-想自己复核一遍而不跑脚本，用这条命令把清单打出来：
+想查看脚本能判断的状态，直接运行只读审计：
 
 ```bash
-python3 scripts/account_guard.py --commands
+python3 scripts/account_guard.py --audit
 ```
 
-下面就是它的内容。规则是：**在新开的终端里跑**，老窗口可能还带着启动时的旧代理变量。
+如果需要外部网站和人工路径，才运行 `python3 scripts/account_guard.py --commands`；其中 Clash API 检查不要手工拼接 Authorization 请求头或调用 curl，始终使用上面的脚本内建安全入口。规则是：**在新开的终端里跑**，老窗口可能还带着启动时的旧代理变量。
 
 ### 一、出口与泄漏面
 
@@ -367,43 +347,15 @@ cat ~/.claude/settings.json 2>/dev/null
 
 ### 三、Clash 线路与绝不直连
 
-三条命令共用一个前缀：
+不要手工拼 Authorization 头，也不要把 `CLASH_SECRET` 交给外部命令参数：这样 secret 会进入进程参数。使用脚本内建的只读审计入口；它通过 Python 内存中的 Unix socket 请求头读取 Clash 状态，secret 不进入 argv：
+
+先通过已有安全机制预先注入 `CLASH_SECRET` 环境变量（不要在命令行或 shell 历史中写明文，也不要写入脚本或仓库），再运行：
 
 ```bash
-SOCK=/tmp/verge/verge-mihomo.sock; AUTH="Authorization: Bearer ${CLASH_SECRET:-<你的 secret>}"
+python3 scripts/account_guard.py --audit
 ```
 
-**当前模式**
-
-```bash
-curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/configs   | python3 -c "import json,sys;print(json.load(sys.stdin)['mode'])"
-```
-
-应为 `rule`（或 `global`，见上文「代理与线路」那节的判据）。
-
-**GLOBAL 指向哪个组**
-
-```bash
-curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/proxies   | python3 -c "import json,sys;p=json.load(sys.stdin)['proxies'];print(p['GLOBAL']['now'], '|', p['Claude']['all'])"
-```
-
-应指向 Claude 专用组，且该组只有一个成员。
-
-**实际走哪条链**
-
-```bash
-curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/connections   | python3 -c "import json,sys;from collections import Counter;print(Counter(' -> '.join(reversed(c['chains'])) for c in json.load(sys.stdin)['connections']))"
-```
-
-链里应只有 `GLOBAL -> Claude -> 节点`。**切模式之后老连接的链是旧的**，先清一下再看：把上面的 URL 换成 `-X DELETE`。
-
-**Claude 规则排在最前**
-
-```bash
-curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/rules   | python3 -c "import json,sys;[print(r['payload'],'->',r['proxy']) for r in json.load(sys.stdin)['rules'][:7]]"
-```
-
-前 7 条应是 `anthropic.com` / `claude.ai` / `claude.com` / `claudeusercontent.com` / `statsigapi.net` 与 `160.79.104.0/21`，全部指向 `Claude` 组。
+审计输出会报告当前模式、GLOBAL/Claude 组、实时连接链、Claude 规则和 DNS 判据；需要机器可读结果时使用 `python3 scripts/account_guard.py --audit --json`。如果 socket 或 secret 不可用，按“未测到/待处理”报告，不要退回 curl 手工请求。
 
 **订阅会不会把规则改回去**（这台机器上最容易忽略的一条）
 
@@ -478,17 +430,12 @@ python3 -c "import json;print(json.load(open('$HOME/.claude/settings.json')).get
 | WebRTC | browserleaks.com/webrtc | 不能出现真实公网 IP |
 | DNS | browserleaks.com/dns | 不应出现中国的 DNS 服务器 |
 | Claude 服务状态 | status.anthropic.com | 怀疑是服务端问题时先看这里 |
-
-### 只想快速看一眼
-
-三条就够：
+### 只想快速看一眼（三条就够）
 
 ```bash
 scutil --proxy | grep -E "HTTPEnable|HTTPSEnable|SOCKSEnable"
 curl -s --noproxy '*' https://api.ipify.org
-SOCK=/tmp/verge/verge-mihomo.sock; AUTH="Authorization: Bearer ${CLASH_SECRET:-<你的 secret>}"
-curl -s --unix-socket $SOCK -H "$AUTH" http://localhost/configs \
-  | python3 -c "import json,sys;print(json.load(sys.stdin)['mode'])"
+python3 scripts/account_guard.py --audit
 ```
 
-第一条全 0、第二条是预期出口、第三条是 `rule`（或 `global`），就没大问题。
+前两条分别用于查看系统代理开关和实测出口；第三条由脚本安全读取 Clash 状态并报告模式、线路和 DNS。目标国家/IP 只有在命令显式提供 `--expected-country`、`--expected-exit-ip` 时才参与匹配。
