@@ -228,6 +228,8 @@ python3 tests/test_account_guard.py
 
 测试应在隔离夹具中运行；真实设备、真实代理、真实浏览器权限和管理员设置不属于单元测试的覆盖范围。
 
+每次推送到 `main`、提交 Pull Request 或手动运行时，GitHub Actions 会在 macOS 上用 Python 3.11 和 3.13 执行编译检查、单元测试和命令帮助检查。CI 只运行隔离的只读检查，不会执行真实的审计、加固、恢复或自检操作：[`查看 CI 工作流`](https://github.com/VioletScar-Hui/claude-account-guard/actions/workflows/tests.yml)。
+
 <a id="references"></a>
 
 ## 参考来源
