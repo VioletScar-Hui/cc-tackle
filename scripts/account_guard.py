@@ -25,6 +25,7 @@ import os
 import pathlib
 import re
 import secrets
+import socketserver
 import shutil
 import subprocess
 import unicodedata
@@ -109,6 +110,32 @@ CLASH_SOCK = pathlib.Path("/tmp/verge/verge-mihomo.sock")
 # Clash Verge 出厂就带这个 secret，没改过的话它适用于所有本机部署；
 # 改过就用环境变量 CLASH_SECRET 覆盖，别把某个人的 secret 写进代码。
 CLASH_SECRET = os.environ.get("CLASH_SECRET", "set-your-secret")
+
+
+def _new_loopback_server(handler):
+    """Create a loopback HTTP server without a reverse DNS lookup.
+
+    ``http.server.HTTPServer.server_bind`` calls ``socket.getfqdn`` after the
+    socket is already bound.  On a CI runner with broken or slow reverse DNS,
+    that can stall construction even though the loopback socket is ready.
+    Keep the currently installed ``ThreadingHTTPServer`` so tests and callers
+    can replace it, but use the lower-level bind implementation that does not
+    perform the lookup.  Non-server fakes used by unit tests keep their old
+    constructor contract.
+    """
+    import http.server
+
+    base = http.server.ThreadingHTTPServer
+    if not isinstance(base, type) or not issubclass(base, socketserver.TCPServer):
+        return base(("127.0.0.1", 0), handler)
+
+    class LoopbackServer(base):
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = self.server_address[0]
+            self.server_port = self.server_address[1]
+
+    return LoopbackServer(("127.0.0.1", 0), handler)
 
 
 def clash_http(method: str, path: str, body: bytes | None = None,
@@ -1784,7 +1811,7 @@ def verify_media_permission(timeout: int = 240) -> dict:
             ready.set()
 
     try:
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server = _new_loopback_server(Handler)
     except OSError as e:
         print(f"  本地服务起不来：{e}")
         return {}
@@ -1937,7 +1964,7 @@ def _webrtc_run(browser: str, media: bool = False) -> dict | None:
             ready.set()
 
     try:
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server = _new_loopback_server(Handler)
     except OSError:
         return None
     port = server.server_address[1]
@@ -2347,7 +2374,7 @@ def verify_browser_locale(timeout: int = 240) -> dict:
             ready.set()
 
     try:
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server = _new_loopback_server(Handler)
     except OSError as e:
         print(f"  本地服务起不来：{e}")
         return {}
