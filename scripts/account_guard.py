@@ -3,7 +3,7 @@
 
 设计沿用 skills/claude-cleanup 的安全约定：
   * 只读审计永远安全，任何写操作都要真实 TTY + 逐项询问 + 最终 CONFIRM；
-  * 第一个写操作是备份，失败即停；
+  * CONFIRM 后、任何目标状态变更前先完成备份，失败即停（并发锁是控制元数据）；
   * 需要 root 时只在终端原生 sudo 隐藏提示里输密码，脚本从不读取或保存密码；
   * 每项改动之后立刻复验，验证失败即报错并保留备份。
 
@@ -33,6 +33,46 @@ import tempfile
 HOME = pathlib.Path.home()
 SETTINGS = HOME / ".claude" / "settings.json"
 BACKUP_ROOT = HOME / "ClaudeGuardBackups"
+# Audit state is intentionally opt-in.  A normal ``--audit`` must not leave an
+# export history, cache, or report behind on disk.
+CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def claude_config_scope() -> dict:
+    """Describe the Claude config directory this process can actually cover.
+
+    ``CLAUDE_CONFIG_DIR`` changes where Claude Code keeps its global settings.
+    This guard deliberately does not follow that directory automatically: doing
+    so without an explicit, reviewed scope would make a repair target unclear.
+    """
+    default = HOME / ".claude"
+    raw = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if raw:
+        configured = pathlib.Path(os.path.abspath(os.path.expanduser(raw)))
+    else:
+        configured = default
+    custom = configured != default
+    out = {
+        "default_config_dir": str(default),
+        "configured_config_dir": str(configured),
+        "custom": custom,
+        "covered": [str(default)] if not custom else [],
+        "out_of_scope": [],
+    }
+    if custom:
+        out["out_of_scope"] = [
+            {"item": "Claude Code global settings", "path": str(configured / "settings.json"),
+             "reason": "CLAUDE_CONFIG_DIR 指向自定义目录；本 skill 不扫描或修改该目录"},
+            {"item": "Claude Code global settings.local", "path": str(configured / "settings.local.json"),
+             "reason": "CLAUDE_CONFIG_DIR 指向自定义目录；本 skill 不扫描或修改该目录"},
+        ]
+    return out
+
+
+def browser_profile_scope() -> str | None:
+    """Return the user supplied browser profile identity, if any."""
+    value = os.environ.get("CLAUDE_GUARD_BROWSER_PROFILE", "").strip()
+    return value or None
 
 TELEMETRY_KEYS = (
     "DISABLE_TELEMETRY",
@@ -247,9 +287,18 @@ def list_network_services() -> list[str]:
 
 def read_json(path: pathlib.Path, default):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return default
+    except OSError as error:
+        raise ValueError(f"无法读取 JSON 文件：{path}") from error
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"JSON 文件损坏：{path}") from error
+    if isinstance(default, dict) and not isinstance(data, dict):
+        raise ValueError(f"JSON 顶层不是对象：{path}")
+    return data
 
 
 def write_json(path: pathlib.Path, data) -> None:
@@ -257,6 +306,17 @@ def write_json(path: pathlib.Path, data) -> None:
     tmp = path.with_suffix(path.suffix + ".guard.tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(path)
+
+
+def save_audit_report(report: dict) -> pathlib.Path:
+    """Explicitly persist an audit report; callers must opt in."""
+    outdir = BACKUP_ROOT
+    outdir.mkdir(parents=True, exist_ok=True)
+    os.chmod(outdir, 0o700)
+    path = outdir / f"audit-{dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.json"
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
 
 
 def protected_snapshot() -> dict[str, bytes]:
@@ -320,38 +380,59 @@ def save_export_history(info: dict) -> None:
     hand_back_ownership(path)
 
 
-def check_export_ip() -> dict:
+def _json_object(body: str):
+    """Parse a probe response without allowing malformed JSON/types to escape."""
+    try:
+        value = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def check_export_ip(persist: bool = True) -> dict:
     """A8 出口 IP 与 ASN 类型。文章 2.3、2.5①。"""
     out = {"ip": None, "org": None, "country": None, "city": None, "timezone": None,
-           "verdict": "未知", "sources": {}}
+           "verdict": None, "sources": {}}
     for name, url in (("ipinfo", "https://ipinfo.io/json"), ("ipify", "https://api.ipify.org?format=json")):
         code, body = run(["curl", "-s", "--max-time", "10", "--noproxy", "*", url])
         if code or not body.strip():
             continue
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
+        data = _json_object(body)
+        if data is None:
             continue
-        out["sources"][name] = data.get("ip")
+        candidate = data.get("ip")
+        if not isinstance(candidate, str) or not re.match(r"^[0-9a-fA-F:.]+$", candidate):
+            candidate = None
+        out["sources"][name] = candidate
         if name == "ipinfo":
             out.update(
-                ip=data.get("ip"), org=data.get("org"), country=data.get("country"),
-                city=data.get("city"), timezone=data.get("timezone"),
+                ip=candidate, org=data.get("org") if isinstance(data.get("org"), str) else None,
+                country=data.get("country") if isinstance(data.get("country"), str) else None,
+                city=data.get("city") if isinstance(data.get("city"), str) else None,
+                timezone=data.get("timezone") if isinstance(data.get("timezone"), str) else None,
             )
+    if not out.get("ip"):
+        # ipify is deliberately a fallback: it only tells us the address, but
+        # that is still better than claiming that no exit IP was measured.
+        out["ip"] = out["sources"].get("ipify")
+        if out.get("ip"):
+            out["fallback_source"] = "ipify"
+    source_ips = {v for v in out["sources"].values() if v}
+    if len(source_ips) > 1:
+        out["source_conflict"] = sorted(source_ips)
     ip = out.get("ip")
     if not ip:
         out["verdict"] = "取不到出口 IP"
         return out
     code, body = run(["curl", "-s", "--max-time", "10", "--noproxy", "*", f"https://ipinfo.io/{ip}/json"])
     if not code and body.strip():
-        try:
-            d = json.loads(body)
-            org = (d.get("org") or "")
+        d = _json_object(body)
+        if d is not None:
+            org = d.get("org") if isinstance(d.get("org"), str) else ""
             out["org"] = org
-            out["timezone"] = d.get("timezone") or out.get("timezone")
+            if isinstance(d.get("timezone"), str):
+                out["timezone"] = d["timezone"]
             out["verdict"] = classify_asn(org)
-        except json.JSONDecodeError:
-            pass
 
     # 交叉核对第二个地理库。同一个 IP 在不同库上可能落在不同城市——实测
     # 同一个出口 IP 在 ipinfo 是 New York City、在 ip-api 却是 Dallas。这个分歧本身
@@ -362,17 +443,14 @@ def check_export_ip() -> dict:
         f"http://ip-api.com/json/{ip}?fields=status,city,regionName,timezone,isp",
     ])
     if not code and body.strip():
-        try:
-            d2 = json.loads(body)
-            if d2.get("status") == "success":
-                out["geo_second"] = {
-                    "city": d2.get("city"), "region": d2.get("regionName"),
-                    "timezone": d2.get("timezone"), "isp": d2.get("isp"),
-                }
-                if d2.get("city") and out.get("city") and d2["city"] != out["city"]:
-                    out["geo_conflict"] = f"{out['city']} / {d2['city']}"
-        except json.JSONDecodeError:
-            pass
+        d2 = _json_object(body)
+        if d2 is not None and d2.get("status") == "success":
+            out["geo_second"] = {
+                "city": d2.get("city"), "region": d2.get("regionName"),
+                "timezone": d2.get("timezone"), "isp": d2.get("isp"),
+            }
+            if d2.get("city") and out.get("city") and d2["city"] != out["city"]:
+                out["geo_conflict"] = f"{out['city']} / {d2['city']}"
     # 文章 §2.5① 要求「城市别每次变」、§9 要求「出口国家和上次一致」，而这一条只能靠
     # 和上一次比才看得出来，单看这一次永远是「现在的出口是谁」。所以把这次的出口记下来。
     # 变了不等于错——换订阅、服务商换 IP 都会变——但它是文章里排最前面的信号，得让人看见。
@@ -385,7 +463,8 @@ def check_export_ip() -> dict:
         for key, label in (("ip", "IP"), ("country", "国家"), ("city", "城市"), ("org", "org")):
             if prev.get(key) and out.get(key) and str(prev[key]) != str(out[key]):
                 out["changed_fields"].append(f"{label} {prev[key]} → {out[key]}")
-    save_export_history(out)
+    if persist:
+        save_export_history(out)
     return out
 
 
@@ -396,14 +475,31 @@ def check_proxy_residue() -> dict:
       * residue —— 未启用但存了 127.0.0.1:7897 一类值，Clean Verge 关掉系统代理后留下的；
       * enabled —— 系统代理仍处于启用状态，与文章 2.4「开 TUN 后关掉系统代理」相悖。
     """
-    out = {"scutil": {}, "enabled": [], "network_services": [], "residue": []}
+    out = {"scutil": {}, "enabled": [], "network_services": [], "residue": [],
+           "probe_ok": True, "probe_errors": []}
     code, body = run(["scutil", "--proxy"])
+    if code:
+        out["probe_ok"] = False
+        out["probe_errors"].append("scutil --proxy 失败")
     for key in ("HTTPEnable", "HTTPSEnable", "SOCKSEnable", "ProxyAutoConfigEnable"):
         m = re.search(rf"{key}\s*:\s*(\d+)", body)
         out["scutil"][key] = int(m.group(1)) if m else None
+        if not m:
+            out["probe_ok"] = False
         if out["scutil"][key] == 1:
             out["enabled"].append(key)
-    for svc in list_network_services():
+    service_code, service_body = run(["networksetup", "-listallnetworkservices"])
+    if service_code:
+        out["probe_ok"] = False
+        out["probe_errors"].append("networksetup -listallnetworkservices 失败")
+        services = []
+    else:
+        services = []
+        for line in service_body.splitlines()[1:]:
+            name = line.strip()
+            if name and not name.startswith("*"):
+                services.append(name)
+    for svc in services:
         for getter, setter in (
             ("getwebproxy", "webproxy"),
             ("getsecurewebproxy", "securewebproxy"),
@@ -411,6 +507,8 @@ def check_proxy_residue() -> dict:
         ):
             code, body = run(["networksetup", f"-{getter}", svc])
             if code:
+                out["probe_ok"] = False
+                out["probe_errors"].append(f"networksetup -{getter} {svc} 失败")
                 continue
             enabled = re.search(r"Enabled:\s*(\w+)", body)
             server = re.search(r"Server:\s*(\S+)", body)
@@ -422,6 +520,9 @@ def check_proxy_residue() -> dict:
                 "server": server.group(1) if server else "",
                 "port": port.group(1) if port else "",
             }
+            if not enabled or not server or not port:
+                out["probe_ok"] = False
+                out["probe_errors"].append(f"{svc}/{setter} 输出字段不完整")
             out["network_services"].append(entry)
             # 只在「未启用但存了值」时算残留；启用中的一律不动
             if entry["enabled"].lower() == "no" and entry["port"] in PROXY_RESIDUE_PORTS:
@@ -535,16 +636,35 @@ def check_anthropic_base_url() -> dict:
 
 def check_ipv6() -> dict:
     """A5 IPv6 泄漏。文章 2.5 可选加固。"""
-    out = {"global_addresses": [], "services": {}}
+    out = {"global_addresses": [], "services": {}, "probe_ok": True, "probe_errors": []}
     code, body = run(["ifconfig"])
+    if code:
+        out["probe_ok"] = False
+        out["probe_errors"].append("ifconfig 失败")
     for line in body.splitlines():
         s = line.strip()
         if s.startswith("inet6") and "fe80" not in s and "::1" not in s:
             out["global_addresses"].append(s.split()[0])
-    for svc in list_network_services():
+    svc_code, svc_body = run(["networksetup", "-listallnetworkservices"])
+    if svc_code:
+        out["probe_ok"] = False
+        out["probe_errors"].append("networksetup -listallnetworkservices 失败")
+        services = []
+    else:
+        services = [line.strip() for line in svc_body.splitlines()[1:]
+                    if line.strip() and not line.strip().startswith("*")]
+    for svc in services:
         code, info = run(["networksetup", "-getinfo", svc])
+        if code:
+            out["probe_ok"] = False
+            out["probe_errors"].append(f"networksetup -getinfo {svc} 失败")
+            out["services"][svc] = None
+            continue
         m = re.search(r"IPv6:\s*(\S+)", info)
-        out["services"][svc] = m.group(1) if m else "?"
+        out["services"][svc] = m.group(1) if m else None
+        if not m:
+            out["probe_ok"] = False
+            out["probe_errors"].append(f"{svc} 缺少 IPv6 字段")
     return out
 
 
@@ -593,20 +713,30 @@ def check_dns() -> dict:
     而不是「fake-ip 生效了」。两者都说成 fake-ip 一个词会掩盖问题，
     所以这里按域名分别记录，把解析到真实 IP 的域名单独列出来。
     """
-    out = {"resolved": [], "fake_ip": False, "real_ip_hosts": [], "system_dns": []}
+    out = {"resolved": [], "fake_ip": False, "real_ip_hosts": [], "system_dns": [],
+           "probe_ok": True, "probe_errors": []}
     for host in ("example.com", "api.anthropic.com", "claude.ai"):
         code, body = run(["dig", "+short", host], timeout=10)
+        if code:
+            out["probe_ok"] = False
+            out["probe_errors"].append(f"dig {host} 失败")
+            continue
         ips = [ip for ip in body.split() if re.match(r"^[0-9a-fA-F:.]+$", ip)]
         for ip in ips:
             is_fake = ip.startswith(fake_ip_prefixes())
             out["resolved"].append({"host": host, "ip": ip, "fake": is_fake})
             if is_fake:
                 out["fake_ip"] = True
-        if ips and not any(i.startswith(fake_ip_prefixes()) for i in ips):
+        # Mixed answers are still a leak: the presence of one fake address must
+        # not hide a second, real address returned for the same hostname.
+        if ips and any(not i.startswith(fake_ip_prefixes()) for i in ips):
             out["real_ip_hosts"].append(host)
         if not ips:
             out["real_ip_hosts"].append(f"{host}(无解析结果)")
     code, body = run(["scutil", "--dns"])
+    if code:
+        out["probe_ok"] = False
+        out["probe_errors"].append("scutil --dns 失败")
     for m in re.finditer(r"nameserver\[\d+\]\s*:\s*(\S+)", body):
         if m.group(1) not in out["system_dns"]:
             out["system_dns"].append(m.group(1))
@@ -1444,9 +1574,44 @@ MEDIA_CACHE = HOME / ".local" / "state" / "claude-guard" / "media-permission.jso
 def load_media_permission() -> dict:
     """读上次的媒体权限复核结果。没跑过就是空的。"""
     try:
-        return json.loads(MEDIA_CACHE.read_text(encoding="utf-8"))
+        data = json.loads(MEDIA_CACHE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    return data if isinstance(data, dict) else {}
+
+
+def cache_is_fresh(data: dict, *, require_profile_scope: bool = True,
+                   expected_profile_scope: str | None = None) -> tuple[bool, str]:
+    """Return whether a cached browser measurement is bounded and attributable.
+
+    The cache is evidence from one browser profile at one point in time.  A
+    missing timestamp or profile scope is therefore unknown, never green.
+    """
+    if not isinstance(data, dict):
+        return False, "缓存不是对象"
+    checked = data.get("checkedAt")
+    if not isinstance(checked, str):
+        return False, "缺少测量时间"
+    try:
+        when = dt.datetime.strptime(checked, "%Y-%m-%d %H:%M")
+    except ValueError:
+        try:
+            when = dt.datetime.fromisoformat(checked.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return False, "测量时间格式无效"
+    age = (dt.datetime.now() - when).total_seconds()
+    if age < 0 or age > CACHE_MAX_AGE_SECONDS:
+        return False, f"测量已超过 {CACHE_MAX_AGE_SECONDS // 3600} 小时"
+    if require_profile_scope:
+        scope = data.get("profileScope")
+        if not isinstance(scope, str) or not scope.strip():
+            return False, "未绑定浏览器资料范围"
+        expected = expected_profile_scope if expected_profile_scope is not None else browser_profile_scope()
+        if not expected:
+            return False, "未提供 CLAUDE_GUARD_BROWSER_PROFILE，不能确认资料身份"
+        if scope != expected:
+            return False, "缓存资料范围与当前指定的浏览器资料标识不一致"
+    return True, ""
 
 
 def verify_media_permission(timeout: int = 240) -> dict:
@@ -1529,6 +1694,14 @@ def verify_media_permission(timeout: int = 240) -> dict:
         return {}
 
     got["checkedAt"] = now_stamp()
+    # The browser cannot identify its profile to this local page.  Bind the
+    # result only to an identifier the user supplied explicitly; without it
+    # the cache remains visible but can never be treated as green evidence.
+    scope = browser_profile_scope()
+    if scope:
+        got["profileScope"] = scope
+    else:
+        got.pop("profileScope", None)
     try:
         MEDIA_CACHE.parent.mkdir(parents=True, exist_ok=True)
         MEDIA_CACHE.write_text(json.dumps(got, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1818,9 +1991,10 @@ def predict_intl_locale(tag: str | None) -> str | None:
 def load_browser_locale() -> dict:
     """读上次的浏览器 Intl 复核结果。没跑过就是空的。"""
     try:
-        return json.loads(LOCALE_CACHE.read_text(encoding="utf-8"))
+        data = json.loads(LOCALE_CACHE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def chrome_app_languages() -> list | None:
@@ -1913,17 +2087,22 @@ def check_browser_locale(ip: dict | None = None) -> dict:
     out["predicted"] = predict_intl_locale(chain[0] if chain else None)
 
     cached = load_browser_locale()
-    if cached.get("intlLocale"):
+    cache_ok, cache_note = cache_is_fresh(cached, expected_profile_scope=browser_profile_scope())
+    if cached.get("intlLocale") and cache_ok:
         out["measured"] = cached["intlLocale"]
         out["checked_at"] = cached.get("checkedAt")
-        out["source"] = "浏览器实测"
+        out["scope_unverified"] = True
+        out["source"] = ("浏览器实测（用户声明资料：" + cached["profileScope"]
+                          + "；资料身份未由脚本验证）")
         # 时区是同一张复核页顺手带回来的（页面本来就在收 timeZone），
         # 以前收了没用。这里只报事实、不下判定 —— 见下面 facts 里的说明。
         if cached.get("timeZone"):
             out["browser_timezone"] = cached["timeZone"]
-    elif out["predicted"]:
+    elif out["predicted"] and not cached.get("intlLocale"):
         out["measured"] = out["predicted"]
         out["source"] = "按 AppleLanguages 推定，未跑浏览器复核"
+    elif cached.get("intlLocale"):
+        out["facts"].append("浏览器 Intl 缓存不可用：" + cache_note)
 
     out["cn"] = is_cn_locale(out["measured"])
     if out["measured"]:
@@ -1973,6 +2152,7 @@ LOCALE_VERIFY_PAGE = """<!doctype html><meta charset="utf-8">
 (() => {
   const d = Intl.DateTimeFormat().resolvedOptions();
   const payload = {
+    profileScope: null,
     intlLocale: d.locale,
     calendar: d.calendar,
     numberingSystem: d.numberingSystem,
@@ -2072,6 +2252,11 @@ def verify_browser_locale(timeout: int = 240) -> dict:
         return {}
 
     got["checkedAt"] = now_stamp()
+    scope = browser_profile_scope()
+    if scope:
+        got["profileScope"] = scope
+    else:
+        got.pop("profileScope", None)
     try:
         LOCALE_CACHE.parent.mkdir(parents=True, exist_ok=True)
         LOCALE_CACHE.write_text(json.dumps(got, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2145,6 +2330,12 @@ def build_summary(report: dict) -> list:
     bl = report.get("A27_browser_locale") or {}
     kc = report.get("E1_keychain") or {}
     rows = []
+    scope = report.get("scope_manifest") or {}
+    custom_config_scope = bool(scope.get("custom"))
+    scope_note = (
+        "CLAUDE_CONFIG_DIR 指向自定义目录 "
+        f"{scope.get('configured_config_dir') or '(未知)'}；未扫描该目录，不能判定干净"
+    )
 
     def add(name, status, detail):
         rows.append((name, status, detail))
@@ -2162,10 +2353,19 @@ def build_summary(report: dict) -> list:
         add("出口 IP 与归属", S_NA, "未检测")
     elif ip.get("ip"):
         detail = f"{ip['ip']}  {ip.get('city')}/{ip.get('country')}"
+        if ip.get("source_conflict"):
+            detail += "（出口来源冲突：" + " / ".join(ip["source_conflict"]) + "）"
+            add("出口 IP 与归属", S_FIX, detail)
+            # 不用历史一致性掩盖本次探测的直接矛盾。
+            source_conflict = True
+        else:
+            source_conflict = False
         if ip.get("geo_conflict"):
             detail += f"（两个地理库打架：{ip['geo_conflict']}）"
         prev = ip.get("previous") or {}
-        if ip.get("changed"):
+        if source_conflict:
+            pass
+        elif ip.get("changed"):
             detail += (f"；⚠ 与上次不同：上次 {prev.get('ip')}"
                        f"（{prev.get('city')}/{prev.get('country')}，记于 {prev.get('checkedAt')}）")
             add("出口 IP 与归属", S_FIX, detail)
@@ -2189,16 +2389,20 @@ def build_summary(report: dict) -> list:
     # ── 泄漏面 ──
     if missing("A1_proxy_residue"):
         add("系统代理残留", S_NA, "未检测")
+    elif pr.get("probe_ok") is False:
+        add("系统代理残留", S_NA, "探测失败或输出不完整，未判定为干净：" + "; ".join(pr.get("probe_errors") or []))
     elif pr.get("enabled"):
         add("系统代理残留", S_BAD, f"系统代理处于启用状态：{pr['enabled']}（TUN 与系统代理不该叠着）")
     elif pr.get("residue"):
-        add("系统代理残留", S_FIX, f"{len(pr['residue'])} 项未启用但存着值，自动清理会清掉")
+        add("系统代理残留", S_FIX, f"{len(pr['residue'])} 项未启用但存着值，确认后计划清掉")
     else:
         add("系统代理残留", S_OK, "四个开关全为 0，网络服务也没有存值")
 
     cdc = dn.get("clash") or {}
     if missing("A6_dns"):
         add("DNS 泄漏", S_NA, "未检测")
+    elif dn.get("probe_ok") is False:
+        add("DNS 泄漏", S_NA, "DNS 探测失败或输出不完整，未判定为干净：" + "; ".join(dn.get("probe_errors") or []))
     elif (dn.get("real_ip_hosts") or []):
         add("DNS 泄漏", S_BAD, f"这些域名解析到了真实公网 IP：{(dn.get('real_ip_hosts') or [])[:3]}")
     elif cdc.get("leaking") or cdc.get("leaking_fallback"):
@@ -2206,18 +2410,18 @@ def build_summary(report: dict) -> list:
         where = "主解析器" if cdc.get("leaking") else "fallback"
         add("DNS 泄漏", S_FIX,
             where + "含国内服务器（" + "、".join(bad[:2]) + "），"
-            "国外域名的解析交给了它们；自动清理会换成境外解析器")
+            "国外域名的解析交给了它们；确认选择后可换成境外解析器")
     elif cdc.get("found") and not cdc.get("respect_rules"):
         add("DNS 泄漏", S_FIX,
             "没开 respect-rules —— Clash 自己的 DNS 查询不跟规则走，是从真实 IP 直发的；"
-            "自动清理会打开")
+            "确认选择后可打开")
     elif cdc.get("enabled") is False:
         add("DNS 泄漏", S_FIX,
-            "Clash 配置里 dns.enable 是关的，DNS 模块根本没在跑；自动清理会打开")
+            "Clash 配置里 dns.enable 是关的，DNS 模块根本没在跑；确认选择后可打开")
     elif cdc.get("tun_enabled") and not cdc.get("hijack"):
         add("DNS 泄漏", S_FIX,
             "TUN 开着但没配 dns-hijack —— 发往 53 端口的查询不会被内核接管，"
-            "会照原样落到系统配的解析器上；自动清理会补上")
+            "会照原样落到系统配的解析器上；确认选择后可补上")
     elif dn.get("fake_ip"):
         ns = cdc.get("nameserver") or []
         tail = "全部落进 fake-ip 段，TUN 劫持生效"
@@ -2245,6 +2449,12 @@ def build_summary(report: dict) -> list:
         add("浏览器 Intl 区域设置", S_FIX,
             f"应用语言已设为 {bl.get('target')}，但 Chrome 是改之前启动的，"
             f"完全退出再打开才生效")
+    elif "推定" in str(bl.get("source") or ""):
+        add("浏览器 Intl 区域设置", S_NA,
+            f"{bl['measured']}（{bl.get('source')}）；没有浏览器实测，不能据此报绿")
+    elif bl.get("scope_unverified"):
+        add("浏览器 Intl 区域设置", S_NA,
+            f"{bl['measured']}（{bl.get('source')}）；资料身份未由脚本验证，不能据此报绿")
     else:
         add("浏览器 Intl 区域设置", S_OK,
             f"{bl['measured']}（{bl.get('source')}），出口 {bl.get('country') or '未知'}")
@@ -2257,18 +2467,20 @@ def build_summary(report: dict) -> list:
         # （--check-media 复核过），那条路径就不可达了——这时候再报「待处理」
         # 就是挂着一个已经修好的项。所以先看复核结果。
         mp = load_media_permission()
-        if mp.get("ok") and (tun or media_ips):
-            add("WebRTC 泄漏", S_OK,
-                f"授权后会露出 {tun[0] if tun else media_ips[0]}，但已经在浏览器里禁掉了"
-                f"摄像头/麦克风（复核于 {mp.get('checkedAt')}），网站拿不到权限，"
-                f"mDNS 混淆一直生效")
+        media_cache_ok, media_cache_note = cache_is_fresh(mp)
+        if wr.get("leaked_public"):
+            add("WebRTC 泄漏", S_BAD, f"探测到公网地址：{wr['leaked_public']}")
+            _webrtc_row_done = True
+        elif mp.get("ok") and media_cache_ok and (tun or media_ips):
+            add("WebRTC 泄漏", S_NA,
+                f"授权后会露出 {tun[0] if tun else media_ips[0]}；缓存显示浏览器已禁掉"
+                f"摄像头/麦克风（复核于 {mp.get('checkedAt')}），但资料身份只有用户声明、"
+                f"未由脚本验证，不能据此报绿")
             _webrtc_row_done = True
         else:
             _webrtc_row_done = False
         if _webrtc_row_done:
             pass
-        elif wr.get("leaked_public"):
-            add("WebRTC 泄漏", S_BAD, f"探测到公网地址：{wr['leaked_public']}")
         elif tun:
             # 最要紧的一种：网站拿到摄像头/麦克风权限后，候选里会带上 Clash 的 TUN 地址。
             # 198.18.0.0/15 是 RFC 2544 保留段，出现它等于自报在用 Clash 类代理。
@@ -2284,7 +2496,9 @@ def build_summary(report: dict) -> list:
             extra = "，候选均为 mDNS 混淆的主机名" if wr.get("mdns") else ""
             if shell:
                 extra += "；但这次用的 headless shell，它看不到真实地址，结论只覆盖一半"
-            add("WebRTC 泄漏", S_OK, f"取到 {wr['candidates']} 个候选，无公网地址{extra}")
+                add("WebRTC 泄漏", S_NA, f"取到 {wr['candidates']} 个候选，无公网地址{extra}")
+            else:
+                add("WebRTC 泄漏", S_OK, f"取到 {wr['candidates']} 个候选，无公网地址{extra}")
         else:
             add("WebRTC 泄漏", S_NA, wr.get("note") or "探测未取到候选，结论不可用")
     else:
@@ -2293,16 +2507,22 @@ def build_summary(report: dict) -> list:
         # 那次复核已经答了；再挂一个「未探测」等于让人以为必须重跑两分钟的探测。
         # 注意：这条分支只在**没有**探测结果时走，探测跑过时以探测为准。
         mp = load_media_permission()
-        if mp.get("ok"):
-            add("WebRTC 泄漏", S_OK,
-                f"这次没跑探测；但已在浏览器里复核过摄像头与麦克风都拿不到"
-                f"（复核于 {mp.get('checkedAt')}），授权那条路径不可达，mDNS 混淆一直生效")
+        media_cache_ok, media_cache_note = cache_is_fresh(mp)
+        if mp.get("ok") and media_cache_ok:
+            add("WebRTC 泄漏", S_NA,
+                f"这次没跑探测；缓存显示摄像头与麦克风都拿不到（复核于 {mp.get('checkedAt')}），"
+                f"但资料身份只有用户声明、未由脚本验证，不能据此报绿")
         else:
-            add("WebRTC 泄漏", S_NA, wr.get("note") or "未探测；加 --webrtc 参数可跑")
+            note = wr.get("note") or "未探测；加 --webrtc 参数可跑"
+            if mp.get("ok") and not media_cache_ok:
+                note += "；已有媒体权限缓存不可用：" + media_cache_note
+            add("WebRTC 泄漏", S_NA, note)
 
     v6g = v6.get("global_addresses") or []
     if missing("A5_ipv6"):
         add("IPv6 全局地址", S_NA, "未检测")
+    elif v6.get("probe_ok") is False:
+        add("IPv6 全局地址", S_NA, "ifconfig/networksetup 探测失败，未判定为无 IPv6：" + "; ".join(v6.get("probe_errors") or []))
     elif v6g:
         add("IPv6 全局地址", S_FIX, f"{len(v6g)} 个全局地址；关掉可少一条绕过代理的路径")
     else:
@@ -2318,8 +2538,12 @@ def build_summary(report: dict) -> list:
 
     g1, g2 = tl.get("gate_auto_plist"), tl.get("gate_location")
     cached = tl.get("gate_location_cached") or {}
+    cached_fresh = bool(cached and cache_is_fresh(cached, require_profile_scope=False)[0])
     if g1 is False and g2 is False:
-        if cached:
+        if cached and not cached_fresh:
+            add("时区两道闸", S_NA,
+                "定位服务闸门只有过期缓存，不能据此报绿；请用受控 root 方式重新复核")
+        elif cached:
             add("时区两道闸", S_OK,
                 f"按位置自动设定=已关，定位服务设定时区=已关（root 实测于 {cached.get('checkedAt')}，之后没再复核）")
         else:
@@ -2459,7 +2683,11 @@ def build_summary(report: dict) -> list:
             add("settings 失效权限", S_OK, detail)
 
     # ── 残留与完整性 ──
-    if missing("A1_terminal_env"):
+    if custom_config_scope:
+        add("终端 / shell / npm / git 代理", S_NA, scope_note)
+        env_n = rc_n = 0
+        npmgit = []
+    elif missing("A1_terminal_env"):
         add("终端 / shell / npm / git 代理", S_NA, "未检测")
         env_n = rc_n = 0
         npmgit = []
@@ -2468,12 +2696,13 @@ def build_summary(report: dict) -> list:
         rc_n = sum(len(v) for v in (te.get("rc_files") or {}).values())
         npmgit = [v for v in list((te.get("npm") or {}).values()) + list((te.get("git") or {}).values())
                   if v and v.strip().lower() not in ("null", "undefined", "none")]
-    rc_n = sum(len(v) for v in (te.get("rc_files") or {}).values())
-    npmgit = [v for v in list((te.get("npm") or {}).values()) + list((te.get("git") or {}).values())
-              if v and v.strip().lower() not in ("null", "undefined", "none")]
+    if not custom_config_scope:
+        rc_n = sum(len(v) for v in (te.get("rc_files") or {}).values())
+        npmgit = [v for v in list((te.get("npm") or {}).values()) + list((te.get("git") or {}).values())
+                  if v and v.strip().lower() not in ("null", "undefined", "none")]
     npmrc_n = len(te.get("npmrc") or [])
     brew_n = len(((te.get("brew") or {}).get("proxy")) or [])
-    if missing("A1_terminal_env"):
+    if custom_config_scope or missing("A1_terminal_env"):
         pass
     elif env_n or rc_n or npmgit or npmrc_n or brew_n:
         extra = []
@@ -2483,7 +2712,7 @@ def build_summary(report: dict) -> list:
             extra.append(f"Homebrew {brew_n} 项")
         add("终端 / shell / npm / git 代理", S_FIX,
             f"env {env_n} 条，rc {rc_n} 条，npm/git {len(npmgit)} 项"
-            + ("；" + "、".join(extra) if extra else "") + "，自动清理会清掉")
+            + ("；" + "、".join(extra) if extra else "") + "，确认后计划清掉")
     else:
         # 文章 2.5④ 那批命令有五处出处，一处一处写进证据里，别只说一句「没有代理」。
         add("终端 / shell / npm / git 代理", S_OK,
@@ -2494,14 +2723,17 @@ def build_summary(report: dict) -> list:
     # 那处残留会被处理掉，实际上脚本根本不会碰它。
     hits = ab.get("hits") or []
     own = [h for h in hits if "/.claude/" in str(h.get("file", ""))]
-    if missing("A2_anthropic_base_url"):
+    if custom_config_scope:
+        add("settings.json 端点与凭据", S_NA, scope_note)
+        own = []
+    elif missing("A2_anthropic_base_url"):
         add("settings.json 端点与凭据", S_NA, "未检测")
         own = []
     other = [h for h in hits if "/.claude/" not in str(h.get("file", ""))]
     sp = te.get("settings_proxy") or []
     if missing("A1_terminal_env"):
         sp = []
-    if missing("A2_anthropic_base_url"):
+    if custom_config_scope or missing("A2_anthropic_base_url"):
         pass
     elif own or sp:
         bits2 = []
@@ -2509,7 +2741,7 @@ def build_summary(report: dict) -> list:
             bits2.append(f"{len(own)} 处指向别处")
         if sp:
             bits2.append("env 里的代理变量 " + "、".join(sp))
-        add("settings.json 端点与凭据", S_FIX, "、".join(bits2) + "，自动清理会清掉")
+        add("settings.json 端点与凭据", S_FIX, "、".join(bits2) + "，确认后计划清掉")
     elif other:
         names = "、".join(sorted({pathlib.Path(h["file"]).name for h in other}))
         add("settings.json 端点与凭据", S_OK,
@@ -2517,7 +2749,9 @@ def build_summary(report: dict) -> list:
     else:
         add("settings.json 端点与凭据", S_OK, "没有 ANTHROPIC_BASE_URL、代理变量之类的残留")
 
-    if missing("A3_telemetry"):
+    if custom_config_scope:
+        add("遥测三键", S_NA, scope_note)
+    elif missing("A3_telemetry"):
         add("遥测三键", S_NA, "未检测")
     elif tm.get("any_set"):
         add("遥测三键", S_OK, "已写入 settings.json 的 env")
@@ -2755,7 +2989,7 @@ def check_local_git() -> dict:
     if not roots:
         out["note"] = (
             "未指定项目目录，这一项跳过。用 "
-            "CLAUDE_GUARD_PROJECT_ROOTS=\"$HOME/CC_Project\" 指定（冒号分隔可写多个）"
+            "CLAUDE_GUARD_PROJECT_ROOTS=\"$HOME/code\" 指定（冒号分隔可写多个）"
         )
         return out
     for raw in roots:
@@ -3661,7 +3895,7 @@ def release_run_lock() -> None:
 
 
 def create_backup(paths: list[pathlib.Path], sudo_paths: list[pathlib.Path] | None = None) -> pathlib.Path:
-    """第一个写操作：把要动的文件复制到带时间戳的备份目录。
+    """在任何目标状态变更前，把要动的文件复制到带时间戳的备份目录。
 
     sudo_paths 里的文件普通用户读不到（例如 /var/db/locationd/clients.plist），
     必须用 sudo cp；调用前要先 sudo_prime()。任何一项备份失败都直接抛错，
@@ -3674,6 +3908,13 @@ def create_backup(paths: list[pathlib.Path], sudo_paths: list[pathlib.Path] | No
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     dest = BACKUP_ROOT / f"guard-{stamp}"
     (dest / "files").mkdir(parents=True, exist_ok=True)
+    try:
+        BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+        os.chmod(BACKUP_ROOT, 0o700)
+        os.chmod(dest, 0o700)
+        os.chmod(dest / "files", 0o700)
+    except OSError as e:
+        raise RuntimeError(f"备份目录权限设置失败：{e}") from e
     manifest: dict = {"created": dt.datetime.now().isoformat(), "items": [], "sudo_items": []}
     for p in paths:
         if not p.exists():
@@ -3686,6 +3927,11 @@ def create_backup(paths: list[pathlib.Path], sudo_paths: list[pathlib.Path] | No
                 shutil.copy2(p, target)
         except OSError as e:
             raise RuntimeError(f"备份失败 {p}: {e}") from e
+        try:
+            if target.is_file():
+                os.chmod(target, 0o600)
+        except OSError as e:
+            raise RuntimeError(f"备份权限设置失败 {target}: {e}") from e
         manifest["items"].append(str(p))
     for p in (sudo_paths or []):
         target = dest / "files" / str(p).lstrip("/").replace("/", "__")
@@ -3695,8 +3941,46 @@ def create_backup(paths: list[pathlib.Path], sudo_paths: list[pathlib.Path] | No
                 f"需要 root 的备份失败：{p}（{err.strip()[:120] or '空文件'}），已中止以免在无备份的情况下改动"
             )
         manifest["sudo_items"].append(str(p))
-    (dest / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    manifest_path = dest / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.chmod(manifest_path, 0o600)
     return dest
+
+
+def backup_paths_for_plan(plan: dict, report: dict, selected: dict | None = None) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
+    """Build the complete pre-change backup set from the displayed plan."""
+    selected = selected or {}
+    paths = [SETTINGS, HOME / ".claude.json", HOME / ".npmrc",
+             HOME / ".gitconfig", HOME / ".config" / "git" / "config"]
+    if selected.get("wrapper", True):
+        paths.append(HOME / ".local" / "bin" / "claude-safe")
+    if selected.get("browser_locale", True):
+        paths.append(LOCALE_ROLLBACK_FILE)
+    paths.extend(HOME / name for name in (plan.get("rc_files") or {}))
+    if selected.get("dead_permissions", True):
+        for d in (report.get("A26_claude_settings") or {}).get("dead") or []:
+            paths.append(HOME / d["file"])
+    # Deletions are irreversible without a copy.  Include every selected
+    # project cleanup path before allowing the first write.
+    if not selected.get("project_junk", True):
+        return list(dict.fromkeys(paths)), []
+    for root in project_roots():
+        if not root.is_dir():
+            continue
+        for dp, dns, fns in os.walk(root, onerror=lambda _e: None):
+            p = pathlib.Path(dp)
+            if "worktrees" in p.parts or "node_modules" in p.parts:
+                dns[:] = []
+                continue
+            if ".claude" not in p.parts:
+                continue
+            for name in fns:
+                if name == ".DS_Store":
+                    paths.append(p / name)
+            for name in dns:
+                if name == "__pycache__":
+                    paths.append(p / name)
+    return list(dict.fromkeys(paths)), []
 
 
 def sudo_alive() -> bool:
@@ -3790,9 +4074,9 @@ def clear_proxy_residue(residue: list[dict]) -> int:
     cleared = 0
     for item in residue:
         svc, kind = item["service"], item["kind"]
-        code, _ = run(["networksetup", f"-set{kind}", svc, "0.0.0.0", "0"])
+        code, body = run(["networksetup", f"-set{kind}", svc, "0.0.0.0", "0"])
         if code:
-            continue
+            raise RuntimeError(f"{svc}/{kind} 清理失败：{body.strip()[:160]}")
         run(["networksetup", f"-set{kind}state", svc, "off"])
         run(["networksetup", f"-set{kind}state", svc, "off"])   # 二次确认，抵消 set 带来的启用
         code, body = run(["networksetup", f"-get{kind}", svc])
@@ -3833,15 +4117,29 @@ def clear_npm_git_proxy() -> list[str]:
     """A1 清掉 npm 与 git 的全局代理配置，清完复验。"""
     done = []
     for key in ("proxy", "https-proxy"):
-        run(["npm", "config", "delete", key])
-        _, left = run(["npm", "config", "get", key])
+        code, body = run(["npm", "config", "delete", key])
+        if code:
+            raise RuntimeError(f"npm:{key} 删除失败：{body.strip()[:160]}")
+        code, left = run(["npm", "config", "get", key])
+        if code:
+            raise RuntimeError(f"npm:{key} 复验失败：{left.strip()[:160]}")
         if left.strip().lower() in ("", "undefined", "null"):
             done.append(f"npm:{key}")
+        else:
+            raise RuntimeError(f"npm:{key} 删除后仍有值")
     for key in ("http.proxy", "https.proxy"):
-        run(["git", "config", "--global", "--unset", key])
-        _, left = run(["git", "config", "--global", "--get", key])
+        code, body = run(["git", "config", "--global", "--unset", key])
+        # git returns 5 when a key is absent; a planned key is expected to
+        # exist, so any other error is a real partial failure.
+        if code not in (0, 5):
+            raise RuntimeError(f"git:{key} 删除失败：{body.strip()[:160]}")
+        code, left = run(["git", "config", "--global", "--get", key])
+        if code not in (0, 1):
+            raise RuntimeError(f"git:{key} 复验失败：{left.strip()[:160]}")
         if not left.strip():
             done.append(f"git:{key}")
+        else:
+            raise RuntimeError(f"git:{key} 删除后仍有值")
     return done
 
 
@@ -4000,6 +4298,11 @@ def clear_clash_dns_leak(rep: dict) -> str:
         "http://localhost/configs",
     ], timeout=25)
     code_s = (body or "").strip()
+    if code_s not in ("200", "204"):
+        raise RuntimeError(
+            "Clash 配置已写入，但内核重载失败（HTTP " + (code_s or "无响应") + "），"
+            "请按备份路径回滚或手动重载"
+        )
 
     after = check_clash_dns()
     # 复验条件直接复用 clash_dns_leaking，不再自己列一遍——两处各写一份迟早会漂移，
@@ -4010,8 +4313,7 @@ def clear_clash_dns_leak(rep: dict) -> str:
             + " respect-rules=" + repr(after.get("respect_rules"))
             + " enable=" + repr(after.get("enabled"))
             + " dns-hijack=" + repr(after.get("hijack")))
-    tail = "内核已重载" if code_s in ("200", "204") else \
-        ("但内核重载返回 HTTP " + code_s + "，配置已改但可能还没生效")
+    tail = "内核已重载"
     return "已清掉国内解析器（" + "；".join(changed) + "），" + tail
 
 
@@ -4043,15 +4345,18 @@ with open("/var/db/locationd/clients.plist", "rb") as fh:
     data = plistlib.load(fh)
 out = {}
 for key, val in data.items():
-    if not isinstance(val, dict):
+    if "timed" not in key.lower() and "timezone" not in key.lower():
         continue
-    if "timed" in key.lower() or "timezone" in key.lower():
+    # 保留异常条目的形状信号，但不要把原始 plist 值回传到 stdout。
+    if not isinstance(val, dict):
+        out[key] = None
+    else:
         out[key] = {k: v for k, v in val.items() if k != "ClientStorageToken"}
 sys.stdout.write(json.dumps(out, default=str))
 '''
 
 
-def location_service_status() -> dict:
+def location_service_status(*, persist: bool = True) -> dict:
     """B5 读定位服务里「设定时区」的状态。
 
     只用 sudo -n（非交互）：读不到就如实报「读不到」并给出 UI 路径，
@@ -4069,12 +4374,16 @@ def location_service_status() -> dict:
     把「没有这个字段」当成「读不到」是错的——它本身就是答案。
     """
     out = {"readable": False, "clients": {}, "timed_present": False, "note": ""}
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-loc-")) / "probe.py"
-    try:
-        tmp.write_text(LOCATION_PROBE, encoding="utf-8")
-        code, body = run(["sudo", "-n", "python3", str(tmp)], timeout=30)
-    finally:
-        shutil.rmtree(tmp.parent, ignore_errors=True)
+    if not persist and os.geteuid() != 0:
+        out["note"] = "只读审计不调用 sudo 探针；需要 root 才能复核定位服务状态"
+        return out
+    # Keep the read path genuinely read-only: pass the tiny plist probe via
+    # Python's -c argument instead of creating and deleting a temporary file.
+    command = ["python3", "-c", LOCATION_PROBE]
+    if os.geteuid() != 0:
+        command.insert(0, "-n")
+        command.insert(0, "sudo")
+    code, body = run(command, timeout=30)
     if code:
         out["note"] = "读不到 /var/db/locationd/clients.plist（需要 root；先 sudo_prime 再执行）"
         return out
@@ -4083,8 +4392,25 @@ def location_service_status() -> dict:
     except json.JSONDecodeError:
         out["note"] = "clients.plist 解析失败，格式与预期不符，已放弃自动处理"
         return out
+    if not isinstance(data, dict):
+        out["note"] = "clients.plist 解析结果不是对象，已放弃自动处理"
+        return out
     out["readable"] = True
+    malformed = False
     for key, val in data.items():
+        if not isinstance(val, dict):
+            # 合法 JSON 也可能有形状异常的条目；不要让它触发
+            # AttributeError，更不能让同一份部分读数被当成完整通过证据。
+            malformed = True
+            out["clients"][key] = {
+                "Authorized": None,
+                "state": "未知（条目格式异常）",
+                "stopped": None,
+                "BundlePath": None,
+            }
+            if "timed" in key.lower():
+                out["timed_present"] = True
+            continue
         authorized = val.get("Authorized")
         out["clients"][key] = {
             # 三态如实保留：True / False / None（None 表示这条没有该字段）
@@ -4095,7 +4421,11 @@ def location_service_status() -> dict:
         }
         if "timed" in key.lower():
             out["timed_present"] = True
-    if out["clients"]:
+    if malformed:
+        out["readable"] = False
+        out["note"] = "clients.plist 含格式异常的客户端条目，已放弃自动处理"
+        return out
+    if out["clients"] and persist:
         # 这次读到了（也就是带 root 跑的），把结论记下来供不带 root 时参考
         save_location_gate_cache(
             any(v.get("Authorized") is True for v in out["clients"].values())
@@ -4173,6 +4503,9 @@ def load_location_gate_cache() -> dict | None:
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(d, dict) or "closed" not in d:
+        return None
+    fresh, _ = cache_is_fresh(d, require_profile_scope=False)
+    if not fresh:
         return None
     return d
 
@@ -4327,7 +4660,7 @@ def check_timezone_layers() -> dict:
 
     # 第二道闸：定位服务里的「设定时区」。读 /var/db/locationd/clients.plist 要 root，
     # 非 root 时如实报读不到，并给出定位源可用性作为旁证。
-    loc = location_service_status()
+    loc = location_service_status(persist=False)
     out["gate_location"] = location_gate_state(loc)
     if out["gate_location"] is None:
         # 读不到就回退到上次 root 实测的结果，并如实标明是缓存
@@ -4401,10 +4734,15 @@ def check_keychain() -> dict:
 
 # ────────────────────────── 报告与交互 ──────────────────────────
 
-def audit() -> dict:
-    ip = check_export_ip()          # 出口 IP 只查一次，一致性检查复用同一结果
-    return {
+def audit(*, persist: bool = False) -> dict:
+    # Normal audits are read-only.  The explicit opt-in is used only when a
+    # caller wants export history to be updated for the next comparison.
+    ip = check_export_ip(persist=persist)  # 出口 IP 只查一次，一致性检查复用同一结果
+    scope = claude_config_scope()
+    report = {
         "timestamp": dt.datetime.now().isoformat(),
+        "scope_manifest": scope,
+        "out_of_scope": scope["out_of_scope"],
         "A1_export_ip": ip,
         "A1_proxy_residue": check_proxy_residue(),
         "A1_terminal_env": check_terminal_env(),
@@ -4428,6 +4766,7 @@ def audit() -> dict:
         "A27_browser_locale": check_browser_locale(ip),
         "E1_keychain": check_keychain(),
     }
+    return report
 
 
 def gate_text(v) -> str:
@@ -4507,7 +4846,7 @@ def print_audit(r: dict) -> None:
         for _label, _key in (("主解析器", "leaking"), ("fallback", "leaking_fallback")):
             if cdc.get(_key):
                 print("    ⚠ " + _label + "里有国内服务器：" + "、".join(cdc[_key])
-                      + " —— 国外域名的解析交给了它们，自动清理会换掉")
+                      + " —— 国外域名的解析交给了它们，确认后可按选择替换")
         if not cdc.get("leaking") and not cdc.get("leaking_fallback") \
                 and not cdc.get("respect_rules"):
             print("    ⚠ 没有 respect-rules：Clash 自己的 DNS 查询不跟规则走，是从真实 IP 直发的")
@@ -4635,7 +4974,7 @@ def print_audit(r: dict) -> None:
 def auto_clean_plan(report: dict) -> dict:
     """残留类项目的自动清理计划。
 
-    这几类都幂等、可逆、有备份，所以不再逐项询问，直接清：
+    这些残留默认按计划清理；Clash/Chrome 和不可原样回滚的清理另行询问：
       * 未启用但存了值的系统代理；
       * shell 配置里的代理行；
       * npm / git 的全局代理；
@@ -4690,13 +5029,13 @@ def auto_clean_plan(report: dict) -> dict:
         n_stale = len(st.get("cli", {}).get("stale") or []) + len(st.get("bundled", {}).get("stale") or [])
         summary.append(
             f"系统级可清理 {st_bytes / 2 ** 20:.0f} MB："
-            f"被取代的旧版本 {n_stale} 份 + 可再生缓存 {len(st.get('caches') or [])} 个"
+            f"被取代的旧版本 {n_stale} 份 + 可再生缓存 {len(st.get('caches') or [])} 个（不可原样回滚，默认不清）"
         )
 
     cs = report.get("A26_claude_settings") or {}
     if cs.get("dead"):
         summary.append(
-            f"项目级 settings 里失效的权限条目 {len(cs['dead'])} 条"
+            f"项目级 settings 里失效的权限条目 {len(cs['dead'])} 条（已列入备份，默认不清）"
             f"（涉及 {len({d['file'] for d in cs['dead']})} 个文件）"
         )
     if cs.get("risky"):
@@ -4711,7 +5050,7 @@ def auto_clean_plan(report: dict) -> dict:
     if stale_repos:
         summary.append(
             f"项目级过期的工作树注册 {pc.get('stale_total')} 条，涉及 {len(stale_repos)} 个仓库"
-            f"（只划掉登记记录，不删任何工作树）"
+            f"（只划掉登记记录，不删任何工作树；元数据变更不可原样回滚，默认不清）"
         )
 
     # Clash 自己的解析器。之前这块漏检，是用户装了检测站才发现的：主 nameserver
@@ -4738,7 +5077,7 @@ def auto_clean_plan(report: dict) -> dict:
         summary.append(
             f"浏览器 Intl 区域设置是 {bl.get('measured')}（大陆简体），出口却是 "
             f"{bl.get('country')} —— 会把 Chrome 的应用语言设为 {bl.get('target')}"
-            f"（只影响 Chrome，系统语言不动；要重启 Chrome 才生效）"
+            f"（只影响 Chrome，系统语言不动；要重启 Chrome 才生效，默认不改）"
         )
 
     return {
@@ -4754,6 +5093,8 @@ def auto_clean_plan(report: dict) -> dict:
         "stale_worktrees": stale_repos,
         "storage_bytes": st_bytes,
         "dead_permissions": len(cs.get("dead") or []),
+        "project_junk": bool(project_roots()),
+        "nonrestorable": bool(st_bytes or stale_repos),
         "summary": summary,
     }
 
@@ -4761,6 +5102,8 @@ def auto_clean_plan(report: dict) -> dict:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="按四层防线做 Claude 本机体检与加固")
     ap.add_argument("--audit", action="store_true", help="只读体检，不做任何修改")
+    ap.add_argument("--save-audit", action="store_true",
+                    help="审计完成后显式保存报告与出口历史（默认 --audit 不落盘）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出体检结果")
     ap.add_argument("--webrtc", action="store_true", help="附加 WebRTC 泄漏探测（需要 Node + Playwright）")
     ap.add_argument("--check-media", action="store_true",
@@ -4770,6 +5113,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--commands", action="store_true", help="只打印手工核对用的终端命令清单，不体检")
     ap.add_argument("--manual", action="store_true", help="只打印必须人工做的行动清单（带点击路径），不体检")
     args = ap.parse_args(argv)
+
+    if args.audit and (args.check_media or args.check_locale):
+        print("拒绝组合：--audit 是只读模式，不能同时运行会写浏览器缓存的 --check-media/--check-locale。",
+              file=sys.stderr)
+        return 2
 
     if args.check_media:
 
@@ -4791,17 +5139,37 @@ def main(argv: list[str] | None = None) -> int:
         print_manual_actions()
         return 0
 
+    if args.save_audit and not (args.audit or args.json):
+        print(
+            "拒绝执行：--save-audit 只适用于 --audit 或 --json 审计；"
+            "完整加固请先用 --audit --save-audit 保存报告，再单独运行加固。",
+            file=sys.stderr,
+        )
+        return 2
+
     under_claude = running_under_claude()
     if under_claude and not args.audit:
         print("拒绝执行：当前脚本由 Claude Code 启动。加固步骤会改本机状态，请改用普通终端；这里只允许 --audit。", file=sys.stderr)
         return 2
+    if not args.audit:
+        scope = claude_config_scope()
+        if scope.get("custom"):
+            print(
+                "拒绝加固：CLAUDE_CONFIG_DIR 指向自定义目录 "
+                f"{scope.get('configured_config_dir')}。本轮未扫描或修改该目录；"
+                "请先切回默认目录，或为自定义目录建立明确的受支持范围。",
+                file=sys.stderr,
+            )
+            return 2
     # 加固模式必须在真实 TTY 下运行；放在体检之前，管道里调用就立刻失败，不必先跑完全套只读检查
     if not args.audit and not sys.stdin.isatty():
         print("拒绝执行：需要真实 TTY 完成知情确认。", file=sys.stderr)
         return 2
 
     try:
-        report = audit()
+        # Full repair cannot persist audit state before CONFIRM; --save-audit is
+        # rejected above for this mode.
+        report = audit(persist=args.save_audit and (args.audit or args.json))
         if args.webrtc:
             report["A7_webrtc"] = check_webrtc()
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
@@ -4811,6 +5179,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.json:
+        if args.save_audit:
+            print(f"报告已存：{save_audit_report(report)}", file=sys.stderr)
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
 
@@ -4821,14 +5191,23 @@ def main(argv: list[str] | None = None) -> int:
         print_summary_table(report)
         print("\n  想自己复核上面每一项：python3 scripts/account_guard.py --commands")
         print("  必须人工做的那些（带点击路径）：python3 scripts/account_guard.py --manual")
-        outdir = BACKUP_ROOT
-        outdir.mkdir(parents=True, exist_ok=True)
-        # 用单引号包内层格式串：Python 3.9/3.10/3.11 的 f-string 不允许内层
-        # 与外层同用双引号，写成 strftime("%Y...") 会直接 SyntaxError。
-        p = outdir / f"audit-{dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.json"
-        p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"\n报告已存：{p}")
+        if args.save_audit:
+            p = save_audit_report(report)
+            print(f"\n报告已存：{p}")
+        else:
+            print("\n只读审计未写入报告、出口历史或缓存；如需保存请加 --save-audit。")
         return 0
+
+    scope = report.get("scope_manifest") or {}
+    if scope.get("custom"):
+        print(
+            "拒绝加固：CLAUDE_CONFIG_DIR 指向自定义目录 "
+            f"{scope.get('configured_config_dir')}。本轮未扫描或修改该目录，"
+            "因此不能在 CONFIRM、并发锁或备份前继续；请先切回默认目录，"
+            "或为自定义目录建立明确的受支持范围。",
+            file=sys.stderr,
+        )
+        return 2
 
     if not sys.stdin.isatty():
         print("拒绝执行：需要真实 TTY 完成知情确认。", file=sys.stderr)
@@ -4848,29 +5227,30 @@ def main(argv: list[str] | None = None) -> int:
             "遥测开关：0 保持；1 关三项；2 只关上报与下载流量。选择 [0]：", {0, 1, 2}
         )
         do_wrapper = ask_yes("生成 BROWSER=false 的 claude-safe 包装脚本？")
+        do_clash_dns = bool(plan.get("clash_dns")) and ask_yes(
+            "修改 Clash DNS（会写配置并重载内核）？"
+        )
+        do_browser_locale = bool(plan.get("browser_locale")) and ask_yes(
+            "修改 Chrome Intl 应用语言（会改 Chrome 偏好并需重启）？"
+        )
+        do_storage = bool(plan.get("storage_bytes")) and ask_yes(
+            "清理旧 CLI/桌面副本与缓存（不可原样回滚）？"
+        )
+        do_dead_permissions = bool(plan.get("dead_permissions")) and ask_yes(
+            "清理项目 settings 中已失效授权（会先备份相关文件）？"
+        )
+        do_stale_worktrees = bool(plan.get("stale_worktrees")) and ask_yes(
+            "清理失效 worktree 注册（Git 元数据不可原样回滚）？"
+        )
+        do_project_junk = bool(plan.get("project_junk")) and ask_yes(
+            "清理项目 .claude 下的 .DS_Store/__pycache__（会先备份）？"
+        )
 
-        # 需要 root 的两项必须在这里一次性提前授权，原因有两个：
-        #   1) location_service_status() 要读 /var/db/locationd/clients.plist，非 root 读不到，
-        #      放在 sudo 之前问会永远显示「读不到」，这一项等于永远选不了；
-        #   2) 备份是第一个写操作，而 root 文件的备份也要 root，顺序反了就会无备份改动。
+        # 只询问意图；sudo 授权与 root 文件读取/备份都延后到 CONFIRM 之后。
         do_ipv6 = do_loc = False
-        loc = {"readable": False, "clients": {}, "note": "未处理（本轮未请求管理员权限）"}
         if ask_yes("处理需要管理员权限的两项（关闭 IPv6、关闭定位服务「设定时区」）？"):
-            sudo_prime()
             do_ipv6 = ask_yes("关闭所有网络服务的 IPv6（文章 2.5 可选加固）？")
-            loc = location_service_status()
-            gate = location_gate_state(loc)
-            if gate is False:
-                # 本来就是关的，不必再问一次，也不必去写一个不存在的字段
-                print(f"  定位服务里的「设定时区」已经是关闭状态，无需改动：{list(loc['clients'])}")
-            elif gate is True:
-                print(f"  已识别的定位服务条目：{list(loc['clients'])}")
-                print("  说明：这是非官方改动路径，key 名在不同 macOS 版本上可能不同；")
-                print("        脚本会逐个尝试，并在改写后重新读取整份 plist 复验，验不到就判定未生效。")
-                print("        更稳的做法是走 UI：系统设置 → 隐私与安全性 → 定位服务 → 系统服务 → 详细信息 → 设定时区")
-                do_loc = ask_yes("要由脚本关闭定位服务里的「设定时区」吗？")
-            else:
-                print(f"  {loc['note']}")
+            do_loc = ask_yes("关闭定位服务「设定时区」（需要管理员权限）？")
 
         if telemetry == 1:
             print("\n⚠ 文章 §5 写明：关掉这些键会同时关掉功能旗标，Remote Control 可能用不了。")
@@ -4878,17 +5258,19 @@ def main(argv: list[str] | None = None) -> int:
         targets = [SETTINGS, HOME / ".claude.json"]
         sudo_targets = [LOCATIOND_PLIST] if do_loc else []
         print("\n最终执行清单：")
-        print(f"  1. 第一个写操作：备份 {[str(t) for t in targets + sudo_targets]}")
+        print(f"  1. 第一个目标状态写入前的动作：备份 {[str(t) for t in targets + sudo_targets]}（锁文件只用于并发控制）")
         print(f"  2. 自动清理残留：系统代理 {len(plan['proxy_residue'])} 项，"
               f"shell 配置 {sum(len(v) for v in plan['rc_files'].values())} 行，"
               f"npm/git {len(plan['npm_git'])} 项，"
               f"端点/代理变量 {'是' if (plan['settings_base_url'] or plan.get('settings_env_proxy')) else '无'}，"
-              f"过期工作树注册 {len(plan.get('stale_worktrees') or [])} 个仓库，"
-              f"系统级可清理 {plan.get('storage_bytes', 0) / 2 ** 20:.0f} MB")
+              f"过期工作树注册将{'清理' if do_stale_worktrees else '保持'}（{len(plan.get('stale_worktrees') or [])} 个仓库），"
+              f"系统级可清理将{'清理' if do_storage else '保持'}（{plan.get('storage_bytes', 0) / 2 ** 20:.0f} MB）")
         print(f"  3. 遥测开关：{telemetry}")
         print(f"  4. 生成包装脚本：{'是' if do_wrapper else '否'}")
         print(f"  5. 关闭 IPv6：{'是' if do_ipv6 else '否'}")
         print(f"  6. 关闭定位服务「设定时区」：{'是' if do_loc else '否'}")
+        print(f"  7. Clash DNS：{'是' if do_clash_dns else '否'}；Chrome Intl：{'是' if do_browser_locale else '否'}")
+        print(f"  8. 不可原样回滚清理：旧版本/缓存={'是' if do_storage else '否'}；失效权限={'是' if do_dead_permissions else '否'}；worktree 注册={'是' if do_stale_worktrees else '否'}")
         print("  绝不改动：session、project、history、skill、plugin、hook、command、agent、MCP 配置等受保护数据。")
         if input("完全理解后输入 CONFIRM 开始；其他输入取消：").strip() != "CONFIRM":
             print("已取消，没有修改任何内容。")
@@ -4905,65 +5287,73 @@ def main(argv: list[str] | None = None) -> int:
         before = protected_snapshot()
         # Clash 配置也进备份：DNS 那一项要改生成物和 profile 的 Merge 增强文件两处，
         # 增强文件改错会让下次重算生成出坏配置。
-        clash_files = [clash_config()] if clash_config().is_file() else []
-        merge_file = _active_merge_enhancement()
-        if merge_file is not None:
-            clash_files.append(merge_file)
-        backup = create_backup(
-            [t for t in targets if t.exists()]
-            + [HOME / name for name in plan["rc_files"] if (HOME / name).is_file()]
-            + clash_files,
-            sudo_targets,
-        )
+        clash_files = []
+        if do_clash_dns:
+            clash_files = [clash_config()] if clash_config().is_file() else []
+            merge_file = _active_merge_enhancement()
+            if merge_file is not None:
+                clash_files.append(merge_file)
+        selected = {"browser_locale": do_browser_locale,
+                    "dead_permissions": do_dead_permissions,
+                    "project_junk": do_project_junk,
+                    "wrapper": do_wrapper}
+        backup_paths, _ = backup_paths_for_plan(plan, report, selected)
+        backup = create_backup([p for p in backup_paths if p.exists()] + clash_files, sudo_targets)
         print(f"\n[1/6] 备份完成：{backup}")
 
         n = clear_proxy_residue(plan["proxy_residue"]) if plan["proxy_residue"] else 0
         rc_changed = clear_rc_proxy_lines(plan["rc_files"]) if plan["rc_files"] else []
         npm_git_done = clear_npm_git_proxy() if plan["npm_git"] else []
         print(f"[2/6] 自动清理：系统代理 {n} 项，shell 配置 {len(rc_changed)} 个文件，npm/git {len(npm_git_done)} 项")
-        if plan.get("clash_dns"):
-            try:
-                print(f"       Clash DNS：{clear_clash_dns_leak(report)}")
-            except Exception as e:
-                print(f"       ⚠ Clash DNS 清理失败（其余步骤继续）：{e}")
-        if plan.get("browser_locale"):
-            try:
-                print(f"       浏览器 Intl：{clear_browser_locale(report['A27_browser_locale'])}")
-            except Exception as e:
-                print(f"       ⚠ 浏览器 Intl 清理失败（其余步骤继续）：{e}")
+        if do_clash_dns:
+            print(f"       Clash DNS：{clear_clash_dns_leak(report)}")
+        if do_browser_locale:
+            print(f"       浏览器 Intl：{clear_browser_locale(report['A27_browser_locale'])}")
 
         print(f"[3/6] 遥测开关：{apply_telemetry(telemetry) if telemetry else '保持'}")
         if plan["settings_base_url"] or plan.get("settings_env_proxy"):
             print(f"       端点/代理变量：{clear_anthropic_base_url()}")
 
-        for d in clean_claude_storage(report):
-            label = d["path"].replace(str(HOME) + "/", "")
-            if d.get("ok"):
-                print(f"       已清 {label}  ({d.get('bytes', 0) / 2 ** 20:.0f} MB)")
-            else:
-                print(f"       跳过 {label} —— {d.get('error')}")
+        cleanup_errors = []
+        if do_storage:
+            for d in clean_claude_storage(report):
+                label = d["path"].replace(str(HOME) + "/", "")
+                if d.get("ok"):
+                    print(f"       已清 {label}  ({d.get('bytes', 0) / 2 ** 20:.0f} MB)")
+                else:
+                    print(f"       跳过 {label} —— {d.get('error')}")
+                    cleanup_errors.append(f"存储 {label}：{d.get('error')}")
 
-        for d in clean_dead_permissions(report):
-            if d.get("error"):
-                print(f"       权限条目 {d['file']}：跳过 —— {d['error']}")
-            elif d.get("removed"):
-                print(f"       权限条目 {d['file']}：删掉 {d['removed']} 条失效授权")
+        if do_dead_permissions:
+            for d in clean_dead_permissions(report):
+                if d.get("error"):
+                    print(f"       权限条目 {d['file']}：跳过 —— {d['error']}")
+                    cleanup_errors.append(f"权限 {d['file']}：{d['error']}")
+                elif d.get("removed"):
+                    print(f"       权限条目 {d['file']}：删掉 {d['removed']} 条失效授权")
 
-        for d in clean_project_claude_junk():
-            label = d["path"].replace(str(HOME) + "/", "")
-            if d.get("ok"):
-                size = f"  ({d['bytes'] / 1024:.0f} KB)" if d.get("bytes") else ""
-                print(f"       项目级 {label}{size}")
-            else:
-                print(f"       项目级跳过 {label} —— {d.get('error')}")
+        if do_project_junk:
+            for d in clean_project_claude_junk():
+                label = d["path"].replace(str(HOME) + "/", "")
+                if d.get("ok"):
+                    size = f"  ({d['bytes'] / 1024:.0f} KB)" if d.get("bytes") else ""
+                    print(f"       项目级 {label}{size}")
+                else:
+                    print(f"       项目级跳过 {label} —— {d.get('error')}")
+                    cleanup_errors.append(f"项目垃圾 {label}：{d.get('error')}")
 
-        for d in prune_stale_worktrees(plan.get("stale_worktrees") or []):
+        if do_stale_worktrees:
+          for d in prune_stale_worktrees(plan.get("stale_worktrees") or []):
             name = d["repo"].replace(str(HOME) + "/", "")
             if d.get("error"):
                 print(f"       工作树注册 {name}：跳过 —— {d['error']}")
+                cleanup_errors.append(f"工作树 {name}：{d['error']}")
             else:
                 print(f"       工作树注册 {name}：{d['before']} -> {d['after']}"
                       f"（划掉 {len(d['removed'])} 条，工作树没动）")
+
+        if cleanup_errors:
+            raise RuntimeError("选中的清理项目未全部成功：" + "；".join(cleanup_errors))
 
         if do_wrapper:
             print(f"[4/6] 包装脚本：{apply_browser_wrapper()}")
@@ -4972,22 +5362,31 @@ def main(argv: list[str] | None = None) -> int:
 
         if do_ipv6:
             res = set_ipv6_off(list(report["A5_ipv6"]["services"]))
-            print(f"[5/6] IPv6：已关闭 {res['done']}")
             if res["failed"]:
-                print(f"       未能关闭：{res['failed']}（没有 root 时 networksetup 会直接失败）")
+                raise RuntimeError(f"IPv6 仅部分关闭：{res['done']}；失败：{res['failed']}")
+            print(f"[5/6] IPv6：已关闭 {res['done']}")
             if res["rollback"]:
                 print("       恢复命令：" + "；".join(res["rollback"]))
         else:
             print("[5/6] IPv6：保持不变")
 
         if do_loc:
-            ensure_sudo("关闭定位服务里的「设定时区」")
-            print(f"[6/6] 定位服务「设定时区」：{disable_location_timezone()}")
+            ensure_sudo("读取并关闭定位服务里的「设定时区」")
+            loc = location_service_status(persist=True)
+            gate = location_gate_state(loc)
+            if gate is True:
+                print(f"[6/6] 定位服务「设定时区」：{disable_location_timezone()}")
+            elif gate is False:
+                print("[6/6] 定位服务「设定时区」：已经关闭，无需改动")
+            else:
+                raise RuntimeError("读不到定位服务状态，未执行关闭")
         else:
             print("[6/6] 定位服务「设定时区」：保持不变")
 
         # 允许清单要包含本次有意改动的文件，否则 zshrc 的自动清理会被误报成「被连带改动」
         allow = {str(SETTINGS)} | {str(HOME / name) for name in plan["rc_files"]}
+        if do_wrapper:
+            allow.add(str(HOME / ".local" / "bin" / "claude-safe"))
         changed = protected_verify(before, allow)
         if changed:
             # 这里刻意不走 raise：写操作已经执行完了，报成「停止」会让用户以为什么都没发生。
@@ -5007,12 +5406,12 @@ def main(argv: list[str] | None = None) -> int:
             print("\n重新体检一次，下面是改动前后的对照（同一次运行里的两遍真读数）：")
             # 复检要带上这次真测过的 WebRTC 结果，否则 --webrtc 跑完的结论会在复检表里
             # 退回成「未探测」，用户刚看到的 ✓ 又变成 ·，等于白跑一次两分钟的探测。
-            fresh = audit()
+            fresh = audit(persist=False)
             if "A7_webrtc" in report:
                 fresh["A7_webrtc"] = report["A7_webrtc"]
             print_before_after(report, fresh)
         except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
-            print(f"复检失败（{error}），上面 [1/6]–[6/6] 的结果仍然有效。", file=sys.stderr)
+            raise RuntimeError(f"复检失败：{error}；已执行改动的回滚路径：{backup}") from error
         return 0
     except KeyboardInterrupt:
         # 中途 Ctrl-C：之前几步可能已经写完，必须告诉用户备份在哪，

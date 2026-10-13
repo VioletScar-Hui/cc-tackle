@@ -72,6 +72,29 @@ class TestPromptHelpers(unittest.TestCase):
                     g.ask_choice("q", {0, 1, 2})
 
 
+class TestReadJsonFailClosed(unittest.TestCase):
+    """已有配置损坏或形状错误时不能按空配置继续审计。"""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_missing_file_still_uses_default(self):
+        self.assertEqual(g.read_json(self.tmp / "missing.json", {}), {})
+
+    def test_malformed_existing_file_raises_value_error(self):
+        path = self.tmp / "broken.json"
+        path.write_text("{broken", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "JSON 文件损坏"):
+            g.read_json(path, {})
+
+    def test_non_object_existing_file_raises_value_error(self):
+        path = self.tmp / "wrong-shape.json"
+        path.write_text("[]", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "顶层不是对象"):
+            g.read_json(path, {})
+
+
 class TestTelemetry(unittest.TestCase):
     """文章 §5 的遥测开关。安全要求：模式 0 绝不落盘，模式 1/2 落盘后必须复验。"""
 
@@ -112,7 +135,7 @@ class TestTelemetry(unittest.TestCase):
 
 
 class TestBackupSafety(unittest.TestCase):
-    """备份是第一个写操作。备份不了就必须停下，不能无备份改动。"""
+    """CONFIRM 后、目标状态变更前先备份；备份不了就必须停下。"""
 
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
@@ -1272,6 +1295,14 @@ class TestLocationGate(unittest.TestCase):
         self.assertIn("plistlib", g.LOCATION_PROBE)
         self.assertNotIn("plutil", g.LOCATION_PROBE)
 
+    def test_probe_preserves_malformed_timezone_shape_without_values(self):
+        # 异常 timed/timezone 条目要传到解析端，且只传 null，不泄露原始 plist 值。
+        self.assertIn("out[key] = None", g.LOCATION_PROBE)
+        self.assertLess(
+            g.LOCATION_PROBE.index('if "timed" not in key.lower()'),
+            g.LOCATION_PROBE.index("if not isinstance(val, dict)"),
+        )
+
 
 class TestScheduleConsistency(unittest.TestCase):
     """文章 2.3 末尾：出口美西而你在国内白天 = 美国凌晨还在写代码。只报事实。"""
@@ -1489,6 +1520,11 @@ class TestLocationGateCache(unittest.TestCase):
             r = g.check_timezone_layers()
         self.assertIs(r["gate_location"], True)
 
+    def test_expired_cache_is_not_used(self):
+        self.cache.parent.mkdir(parents=True, exist_ok=True)
+        self.cache.write_text(json.dumps({"closed": True, "checkedAt": "2020-01-01 00:00"}), encoding="utf-8")
+        self.assertIsNone(g.load_location_gate_cache())
+
     def test_without_cache_it_still_reports_unknown(self):
         with mock.patch.object(g, "location_service_status",
                                return_value={"readable": False, "clients": {}, "note": "要 root"}):
@@ -1497,12 +1533,20 @@ class TestLocationGateCache(unittest.TestCase):
         self.assertIn("要 root", r.get("gate_location_note", ""))
 
     def test_summary_marks_cached_result_as_solved_with_timestamp(self):
+        checked = g.now_stamp()
         rows = g.build_summary({"A21_timezone_layers": {
             "gate_auto_plist": False, "gate_location": False,
-            "gate_location_cached": {"closed": True, "checkedAt": "2026-10-08 22:46"}}})
+            "gate_location_cached": {"closed": True, "checkedAt": checked}}})
         row = [r for r in rows if r[0] == "时区两道闸"][0]
         self.assertIs(row[1], g.S_OK)
-        self.assertIn("2026-10-08 22:46", row[2])
+        self.assertIn(checked, row[2])
+
+    def test_summary_does_not_greenlight_expired_cached_result(self):
+        rows = g.build_summary({"A21_timezone_layers": {
+            "gate_auto_plist": False, "gate_location": False,
+            "gate_location_cached": {"closed": True, "checkedAt": "2020-01-01 00:00"}}})
+        row = [r for r in rows if r[0] == "时区两道闸"][0]
+        self.assertIs(row[1], g.S_NA)
 
     def test_summary_without_cache_reports_pending(self):
         rows = g.build_summary({"A21_timezone_layers": {
@@ -1537,6 +1581,32 @@ class TestLocationGateCache(unittest.TestCase):
             r = g.location_service_status()
         self.assertFalse(r["readable"])
         self.assertFalse(self.cache.exists())
+
+    def test_read_probe_does_not_create_temporary_file(self):
+        with mock.patch.object(g.tempfile, "mkdtemp") as mkdtemp, \
+             mock.patch.object(g.os, "geteuid", return_value=0):
+            with mock.patch.object(g, "run", return_value=(1, "")) as run:
+                g.location_service_status(persist=False)
+        mkdtemp.assert_not_called()
+        self.assertIn("-c", run.call_args.args[0])
+
+    def test_non_object_probe_json_is_unknown(self):
+        with mock.patch.object(g, "run", return_value=(0, "[]")):
+            result = g.location_service_status(persist=True)
+        self.assertFalse(result["readable"])
+        self.assertIn("不是对象", result["note"])
+
+    def test_malformed_probe_entry_is_unknown_without_traceback(self):
+        body = json.dumps({
+            "root:p/System/Library/LocationBundles/TimeZone.bundle:": [],
+            "valid": {"Authorized": False},
+        })
+        with mock.patch.object(g, "run", return_value=(0, body)):
+            result = g.location_service_status(persist=True)
+        self.assertFalse(result["readable"])
+        self.assertEqual(result["clients"]["root:p/System/Library/LocationBundles/TimeZone.bundle:"]["state"],
+                         "未知（条目格式异常）")
+        self.assertIn("格式异常", result["note"])
 
 
 class TestConsistencyIsASettledChoice(unittest.TestCase):
@@ -2244,12 +2314,16 @@ class TestWebrtcMediaPermissionExposure(unittest.TestCase):
         p = mock.patch.object(g, "load_media_permission", return_value={})
         p.start()
         self.addCleanup(p.stop)
+        self.profile_env = mock.patch.dict(os.environ, {"CLAUDE_GUARD_BROWSER_PROFILE": "test-profile"})
+        self.profile_env.start()
+        self.addCleanup(self.profile_env.stop)
 
     def test_row_turns_green_when_the_browser_confirmed_denied(self):
         # 用户在真实浏览器里复核过、结论是「网站拿不到权限」时，这一行该转绿并注明复核时间；
         # 否则一个已经修好的项会永远挂在「待处理」里。
         with mock.patch.object(g, "load_media_permission",
-                               return_value={"ok": True, "checkedAt": "2026-10-09 17:18",
+                               return_value={"ok": True, "checkedAt": g.now_stamp(),
+                                             "profileScope": "test-profile",
                                              "camera": "denied", "microphone": "denied"}):
             row = self._row({"A7_webrtc": {
                 "available": True, "candidates": 1, "mdns": True,
@@ -2259,17 +2333,18 @@ class TestWebrtcMediaPermissionExposure(unittest.TestCase):
                                "local_ips": [{"ip": "192.168.1.5", "private": True},
                                              {"ip": "198.18.0.1", "private": True}],
                                "leaked_public": [], "tun_leak": ["198.18.0.1"], "mdns": False}}})
-        self.assertIs(row[1], g.S_OK)
-        self.assertIn("2026-10-09 17:18", row[2])
+        self.assertIs(row[1], g.S_NA)
+        self.assertIn(g.now_stamp(), row[2])
 
     def test_row_uses_the_media_cache_when_the_probe_was_not_run(self):
         # 完整流程不带 --webrtc 时不跑探测，但复核过的结论该直接用来判这一行；
         # 否则用户刚修好的项会在流程末尾的复检表里又退回成「未探测」。
         with mock.patch.object(g, "load_media_permission",
-                               return_value={"ok": True, "checkedAt": "2026-10-09 17:18"}):
+                               return_value={"ok": True, "checkedAt": g.now_stamp(),
+                                             "profileScope": "test-profile"}):
             row = self._row({})
-        self.assertIs(row[1], g.S_OK)
-        self.assertIn("2026-10-09 17:18", row[2])
+        self.assertIs(row[1], g.S_NA)
+        self.assertIn(g.now_stamp(), row[2])
 
     def test_row_stays_unmeasured_without_probe_and_without_cache(self):
         # setUp 已把缓存挡成空：既没跑探测、也没复核过，就只能如实说未测到
@@ -2356,7 +2431,7 @@ class TestWebrtcMediaPermissionExposure(unittest.TestCase):
             "browser": "/x/chromium_headless_shell-1234/chrome-headless-shell-mac-arm64/chrome-headless-shell",
             "with_media": {"candidates": 1, "media": "granted", "local_ips": [],
                            "leaked_public": [], "tun_leak": [], "mdns": True}}})
-        self.assertIs(row[1], g.S_OK)
+        self.assertIs(row[1], g.S_NA)
         self.assertIn("headless shell", row[2])
 
     def test_public_leak_still_wins(self):
@@ -2940,6 +3015,9 @@ class TestCheckBrowserLocale(unittest.TestCase):
         p = mock.patch.object(g, "LOCALE_CACHE", self.cache)
         p.start()
         self.addCleanup(p.stop)
+        self.profile_env = mock.patch.dict(os.environ, {"CLAUDE_GUARD_BROWSER_PROFILE": "test-profile"})
+        self.profile_env.start()
+        self.addCleanup(self.profile_env.stop)
 
     def _fake_run(self, app_override=None, system=("zh-Hans-US", "en-US", "en-US")):
         def fake(cmd, **kw):
@@ -2964,11 +3042,12 @@ class TestCheckBrowserLocale(unittest.TestCase):
 
     def test_measured_value_beats_the_prediction(self):
         self.cache.write_text(
-            json.dumps({"intlLocale": "en-US", "checkedAt": "2026-10-10 12:00"}), encoding="utf-8")
+            json.dumps({"intlLocale": "en-US", "checkedAt": g.now_stamp(),
+                        "profileScope": "test-profile"}), encoding="utf-8")
         with mock.patch.object(g, "run", side_effect=self._fake_run()):
             out = g.check_browser_locale({"country": "US"})
         self.assertEqual(out["measured"], "en-US")
-        self.assertEqual(out["source"], "浏览器实测")
+        self.assertIn("浏览器实测", out["source"])
         self.assertFalse(out["cn"])
 
     def test_app_override_wins_over_the_system_languages(self):
@@ -2995,6 +3074,34 @@ class TestCheckBrowserLocale(unittest.TestCase):
         self.assertEqual(out["target"], g.DEFAULT_LOCALE)
 
 
+class TestBrowserCacheLoaders(unittest.TestCase):
+    """浏览器缓存顶层形状异常时必须收敛为空，不能把 list/null 传给 .get。"""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.media_cache = self.tmp / "media-permission.json"
+        self.locale_cache = self.tmp / "browser-locale.json"
+        self.media_path = mock.patch.object(g, "MEDIA_CACHE", self.media_cache)
+        self.locale_path = mock.patch.object(g, "LOCALE_CACHE", self.locale_cache)
+        self.media_path.start()
+        self.locale_path.start()
+        self.addCleanup(self.media_path.stop)
+        self.addCleanup(self.locale_path.stop)
+
+    def test_media_non_object_json_is_empty(self):
+        for payload in ("[]", "null"):
+            with self.subTest(payload=payload):
+                self.media_cache.write_text(payload, encoding="utf-8")
+                self.assertEqual(g.load_media_permission(), {})
+
+    def test_locale_non_object_json_is_empty(self):
+        for payload in ("[]", "null"):
+            with self.subTest(payload=payload):
+                self.locale_cache.write_text(payload, encoding="utf-8")
+                self.assertEqual(g.load_browser_locale(), {})
+
+
 class TestBrowserLocaleRowInSummary(unittest.TestCase):
     """表里那一行要能反映真实状态，而不是有字段就报绿。"""
 
@@ -3014,6 +3121,11 @@ class TestBrowserLocaleRowInSummary(unittest.TestCase):
         self.assertIs(row[1], g.S_FIX)
         self.assertIn("zh-CN", row[2])
         self.assertIn("en-US", row[2])
+
+    def test_prediction_is_not_green(self):
+        row = self._row({"measured": "en-US", "source": "按 AppleLanguages 推定，未跑浏览器复核",
+                         "cn": False, "country": "US", "target": "en-US"})
+        self.assertIs(row[1], g.S_NA)
 
     def test_cn_exit_is_not_pending(self):
         row = self._row({"measured": "zh-CN", "source": "浏览器实测", "cn": True,
@@ -4203,7 +4315,14 @@ class TestRunLock(unittest.TestCase):
 class TestBrowserTimezoneFact(unittest.TestCase):
     """A27 顺手把浏览器时区报成事实 —— 只报事实，不下判定。"""
 
+    def setUp(self):
+        self.profile_env = mock.patch.dict(os.environ, {"CLAUDE_GUARD_BROWSER_PROFILE": "test-profile"})
+        self.profile_env.start()
+        self.addCleanup(self.profile_env.stop)
+
     def _call(self, cached, exit_ip):
+        if cached.get("intlLocale"):
+            cached = {**cached, "checkedAt": g.now_stamp(), "profileScope": "test-profile"}
         with mock.patch.object(g, "load_browser_locale", return_value=cached), \
              mock.patch.object(g, "run", return_value=(1, "")), \
              mock.patch.object(g, "check_export_ip", return_value=exit_ip):
@@ -4388,6 +4507,106 @@ class TestLocalGitRootMayBeARepo(unittest.TestCase):
             out = g.check_local_git()
         self.assertEqual(out["repos"], [str(self.tmp / "repo-a")])
         self.assertEqual(out["no_git"], [str(self.tmp / "plain")])
+
+
+class TestIterationOneSafety(unittest.TestCase):
+    """回归本轮四项维护中的边界，不触碰真实主机状态。"""
+
+    def test_proxy_probe_failure_is_unknown(self):
+        with mock.patch.object(g, "run", return_value=(1, "")):
+            report = g.check_proxy_residue()
+        row = [r for r in g.build_summary({"A1_proxy_residue": report})
+               if r[0] == "系统代理残留"][0]
+        self.assertIs(row[1], g.S_NA)
+
+    def test_dns_mixed_fake_and_real_is_a_leak(self):
+        def fake(cmd, timeout=20):
+            if cmd[0] == "dig":
+                return 0, "198.18.0.2\n1.2.3.4\n"
+            return 0, "nameserver[0] : 1.1.1.1\n"
+        with mock.patch.object(g, "run", side_effect=fake):
+            report = g.check_dns()
+        self.assertEqual(report["real_ip_hosts"], ["example.com", "api.anthropic.com", "claude.ai"])
+
+    def test_audit_export_state_is_opt_in(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        old_home = g.HOME
+        g.HOME = tmp
+        self.addCleanup(setattr, g, "HOME", old_home)
+        with mock.patch.object(g, "run", return_value=(1, "")):
+            g.check_export_ip(persist=False)
+        self.assertFalse((tmp / ".local" / "state" / "claude-guard" / "export-ip.json").exists())
+
+    def test_stale_or_unbound_cache_is_not_fresh(self):
+        stale = {"checkedAt": "2020-01-01 00:00", "profileScope": "test"}
+        unbound = {"checkedAt": g.now_stamp()}
+        self.assertFalse(g.cache_is_fresh(stale)[0])
+        self.assertFalse(g.cache_is_fresh(unbound)[0])
+
+    def test_browser_cache_requires_current_explicit_profile_identity(self):
+        cache = {"intlLocale": "en-US", "checkedAt": g.now_stamp(), "profileScope": "profile-a"}
+        with mock.patch.dict(os.environ, {"CLAUDE_GUARD_BROWSER_PROFILE": "profile-b"}):
+            self.assertFalse(g.cache_is_fresh(cache)[0])
+
+    def test_custom_claude_config_scope_is_out_of_scope_and_not_green(self):
+        custom = pathlib.Path(tempfile.mkdtemp()) / "custom-claude"
+        self.addCleanup(shutil.rmtree, custom.parent, ignore_errors=True)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(custom)}, clear=False):
+            scope = g.claude_config_scope()
+            self.assertTrue(scope["custom"])
+            self.assertTrue(scope["out_of_scope"])
+            report = {
+                "scope_manifest": scope,
+                "A1_terminal_env": {"env_hits": [], "rc_files": {}, "npm": {}, "git": {}},
+                "A2_anthropic_base_url": {"hits": []},
+                "A3_telemetry": {"any_set": False},
+            }
+            rows = g.build_summary(report)
+        for name in ("终端 / shell / npm / git 代理", "settings.json 端点与凭据", "遥测三键"):
+            row = [item for item in rows if item[0] == name][0]
+            self.assertIs(row[1], g.S_NA, name)
+
+    def test_full_repair_save_flag_does_not_persist_before_confirm(self):
+        with mock.patch.object(g, "audit") as audit:
+            self.assertEqual(g.main(["--save-audit"]), 2)
+        audit.assert_not_called()
+
+    def test_audit_rejects_cache_writing_browser_checks(self):
+        with mock.patch.object(g, "verify_media_permission") as media, \
+             mock.patch.object(g, "verify_browser_locale") as locale:
+            self.assertEqual(g.main(["--audit", "--check-media"]), 2)
+            self.assertEqual(g.main(["--audit", "--check-locale"]), 2)
+        media.assert_not_called()
+        locale.assert_not_called()
+
+    def test_public_webrtc_leak_outranks_media_cache(self):
+        report = {"A7_webrtc": {
+            "available": True, "leaked_public": ["8.8.8.8"],
+            "with_media": {"tun_leak": [], "local_ips": []},
+            "browser": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        }}
+        with mock.patch.object(g, "load_media_permission", return_value={
+            "ok": True, "checkedAt": g.now_stamp(), "profileScope": "test-profile"}), \
+             mock.patch.dict(os.environ, {"CLAUDE_GUARD_BROWSER_PROFILE": "test-profile"}), \
+             mock.patch.object(g, "chromium_is_headless_shell", return_value=False):
+            row = [item for item in g.build_summary(report) if item[0] == "WebRTC 泄漏"][0]
+        self.assertIs(row[1], g.S_BAD)
+
+    def test_backup_plan_includes_configuration_targets(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        old_home, old_settings = g.HOME, g.SETTINGS
+        g.HOME, g.SETTINGS = tmp, tmp / ".claude" / "settings.json"
+        self.addCleanup(setattr, g, "HOME", old_home)
+        self.addCleanup(setattr, g, "SETTINGS", old_settings)
+        paths, _ = g.backup_paths_for_plan({"rc_files": {".zshrc": []}}, {
+            "A26_claude_settings": {"dead": [{"file": ".claude/settings.local.json"}]}
+        })
+        self.assertIn(tmp / ".npmrc", paths)
+        self.assertIn(tmp / ".gitconfig", paths)
+        self.assertIn(tmp / ".claude/settings.local.json", paths)
+        self.assertIn(tmp / ".local/bin/claude-safe", paths)
 
 
 if __name__ == "__main__":
