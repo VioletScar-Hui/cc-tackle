@@ -5143,6 +5143,68 @@ class TestClashEndpointDiscovery(unittest.TestCase):
         self.assertIn("/a.sock", row[2])
 
 
+class TestReportOnlyFlow(unittest.TestCase):
+    """标准调用流程：前测 → 修 → 后测 → 一份 HTML。
+
+    这里钉的是「HTML 一定给得出来」这条：
+    - 只读模式加 --report 就出 HTML，且**不写 JSON、不动状态**（--save-audit 会写）；
+    - 在 CONFIRM 处取消时也要出 HTML（改动前那份），否则用户拿不到任何东西。
+    """
+
+    def _sandbox(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name, val in (("HOME", tmp), ("BACKUP_ROOT", tmp / "backups")):
+            patcher = mock.patch.object(g, name, val)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return tmp
+
+    def test_audit_report_writes_html_and_nothing_else(self):
+        tmp = self._sandbox()
+        written = []
+        with mock.patch.object(g, "audit", return_value={"A1_export_ip": {}}), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "print_summary_table"), \
+             mock.patch("report_html.write_report",
+                        side_effect=lambda *a, **k: written.append(k) or (tmp / "r.html")):
+            self.assertEqual(g.main(["--audit", "--report"]), 0)
+        self.assertEqual(len(written), 1, "只读模式加 --report 必须落一份 HTML")
+        self.assertFalse(list((tmp / "backups").glob("audit-*.json")) if (tmp / "backups").exists() else [],
+                         "--report 不该写 audit JSON，那是 --save-audit 的事")
+
+    def test_audit_report_does_not_touch_the_caches(self):
+        tmp = self._sandbox()
+        with mock.patch.object(g, "audit", return_value={}), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "print_summary_table"), \
+             mock.patch.object(g, "save_audit_report") as save, \
+             mock.patch("report_html.write_report", return_value=tmp / "r.html"):
+            g.main(["--audit", "--report"])
+        save.assert_not_called()
+
+    def test_cancel_at_confirm_still_hands_over_the_page(self):
+        tmp = self._sandbox()
+        report = {"A1_terminal_env": {"rc_files": {}, "npm": {}, "git": {},
+                                      "env_hits": [], "env_info": []}}
+        written = []
+        with mock.patch.object(g, "audit", return_value=report), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "auto_clean_plan", return_value={
+                 "summary": [], "proxy_residue": [], "rc_files": {}, "npm_git": [],
+                 "settings_base_url": [], "settings_env_proxy": [], "ipv6": False,
+                 "location_timezone": False, "clash_dns": False, "browser_locale": False,
+                 "storage_bytes": 0, "dead_permissions": False, "stale_worktrees": [],
+                 "project_junk": []}), \
+             mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=True), \
+             mock.patch("builtins.input", side_effect=["0", "n", "n", "n", "n", "n", "n", "不确认"]), \
+             mock.patch("report_html.write_report",
+                        side_effect=lambda *a, **k: written.append(k) or (tmp / "r.html")):
+            rc = g.main(["--report"])
+        self.assertEqual(rc, 1, "在 CONFIRM 处取消仍然是退出码 1")
+        self.assertEqual(len(written), 1, "取消时也该把改动前那份 HTML 给出来")
+
+
 class TestHtmlReport(unittest.TestCase):
     """报告页：自包含、数字与终端同源、用户文字不会被当成 HTML 打出去。
 
