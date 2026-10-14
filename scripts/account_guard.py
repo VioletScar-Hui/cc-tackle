@@ -3171,18 +3171,25 @@ def build_summary(report: dict) -> list:
     return rows
 
 
-def write_html_twin(before: dict, after: dict) -> None:
-    """把这一轮的结果落成 HTML 报告并用默认浏览器打开。
+def write_html_only(report: dict, before: dict | None = None, note: str = "") -> None:
+    """只落一份 HTML，不写 audit JSON、不动出口历史与缓存。
 
-    报告是给人看的附属产物：渲染失败只提示、不往上抛，否则一次成功的加固会因为模板里
-    某个字段没对上而以 traceback 收场。
+    与 --save-audit 的区别：那条路会连 JSON 和状态一起写，而「就想看一眼报告」的人
+    不该被顺带改状态。报告是给人看的附属产物，渲染失败只提示、不往上抛，否则一次
+    成功的加固会因为模板里某个字段没对上而以 traceback 收场。
     """
     try:
         from report_html import write_report
-        page = write_report(after, before=before, open_it=True)
-        print(f"\nHTML 报告：{page}")
+        page = write_report(report, before=before, open_it=True)
+        suffix = f"（{note}）" if note else ""
+        print(f"\nHTML 报告{suffix}：{page}")
     except Exception as error:      # 同上：附属产物不该影响主流程的结论
         print(f"\nHTML 报告生成失败（上面的结论不受影响）：{error}", file=sys.stderr)
+
+
+def write_html_twin(before: dict, after: dict) -> None:
+    """改动前后的对照版 HTML：两个参数都是同一次运行里的真读数。"""
+    write_html_only(after, before=before)
 
 
 def print_summary_table(report: dict) -> None:
@@ -5947,6 +5954,8 @@ def auto_clean_plan(report: dict) -> dict:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="按四层防线做 Claude 本机体检与加固")
     ap.add_argument("--audit", action="store_true", help="只读体检，不做任何修改")
+    ap.add_argument("--report", action="store_true",
+                    help="结束时落一份 HTML 报告（只读模式下也能用，不写 JSON 与状态）")
     ap.add_argument("--save-audit", action="store_true",
                     help="审计完成后显式保存报告与出口历史（默认 --audit 不落盘）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出体检结果")
@@ -6080,8 +6089,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"HTML 版  ：{write_report(report, report_path=str(p))}")
             except Exception as error:
                 print(f"HTML 版生成失败（上面的结论不受影响）：{error}", file=sys.stderr)
+        elif args.report:
+            # 只要一份 HTML，不要 JSON、不要状态：给同事或自己看一眼的那种用法。
+            write_html_only(report, note="只有这一次体检，没有改动对照")
         else:
-            print("\n只读审计未写入报告、出口历史或缓存；如需保存请加 --save-audit。")
+            print("\n只读审计未写入报告、出口历史或缓存；"
+                  "需要留档加 --save-audit（含 JSON），只要 HTML 加 --report。")
         return 0
 
     scope = report.get("scope_manifest") or {}
@@ -6160,6 +6173,8 @@ def main(argv: list[str] | None = None) -> int:
         print("  绝不改动：session、project、history、skill、plugin、hook、command、agent、MCP 配置等受保护数据。")
         if input("完全理解后输入 CONFIRM 开始；其他输入取消：").strip() != "CONFIRM":
             print("已取消，没有修改任何内容。")
+            if args.report:
+                write_html_only(report, note="已取消，这是改动前的状态")
             return 1
 
         # 锁取在 CONFIRM 之后：这之前一个字节都没写，不需要拦并发。

@@ -44,6 +44,15 @@
 
 ## 快速开始
 
+### 最常用的一条流程：前测 → 修 → 后测 → 一份 HTML
+
+```bash
+python3 scripts/account_guard.py --audit     # 前测：只读，不改任何状态
+python3 scripts/account_guard.py             # 修：列清单 → 敲一次 CONFIRM → 备份 → 改 → 重新体检 → 出 HTML
+```
+
+第二条命令本身就是完整流水线：动手前的体检、备份、改动、改动之后重新体检、前后对照表，最后落一份带前后对照的 HTML 并打开。只想留一份页面、不想顺带写 JSON 与出口历史时用 `--report`；在 CONFIRM 处取消时它也会给出「改动前」那一份。
+
 ### 只读审计入口
 
 ```bash
