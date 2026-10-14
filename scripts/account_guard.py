@@ -72,10 +72,45 @@ def claude_config_scope() -> dict:
     return out
 
 
+BROWSER_PROFILE_ENV = "CLAUDE_GUARD_BROWSER_PROFILE"
+EXPECTED_COUNTRY_ENV = "CLAUDE_GUARD_EXPECTED_COUNTRY"
+EXPECTED_EXIT_IP_ENV = "CLAUDE_GUARD_EXPECTED_EXIT_IP"
+
+
 def browser_profile_scope() -> str | None:
     """Return the user supplied browser profile identity, if any."""
-    value = os.environ.get("CLAUDE_GUARD_BROWSER_PROFILE", "").strip()
+    value = os.environ.get(BROWSER_PROFILE_ENV, "").strip()
     return value or None
+
+
+def declared_expected(country: str | None = None,
+                      exit_ip: str | None = None) -> tuple[str | None, str | None]:
+    """把「你自己声明的预期出口」收敛成一个入口：命令行优先，其次环境变量。
+
+    为什么要认环境变量：预期出口是用户自己的声明，不是脚本推断出来的事实。
+    但 selfcheck.py、报告服务、桌面启动器这些调用点走的是 audit()，拿不到命令行
+    参数；只认命令行的话，同一次声明换个入口就没了，那一项会在「已解决」和
+    「未测到」之间来回跳。所以命令行给不出时读环境变量，两处都没有才算没声明。
+    """
+    picked = []
+    for cli_value, env_name, normalize in (
+        (country, EXPECTED_COUNTRY_ENV, normalize_expected_country),
+        (exit_ip, EXPECTED_EXIT_IP_ENV, normalize_expected_ip),
+    ):
+        # 命令行里给了空串也算没给；环境变量里的空白（export X=" "）同样不算声明，
+        # 否则它会一路走到校验那步，把一次体检整个判成失败。
+        value = cli_value if (cli_value or "").strip() else os.environ.get(env_name)
+        value = (value or "").strip() or None
+        if value is None:
+            picked.append(None)
+            continue
+        try:
+            picked.append(normalize(value))
+        except ValueError as error:
+            # 命令行那侧由 argparse 自己校验；能走到这里的基本都是环境变量写错了，
+            # 报错要指名是哪个变量，不然用户只看到「--expected-country 不合法」。
+            raise ValueError(f"{env_name} 的值不合法：{error}") from error
+    return (picked[0], picked[1])
 
 TELEMETRY_KEYS = (
     "DISABLE_TELEMETRY",
@@ -2923,10 +2958,14 @@ def build_summary(report: dict) -> list:
         n_stale = len(st.get("cli", {}).get("stale") or []) + len(st.get("bundled", {}).get("stale") or [])
         n_cache = len(st.get("caches") or [])
         cur = st.get("cli", {}).get("current") or "?"
-        if st.get("cleanable_bytes"):
+        if storage_worth_cleaning(st):
             add("系统级可清理量", S_FIX,
-                f"当前 CLI {cur}；有 {st['cleanable_bytes'] / 2 ** 20:.0f} MB 可清"
+                f"当前 CLI {cur}；有 {human_bytes(st['cleanable_bytes'])} 可清"
                 f"（旧版本 {n_stale} 份 + 可再生缓存 {n_cache} 个）")
+        elif st.get("cleanable_bytes"):
+            add("系统级可清理量", S_OK,
+                f"当前 CLI {cur}；只剩 {human_bytes(st['cleanable_bytes'])} 可再生缓存"
+                f"（{n_cache} 个目录，清了自己还会长回来，不值得动）")
         else:
             add("系统级可清理量", S_OK,
                 f"当前 CLI {cur}；没有攒下旧版本，缓存目录也是空的")
@@ -3353,9 +3392,40 @@ DESKTOP_CACHE_DIRS = (
     "Code Cache", "Cache", "GPUCache",
     "DawnWebGPUCache", "DawnGraphiteCache", "DawnCache",
 )
+# 低于这个量就不值得动手：Electron 的缓存会被自己重建（实测清完 43.8 MB，
+# 十几分钟后桌面版又长出 0.4 MB）。原来的判定是「只要有可清理字节就报待处理」，
+# 于是清完立刻又挂回「待处理」，还打印出「有 0 MB 可清」这种自相矛盾的话。
+STORAGE_CLEAN_THRESHOLD = 1 << 20  # 1 MB
+
 DESKTOP_DATA = HOME / "Library" / "Application Support" / "Claude"
 DESKTOP_BUNDLED = DESKTOP_DATA / "claude-code"
 CLI_VERSIONS = HOME / ".local" / "share" / "claude" / "versions"
+
+
+def human_bytes(n) -> str:
+    """字节数说成人话：不到 1 MB 用 KB，省得出现「有 0 MB 可清」。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "未知"
+    if n < 0:
+        n = 0
+    if n < 1 << 20:
+        return f"{n / 1024:.0f} KB"
+    if n < 1 << 30:
+        return f"{n / (1 << 20):.1f} MB"
+    return f"{n / (1 << 30):.2f} GB"
+
+
+def storage_worth_cleaning(report_or_state) -> bool:
+    """值不值得清：旧版本多少都值，纯缓存低于阈值就不折腾。"""
+    st = report_or_state or {}
+    if "A25_claude_storage" in st:
+        st = st.get("A25_claude_storage") or {}
+    stale = len(st.get("cli", {}).get("stale") or []) + len(st.get("bundled", {}).get("stale") or [])
+    if stale:
+        return True
+    return int(st.get("cleanable_bytes") or 0) >= STORAGE_CLEAN_THRESHOLD
 
 
 def _entry_size(p: pathlib.Path) -> int:
@@ -4791,19 +4861,32 @@ def clear_proxy_residue(residue: list[dict]) -> int:
     所以清完必须再执行一次 set{kind}state off，并且复验 Enabled 为 No 才算成功；
     否则会把一条「未启用的残留」变成「已启用的代理」，正好造成文章最担心的后果。
     只处理 residue（Enabled=No）条目，正在启用的代理一律不碰。
+
+    第三种情况：报告之后这条已经被别人清干净了（实测定时脚本
+    local.proxy-residue-cleanup 会抢在前面）——目标状态本来就达到了，
+    跳过并记进 clear_proxy_residue.skipped，不算失败。
     """
     cleared = 0
+    skipped = 0
     for item in residue:
         svc, kind = item["service"], item["kind"]
         code, before_body = run(["networksetup", f"-get{kind}", svc])
         before_enabled = re.search(r"Enabled:\s*(\w+)", before_body)
         before_server = re.search(r"Server:\s*(\S*)", before_body)
         before_port = re.search(r"Port:\s*(\S*)", before_body)
-        if (code or not before_enabled or before_enabled.group(1).lower() != "no"
-                or not before_server or not before_port
-                or before_server.group(1) != str(item.get("server", ""))
+        if code or not before_enabled or not before_server or not before_port:
+            raise RuntimeError(f"{svc}/{kind} 读不到当前状态，拒绝清理")
+        if before_enabled.group(1).lower() != "no":
+            # 报告之后被打开了：这条已经不是在用之外的值，碰它可能断网。
+            raise RuntimeError(f"{svc}/{kind} 在确认后变成了启用状态，拒绝清理")
+        if before_server.group(1) in ("", "0.0.0.0") and before_port.group(1) in ("", "0"):
+            # 报告之后已经被别人清掉了（实测：定时脚本 local.proxy-residue-cleanup 会抢在前面），
+            # 目标状态本来就达到了，不算失败。
+            skipped += 1
+            continue
+        if (before_server.group(1) != str(item.get("server", ""))
                 or before_port.group(1) != str(item.get("port", ""))):
-            raise RuntimeError(f"{svc}/{kind} 在确认后状态已变化，拒绝清理")
+            raise RuntimeError(f"{svc}/{kind} 在确认后换成了别的值，拒绝清理")
         code, body = run(["networksetup", f"-set{kind}", svc, "0.0.0.0", "0"])
         if code:
             raise RuntimeError(f"{svc}/{kind} 清理失败：{body.strip()[:160]}")
@@ -4817,6 +4900,7 @@ def clear_proxy_residue(residue: list[dict]) -> int:
         if server and server.group(1) == item["server"]:
             raise RuntimeError(f"{svc}/{kind} 清理后服务器值仍是 {item['server']}，没有真正清掉")
         cleared += 1
+    clear_proxy_residue.skipped = skipped     # 已经是干净的那些，给调用方措辞用
     return cleared
 
 
@@ -5488,6 +5572,7 @@ def audit(*, persist: bool = False, expected_country: str | None = None,
           expected_exit_ip: str | None = None) -> dict:
     # Normal audits are read-only.  The explicit opt-in is used only when a
     # caller wants export history to be updated for the next comparison.
+    expected_country, expected_exit_ip = declared_expected(expected_country, expected_exit_ip)
     ip = check_export_ip(persist=persist)  # 出口 IP 只查一次，一致性检查复用同一结果
     scope = claude_config_scope()
     expected = expected_exit_result(ip, expected_country, expected_exit_ip)
@@ -5782,10 +5867,10 @@ def auto_clean_plan(report: dict) -> dict:
 
     st = report.get("A25_claude_storage") or {}
     st_bytes = st.get("cleanable_bytes") or 0
-    if st_bytes:
+    if st_bytes and storage_worth_cleaning(st):
         n_stale = len(st.get("cli", {}).get("stale") or []) + len(st.get("bundled", {}).get("stale") or [])
         summary.append(
-            f"系统级可清理 {st_bytes / 2 ** 20:.0f} MB："
+            f"系统级可清理 {human_bytes(st_bytes)}："
             f"被取代的旧版本 {n_stale} 份 + 可再生缓存 {len(st.get('caches') or [])} 个（不可原样回滚，默认不清）"
         )
 
@@ -5851,7 +5936,7 @@ def auto_clean_plan(report: dict) -> dict:
         "clash_dns": clash_dns_leaking(report),
         "browser_locale": browser_locale,
         "stale_worktrees": stale_repos,
-        "storage_bytes": st_bytes,
+        "storage_bytes": st_bytes if storage_worth_cleaning(st) else 0,
         "dead_permissions": len(cs.get("dead") or []),
         "project_junk": bool(project_roots()),
         "nonrestorable": bool(st_bytes or stale_repos),
@@ -5866,9 +5951,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="审计完成后显式保存报告与出口历史（默认 --audit 不落盘）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出体检结果")
     ap.add_argument("--expected-country", type=normalize_expected_country,
-                    help="声明预期出口国家（ISO 两字母，例如 US）")
+                    help="声明预期出口国家（ISO 两字母，例如 US）；"
+                         f"也可以用环境变量 {EXPECTED_COUNTRY_ENV}")
     ap.add_argument("--expected-exit-ip", type=normalize_expected_ip,
-                    help="声明预期出口 IP；只接受合法 IPv4/IPv6")
+                    help="声明预期出口 IP；只接受合法 IPv4/IPv6；"
+                         f"也可以用环境变量 {EXPECTED_EXIT_IP_ENV}")
     ap.add_argument("--restore", metavar="BACKUP_DIR",
                     help="从 v2 备份显式恢复；需要真实 TTY 和 CONFIRM")
     ap.add_argument("--restore-preview", action="store_true",
@@ -6063,7 +6150,7 @@ def main(argv: list[str] | None = None) -> int:
               f"npm/git {len(plan['npm_git'])} 项，"
               f"端点/代理变量 {'是' if (plan['settings_base_url'] or plan.get('settings_env_proxy')) else '无'}，"
               f"过期工作树注册将{'清理' if do_stale_worktrees else '保持'}（{len(plan.get('stale_worktrees') or [])} 个仓库），"
-              f"系统级可清理将{'清理' if do_storage else '保持'}（{plan.get('storage_bytes', 0) / 2 ** 20:.0f} MB）")
+              f"系统级可清理将{'清理' if do_storage else '保持'}（{human_bytes(plan.get('storage_bytes', 0))}）")
         print(f"  3. 遥测开关：{telemetry}")
         print(f"  4. 生成包装脚本：{'是' if do_wrapper else '否'}")
         print(f"  5. 关闭 IPv6：{'是' if do_ipv6 else '否'}")
@@ -6120,11 +6207,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n[1/6] 备份完成：{backup}")
 
         _mark_backup_in_progress(backup, "automatic-cleanup")
-        n = clear_proxy_residue(plan["proxy_residue"]) if plan["proxy_residue"] else 0
+        if plan["proxy_residue"]:
+            n = clear_proxy_residue(plan["proxy_residue"])
+            gone = len(plan["proxy_residue"]) - n
+        else:
+            n = gone = 0
         rc_changed = clear_rc_proxy_lines(plan["rc_files"]) if plan["rc_files"] else []
         npm_git_done = clear_npm_git_proxy() if plan["npm_git"] else []
         _refresh_backup_manifest(backup, "automatic-cleanup")
-        print(f"[2/6] 自动清理：系统代理 {n} 项，shell 配置 {len(rc_changed)} 个文件，npm/git {len(npm_git_done)} 项")
+        print(f"[2/6] 自动清理：系统代理 {n} 项"
+              + (f"（另有 {gone} 项在报告之后已经不在了）" if gone else "")
+              + f"，shell 配置 {len(rc_changed)} 个文件，npm/git {len(npm_git_done)} 项")
         if do_clash_dns:
             _mark_backup_in_progress(backup, "clash-dns")
             print(f"       Clash DNS：{clear_clash_dns_leak(report)}")

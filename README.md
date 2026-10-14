@@ -193,13 +193,18 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 - Clash 读取本机配置或 socket；自定义 secret 通过 `CLASH_SECRET` 传入，不要把它写进仓库。
 - 脚本不会读取或保存 sudo 密码。Clash secret 从 `CLASH_SECRET` 读取；脚本调用本机 Clash API 时，会在 Python 内存中组装请求头，不把 secret 交给外部命令参数。仍请保护该环境变量，不要把它写入日志、脚本或仓库。
 - 默认项目范围可以通过 `CLAUDE_GUARD_PROJECT_ROOTS` 指定；自定义 `CLAUDE_CONFIG_DIR` 只会报告，不纳入加固范围。
+- 「系统级可清理量」少于 1 MB 不算待处理：Electron 的可再生缓存会被应用自己重建（实测清掉 43.8 MB，十几分钟后桌面版又长回 0.4 MB），为这点量常挂一个待处理没有意义。低于这个量时该行报通过，并写明还剩多少、为什么不动。
 
 ### 环境变量
 
 ```bash
 export CLAUDE_GUARD_PROJECT_ROOTS="$HOME/code:$HOME/work"
 export CLAUDE_GUARD_BROWSER_PROFILE="my-claude-profile"
+export CLAUDE_GUARD_EXPECTED_COUNTRY="US"           # 你声明这条线路应该落在哪一国
+export CLAUDE_GUARD_EXPECTED_EXIT_IP="203.0.113.10" # 可选：把出口 IP 也一起钉死
 ```
+
+`CLAUDE_GUARD_EXPECTED_COUNTRY` / `CLAUDE_GUARD_EXPECTED_EXIT_IP` 和对应的两个命令行参数是同一件事：声明你预期的出口。命令行优先，其次环境变量；两处都没给，「预期出口是否符合」那一项就如实报「未测到」，脚本不会替你猜一个。
 
 如果本机 secret 不是默认值，请通过已有安全机制预先注入 `CLASH_SECRET` 环境变量；不要在命令行、shell 历史、脚本或仓库中写明文 secret。
 

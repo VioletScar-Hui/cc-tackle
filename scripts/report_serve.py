@@ -67,15 +67,24 @@ def _paths_clash(rep, plan, after=None):
 
 
 def _paths_dead_perms(rep, plan, after=None):
+    # 报告里的 file 是相对家目录的（check_claude_settings 里是 str(f).replace(HOME + "/", "")），
+    # 直接当路径用 is_file() 为假，于是这一笔会在没有备份的情况下改文件。
+    # HOME / f 对绝对路径返回 f 本身，两种形态都对。
     files = {d["file"] for d in (rep.get("A26_claude_settings") or {}).get("dead") or []}
-    return [pathlib.Path(f) for f in files]
+    return [g.HOME / pathlib.Path(f) for f in files]
 
 
 def _apply_proxy_residue(rep, plan):
     items = plan.get("proxy_residue") or []
     if not items:
         return "系统代理没有残留，无需改动"
-    return f"清掉系统代理残留 {g.clear_proxy_residue(items)} 项"
+    cleared = g.clear_proxy_residue(items)
+    gone = len(items) - cleared
+    if not cleared:
+        return f"系统代理残留已经不在了（{gone} 项，多半被定时脚本清掉了），无需改动"
+    if gone:
+        return f"清掉系统代理残留 {cleared} 项，另有 {gone} 项已经不在了"
+    return f"清掉系统代理残留 {cleared} 项"
 
 
 def _apply_rc_proxy(rep, plan):
@@ -230,15 +239,24 @@ for _aid, _spec in ACTIONS.items():
         ROW_ACTIONS.setdefault(_row, []).append(_aid)
 
 
-def ui_actions() -> dict:
+def ui_actions(report: dict | None = None) -> dict:
     """给渲染器用的表：行名 → [{id,label,hint}]。
 
     report_html 不能 import 本模块（本模块已经 import 了它），所以按钮上要显示的文字
     由这里带过去，渲染器只负责摆位置。
+
+    给了 report 就只留有「待处理」行的动作：否则一行已经报绿，上面照样挂着「清理」
+    按钮，页头的「可自动修的项」还会把它算进去（2026-10-14 清完缓存后就是这样：
+    那 0.4 MB 会自己长回来，行报绿了，按钮却还在）。
     """
+    pending = None
+    if report is not None:
+        pending = {name for name, status, _detail in g.build_summary(report) if status == g.S_FIX}
     out: dict = {}
     for aid, spec in ACTIONS.items():
         for row in spec["rows"]:
+            if pending is not None and row not in pending:
+                continue
             out.setdefault(row, []).append(
                 {"id": aid, "label": spec.get("label", "修复"), "hint": spec.get("hint", "")})
     return out
@@ -261,14 +279,19 @@ class State:
         return g.build_summary(self.report)
 
     def fix(self, action_id: str) -> str:
-        """跑一个动作：先算计划 → 备份 → 执行 → 重查受影响的那几项。"""
+        """跑一个动作：先算计划 → 备份 → 执行 → 重查受影响的那几项。
+
+        顺序不能反。2026-10-14 实测抓到过反的那版：先 apply 再 create_backup，
+        于是备份里存的是**已经改过**的文件——点坏了照着它回滚，等于把改完的状态再写一遍。
+        现在的规矩和终端流程一致：备份先拍，备份失败就把异常抛出去，那个字一个都不动。
+        """
         spec = ACTIONS[action_id]
         plan = g.auto_clean_plan(self.report)
-        message = spec["apply"](self.report, plan)
         paths = [p for p in (spec["paths"](self.report, plan) or []) if p and p.is_file()]
         backup_note = ""
         if paths:
             backup_note = f"；备份 {g.create_backup(paths)}"
+        message = spec["apply"](self.report, plan)
         self.report.update(spec["recheck"](self.report))
         self.report["timestamp"] = dt.datetime.now().isoformat()
         return message + backup_note
@@ -326,7 +349,7 @@ class Handler(BaseHTTPRequestHandler):
         if sub in ("", "index.html"):
             html = report_html.render(st.report, live=f"http://{self.headers.get('Host')}/{self.token}",
                                       report_path="（本页由本地服务实时渲染）",
-                                      actions=ui_actions())
+                                      actions=ui_actions(st.report))
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
         elif sub == "state":
             self._json(200, {"rows": st.rows(), "timestamp": st.report.get("timestamp")})
