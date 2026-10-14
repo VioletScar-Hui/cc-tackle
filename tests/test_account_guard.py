@@ -22,12 +22,17 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 
 import account_guard as g  # noqa: E402
+import report_html as rh  # noqa: E402
+import report_serve as rs  # noqa: E402
 import selfcheck as selfcheck_module  # noqa: E402
 
 
@@ -2686,6 +2691,11 @@ class TestClearClashDnsLeak(unittest.TestCase):
     """修的时候要改两处，而且写进增强文件的必须是完整的 dns 块。"""
 
     def setUp(self):
+        # 端点探活必须显式关掉。这两个类只 patch 了 run 当夹具，没钉 CLASH_SOCK，
+        # 而本机可能真有内核在跑 —— 不钉住的话桩代码会去敲真的内核并真的发 PUT
+        # （2026-10-14 合并时踩到：9 个用例因此报 HTTP 400）。
+        self.addCleanup(setattr, g, "CLASH_SOCK", g.CLASH_SOCK)
+        g.CLASH_SOCK = pathlib.Path("/nonexistent/guard-fixture.sock")
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.cdir = (self.tmp / "Library/Application Support"
@@ -2880,6 +2890,11 @@ class TestClashDnsFallback(unittest.TestCase):
     """
 
     def setUp(self):
+        # 端点探活必须显式关掉。这两个类只 patch 了 run 当夹具，没钉 CLASH_SOCK，
+        # 而本机可能真有内核在跑 —— 不钉住的话桩代码会去敲真的内核并真的发 PUT
+        # （2026-10-14 合并时踩到：9 个用例因此报 HTTP 400）。
+        self.addCleanup(setattr, g, "CLASH_SOCK", g.CLASH_SOCK)
+        g.CLASH_SOCK = pathlib.Path("/nonexistent/guard-fixture.sock")
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.cdir = (self.tmp / "Library/Application Support"
@@ -4928,6 +4943,322 @@ class TestClashSocketTransport(unittest.TestCase):
         self.assertEqual(len(received), 2)
         self.assertTrue(all(b"Authorization: Bearer test-secret" in request for request in received))
         self.assertIn(b'{"force":true}', received[1])
+
+
+class TestClashEndpointDiscovery(unittest.TestCase):
+    """控制端点会搬家，检查不能写死路径（2026-10-13 实测踩到）。
+
+    Clash Verge 2.5 起有「服务模式」：内核改由特权服务托管，控制 socket 从
+    /tmp/verge/verge-mihomo.sock 搬到 /var/run/clash-verge-service/users/<uid>/。
+    写死旧路径时体检会报「控制接口不可达」——读起来像网络坏了，实际只是端点换了地方。
+    """
+
+    @staticmethod
+    def _fake(ok_sock):
+        def fake_run(cmd, timeout=20):
+            joined = " ".join(str(c) for c in cmd)
+            try:
+                sock = cmd[cmd.index("--unix-socket") + 1]
+            except (ValueError, IndexError):
+                sock = ""
+            if "/version" in joined:
+                return (0, '{"version":"v1.19.32"}') if (ok_sock and sock == ok_sock) else (1, "")
+            if "/configs" in joined:
+                return 0, json.dumps({"mode": "rule", "tun": {"enable": True}})
+            if "/proxies" in joined:
+                return 0, json.dumps({"proxies": {}})
+            if "/rules" in joined:
+                return 0, json.dumps({"rules": []})
+            return 1, ""
+
+        return fake_run
+
+    def _sandbox_home(self, declared=None):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        d = tmp / "Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+        d.mkdir(parents=True)
+        if declared is not None:
+            (d / "config.yaml").write_text(
+                "external-controller-unix: %s\n" % declared, encoding="utf-8")
+        return tmp
+
+    def test_declared_socket_comes_first(self):
+        home = self._sandbox_home("/tmp/somewhere/mihomo.sock")
+        with mock.patch.object(g, "HOME", home):
+            paths = [str(p) for p in g.clash_sock_paths()]
+        self.assertEqual(paths[0], "/tmp/somewhere/mihomo.sock")
+        self.assertIn(
+            "/var/run/clash-verge-service/users/%d/verge-mihomo.sock" % os.getuid(), paths)
+
+    def test_defaults_are_listed_without_config(self):
+        home = self._sandbox_home()
+        with mock.patch.object(g, "HOME", home):
+            paths = [str(p) for p in g.clash_sock_paths()]
+        self.assertTrue(any("clash-verge-service" in p for p in paths), paths)
+        self.assertIn("/tmp/verge/verge-mihomo.sock", paths)
+
+    def test_probe_skips_the_stale_one(self):
+        """声明值指向已经消失的旧 socket 时，要能落到真正在用的那个上。"""
+        home = self._sandbox_home("/tmp/verge/verge-mihomo.sock")
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        stale = tmp / "stale.sock"
+        stale.write_text("", encoding="utf-8")
+        live = tmp / "live.sock"
+        live.write_text("", encoding="utf-8")
+        # 探活实现是纯 socket（不走 run），所以这里直接给探活函数打桩。
+        with mock.patch.object(g, "HOME", home), \
+             mock.patch.object(g, "CLASH_SOCK_CANDIDATES", (str(stale), str(live))), \
+             mock.patch.object(g, "_CLASH_SOCK_CACHE", {}), \
+             mock.patch.object(g, "_probe_clash_socket",
+                               side_effect=lambda p: str(p) == str(live)):
+            self.assertEqual(str(g.clash_socket()), str(live))
+
+    def test_no_socket_anywhere_returns_none(self):
+        home = self._sandbox_home("/tmp/verge/verge-mihomo.sock")
+        with mock.patch.object(g, "HOME", home), \
+             mock.patch.object(g, "CLASH_SOCK_CANDIDATES", ("/nonexistent/a.sock",)), \
+             mock.patch.object(g, "_CLASH_SOCK_CACHE", {}), \
+             mock.patch.object(g, "_probe_clash_socket", side_effect=lambda p: False):
+            self.assertIsNone(g.clash_socket())
+
+    def test_probe_failure_falls_back_to_existing(self):
+        """探活本身失败（比如 curl 不可用）时退回第一个存在的端点，不把整项判死。"""
+        home = self._sandbox_home()
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        only = tmp / "only.sock"
+        only.write_text("", encoding="utf-8")
+        with mock.patch.object(g, "HOME", home), \
+             mock.patch.object(g, "CLASH_SOCK_CANDIDATES", (str(only),)), \
+             mock.patch.object(g, "_CLASH_SOCK_CACHE", {}), \
+             mock.patch.object(g, "_probe_clash_socket", side_effect=lambda p: False):
+            self.assertEqual(str(g.clash_socket()), str(only))
+
+    def test_check_reports_the_endpoints_it_tried(self):
+        home = self._sandbox_home("/tmp/verge/verge-mihomo.sock")
+        with mock.patch.object(g, "HOME", home), \
+             mock.patch.object(g, "CLASH_SOCK_CANDIDATES", ("/nonexistent/a.sock",)), \
+             mock.patch.object(g, "run", side_effect=self._fake(None)):
+            r = g.check_clash_groups()
+        self.assertFalse(r["reachable"])
+        self.assertEqual(r["sock"], "")
+        self.assertTrue(r["sock_tried"])
+
+    def test_summary_names_the_endpoints_when_unreachable(self):
+        rows = g.build_summary({"A12_clash_groups": {
+            "reachable": False, "sock_tried": ["/a.sock", "/b.sock"]}})
+        row = [r for r in rows if r[0] == "绝不直连"][0]
+        self.assertIs(row[1], g.S_NA)
+        self.assertIn("/a.sock", row[2])
+
+
+class TestHtmlReport(unittest.TestCase):
+    """报告页：自包含、数字与终端同源、用户文字不会被当成 HTML 打出去。
+
+    这三条都不是洁癖。①自包含：这个工具就是查网络痕迹的，报告再往外发请求会自相矛盾；
+    ②同源：判定只走 build_summary，页面不另写一套；③转义：DNS 解析器、CLI 路径这些
+    字段都是外部输入，直接拼进 HTML 就是把报告页变成注入点。
+    """
+
+    def _report(self, **over):
+        rep = {
+            "timestamp": "2026-10-13 21:00:00",
+            "A1_export_ip": {"ip": "203.0.113.9", "country": "US", "city": "Nowhere",
+                             "org": "AS7018 Example ISP, LLC", "timezone": "America/Chicago"},
+            "A12_clash_groups": {
+                "reachable": True, "mode": "rule",
+                "tun": {"enable": True, "strict-route": True},
+                "claude_group": {"type": "Selector", "now": "N1", "members": ["N1"]},
+                "fallback": {"proxy": "Proxy"},
+            },
+        }
+        rep.update(over)
+        return rep
+
+    def test_page_is_self_contained(self):
+        h = rh.render(self._report())
+        self.assertNotIn('src="http', h)
+        self.assertNotIn('href="http', h)
+        self.assertNotIn("<link ", h)
+        self.assertNotIn("<script", h)          # 整页没有 JS，展开靠 details
+
+    def test_external_text_is_escaped(self):
+        h = rh.render(self._report(A6_dns={"clash": {"nameserver": ["<img src=x onerror=1>"]}}))
+        self.assertNotIn("<img src=x", h)
+        self.assertIn("&lt;img src=x", h)
+
+    def test_score_leaves_unmeasured_out_of_the_denominator(self):
+        sc = rh._score([("a", g.S_OK, ""), ("b", g.S_NA, ""), ("c", g.S_OK, "")])
+        self.assertEqual(sc["score"], 100)
+        self.assertEqual(sc["counts"]["na"], 1)
+
+    def test_attention_items_count_as_half(self):
+        self.assertEqual(rh._score([("a", g.S_OK, ""), ("b", g.S_FIX, "")])["score"], 75)
+        self.assertEqual(rh._score([("a", g.S_OK, ""), ("b", g.S_BAD, "")])["score"], 50)
+
+    def test_all_unmeasured_has_no_score(self):
+        sc = rh._score([("a", g.S_NA, "")])
+        self.assertIsNone(sc["score"])
+
+    def test_before_after_shows_delta_and_fixed_list(self):
+        before = [("绝不直连", g.S_BAD, "不成立"), ("出口 IP 与归属", g.S_OK, "好")]
+        after = [("绝不直连", g.S_OK, "成立"), ("出口 IP 与归属", g.S_OK, "好")]
+        with mock.patch.object(g, "build_summary", side_effect=[after, before]):
+            h = rh.render({"timestamp": "x"}, before={"timestamp": "y"})
+        self.assertIn("这一轮改好的", h)
+        self.assertIn("绝不直连", h.split("这一轮改好的")[1])
+        self.assertIn("修复前", h)
+
+    def test_items_and_evidence_come_from_the_report(self):
+        h = rh.render(self._report())
+        self.assertIn("203.0.113.9", h)          # 关键实测那张卡
+        self.assertIn("203.0.113.9", h.split("看依据")[1])  # 依据里也要有原始读数
+        self.assertIn("N1", h)                   # Claude 专用组
+
+    def test_write_report_lands_in_the_given_dir(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        p = rh.write_report(self._report(), out_dir=tmp, report_path="/tmp/x.json")
+        self.assertTrue(p.exists())
+        body = p.read_text(encoding="utf-8")
+        self.assertIn("/tmp/x.json", body)
+        self.assertIn("<!DOCTYPE html>", body)
+
+
+class TestReportServe(unittest.TestCase):
+    """报告页的按钮：只认白名单动作、只认带令牌的请求、静态页不出按钮。
+
+    这个进程能删文件，所以它的门必须比别的检查严：令牌在路径里、自定义头在 POST 上、
+    动作名对不上就 400。三条都要有用例，不然哪天「顺手放宽一点」就没人拦得住。
+    """
+
+    REPORT = {
+        "timestamp": "2026-10-13 22:00:00",
+        "A1_proxy_residue": {"residue": [], "enabled": {}},
+        "A12_clash_groups": {"reachable": True, "mode": "rule",
+                             "tun": {"enable": True, "strict-route": True},
+                             "claude_group": {"type": "Selector", "now": "N1", "members": ["N1"]},
+                             "fallback": {"proxy": "Proxy"}},
+    }
+
+    def _serve(self):
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), rs.Handler)
+        tok = "a" * 48
+        st = rs.State(json.loads(json.dumps(self.REPORT)))
+        srv.state = st
+        srv.token = tok
+        rs.Handler.token = tok
+        rs.Handler.state = st
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}/{tok}", tok
+
+    @staticmethod
+    def _get(url, timeout=10):
+        """返回 (状态码, 正文或已解析的 JSON)。/state 这种直接给 dict，省得每处都 parse。"""
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                raw = r.read().decode("utf-8")
+                code = r.status
+        except urllib.error.HTTPError as e:
+            raw, code = e.read().decode("utf-8"), e.code
+        try:
+            return code, json.loads(raw)
+        except ValueError:
+            return code, raw
+
+    @staticmethod
+    def _post(url, body, token=None, timeout=30):
+        # token 必须显式传：之前从 url 末段取，而对 /fix 来说末段是 "fix"，
+        # 于是「带令牌」的用例全被判成 403（自己写测试踩的坑）。
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json",
+                     **({"X-Guard-Token": token} if token else {})})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8"))
+
+    def test_live_page_has_buttons_and_static_page_does_not(self):
+        base, _ = self._serve()
+        status, html = self._get(base + "/")
+        self.assertEqual(status, 200)
+        self.assertIn("data-all='1'", html)
+        self.assertIn("data-rescan='1'", html)
+        self.assertIn("data-rows='系统代理残留'", html)
+        self.assertIn("<script", html)            # 服务模式才有脚本
+        static = rh.render(json.loads(json.dumps(self.REPORT)))
+        self.assertNotIn("data-rows=", static)
+        self.assertNotIn("<script", static)
+
+    def test_wrong_token_gets_404(self):
+        base, _ = self._serve()
+        port = base.split("/")[2]
+        code, _ = self._get(f"http://{port}/deadbeef/")
+        self.assertEqual(code, 404)
+
+    def test_post_without_custom_header_is_refused(self):
+        base, _ = self._serve()
+        code, body = self._post(base + "/fix", {"rows": ["系统代理残留"]})
+        self.assertEqual(code, 403)
+        self.assertFalse(body["ok"])
+
+    def test_unknown_row_is_refused(self):
+        base, token = self._serve()
+        code, body = self._post(base + "/fix", {"rows": ["不存在的行"]}, token=token)
+        self.assertEqual(code, 400)
+        self.assertFalse(body["ok"])
+
+    def test_fix_runs_only_the_whitelisted_action(self):
+        base, token = self._serve()
+        called = []
+
+        def fake_apply(rep, plan):
+            called.append("proxy_residue")
+            return "清掉 1 项"
+
+        with mock.patch.dict(rs.ACTIONS["proxy_residue"], {"apply": fake_apply}), \
+             mock.patch.object(rs.g, "auto_clean_plan", return_value={}), \
+             mock.patch.object(rs.g, "create_backup", return_value=pathlib.Path("/tmp/fake-backup")):
+            code, body = self._post(base + "/fix", {"rows": ["系统代理残留"]}, token=token)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(called, ["proxy_residue"])
+        self.assertTrue(body["ok"])
+        self.assertIn("清掉 1 项", body["messages"][0])
+
+    def test_state_endpoint_returns_rows(self):
+        base, _ = self._serve()
+        code, body = self._get(base + "/state")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["rows"])
+        self.assertEqual(len(body["rows"][0]), 3)
+
+    def test_ledger_records_what_was_deleted(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        with mock.patch.object(g, "BACKUP_ROOT", tmp):
+            p = g.write_cleanup_manifest("测试", [
+                {"path": "/tmp/a", "bytes": 100, "ok": True},
+                {"path": "/tmp/b", "bytes": 50, "ok": False},
+            ], extra={"source": "test"})
+            body = json.loads(p.read_text(encoding="utf-8"))
+        self.assertTrue(str(p).startswith(str(tmp)))
+        self.assertEqual(body["totalBytes"], 100)     # 没删成的那些不计入
+        self.assertEqual(body["items"][1]["ok"], False)
+        self.assertEqual(body["source"], "test")
+
+
+if __name__ == "__main__":
+    # 这个块必须待在文件最末尾。2026-10-10 发现它一度停在中间（第 2403 行），
+    # 于是它后面定义的 6 个类、40 个用例从来没被执行过——`unittest.main()` 在第 2403
+    # 行就跑完了收集，而那几个类那时还没被定义。症状是「测试全过」，实际只跑了
+    # 227/267。往这个文件里加用例时，务必加在下面这行之上。
+    unittest.main(verbosity=2)
 
 
 if __name__ == "__main__":

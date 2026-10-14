@@ -101,6 +101,10 @@ python3 scripts/account_guard.py --audit \
 
 **别把别的工具的残留说成会被清理。** 扫描会连带命中 `~/.dsh/settings.yaml` 这类别的工具的配置，按范围约定脚本不碰它们，所以表里要写「只报告不代改」，不能写「自动清理会清掉」。
 
+## 结果页：HTML 报告
+
+每跑完一次都会落一份自包含的报告页（`~/ClaudeGuardBackups/report-<时间戳>.html`）：零外部资源、无 JS，完整加固跑完自动打开，`--audit --save-audit` 落盘并打印路径。想在上面**点着修**就跑 `python3 scripts/report_serve.py` —— 本地回环服务加一次性令牌，只给「本来就敢自动做」的项出按钮。详见 `references/report-page.md`。
+
 ## 「绝不直连」怎么判
 
 这一项不靠人眼看，脚本会给出明确结论（A12）。判据落在**代理组**上，不落在规则上：

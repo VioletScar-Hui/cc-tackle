@@ -106,10 +106,106 @@ GEO_WORD_RE = re.compile(
     r"(?<![A-Za-z0-9_/])(?:" + "|".join(re.escape(w) for w in GEO_WORDS) + r")(?![A-Za-z0-9_])"
 )
 
-CLASH_SOCK = pathlib.Path("/tmp/verge/verge-mihomo.sock")
+DEFAULT_CLASH_SOCK = pathlib.Path("/tmp/verge/verge-mihomo.sock")
+# 兼容旧调用方与测试缝：它们会把 CLASH_SOCK 指到 /dev/null 或某个夹具 socket 上。
+# 只要它不等于默认值，下面的探活就完全不介入（见 clash_socket）。
+CLASH_SOCK = DEFAULT_CLASH_SOCK
+# 控制接口的地址不是固定的，别写死：
+#   非服务模式            /tmp/verge/verge-mihomo.sock
+#   2.5 起的「服务模式」  /var/run/clash-verge-service/users/<uid>/verge-mihomo.sock
+# 2026-10-13 实测踩到：Clash Verge 2.5.8 重装特权服务后内核改由服务托管，端点换成后者，
+# 而 GUI 那份 config.yaml 里仍写着前者。写死旧路径的体检会报「控制接口不可达」——
+# 读起来像网络坏了，实际只是端点搬了家。
+CLASH_SOCK_CANDIDATES = (
+    "/var/run/clash-verge-service/users/{uid}/verge-mihomo.sock",
+    "/tmp/verge/verge-mihomo.sock",
+)
 # Clash Verge 出厂就带这个 secret，没改过的话它适用于所有本机部署；
 # 改过就用环境变量 CLASH_SECRET 覆盖，别把某个人的 secret 写进代码。
 CLASH_SECRET = os.environ.get("CLASH_SECRET", "set-your-secret")
+
+_CLASH_SOCK_CACHE: dict = {}
+
+
+def clash_sock_paths() -> list:
+    """按优先级列出候选端点。
+
+    CLASH_SOCK 被显式改过时（测试夹具或调用方指定）只认它 —— 那是这套代码的测试缝，
+    夹具服务收到几个请求是被断言过的，探活多打一次 /version 会让用例失败。
+    """
+    if CLASH_SOCK != DEFAULT_CLASH_SOCK:
+        return [CLASH_SOCK]
+    cands = []
+    try:
+        cfg = (clash_dir() / "config.yaml").read_text(encoding="utf-8")
+    except OSError:
+        cfg = ""
+    for line in cfg.splitlines():
+        if line.startswith("external-controller-unix:"):
+            value = line.split(":", 1)[1].strip().strip("\"'")
+            if value:
+                cands.append(pathlib.Path(value))
+    cands += [pathlib.Path(p.format(uid=os.getuid())) for p in CLASH_SOCK_CANDIDATES]
+    out = []
+    for c in cands:
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def _path_exists(p) -> bool:
+    try:
+        return bool(p.exists())
+    except OSError:
+        return False
+
+
+def _probe_clash_socket(path) -> bool:
+    """只读探活：连上问一句 /version。不经过 clash_http，避免递归。"""
+    import http.client
+    import socket as _socket
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(3)
+    try:
+        sock.connect(str(path))
+        sock.sendall(("GET /version HTTP/1.1\r\nHost: localhost\r\n"
+                      f"Authorization: Bearer {CLASH_SECRET}\r\n"
+                      "Connection: close\r\n\r\n").encode())
+        response = http.client.HTTPResponse(sock)
+        response.begin()
+        ok = response.status == 200
+        response.read()
+        return ok
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+    finally:
+        sock.close()
+
+
+def clash_socket():
+    """返回该用的控制端点；一个都不存在时返回 None。
+
+    默认路径下按候选逐个探活，挑第一个真能应答的；全都探不通时退回「第一个存在的端点」，
+    让真实请求去定夺（探活本身失败不该把整项判成不可达）。被显式改过时直接用它，不探活。
+    """
+    paths = clash_sock_paths()
+    key = tuple(str(p) for p in paths)
+    if key in _CLASH_SOCK_CACHE:
+        return _CLASH_SOCK_CACHE[key]
+    if CLASH_SOCK != DEFAULT_CLASH_SOCK:
+        chosen = CLASH_SOCK if _path_exists(CLASH_SOCK) else None
+        _CLASH_SOCK_CACHE[key] = chosen
+        return chosen
+    existing = [p for p in paths if _path_exists(p)]
+    chosen = None
+    for p in existing:
+        if _probe_clash_socket(p):
+            chosen = p
+            break
+    if chosen is None and existing:
+        chosen = existing[0]
+    _CLASH_SOCK_CACHE[key] = chosen
+    return chosen
 
 
 def _new_loopback_server(handler):
@@ -152,10 +248,12 @@ def clash_http(method: str, path: str, body: bytes | None = None,
         raise ValueError("Clash API 路径必须以 / 开头")
     if any(ord(ch) < 0x20 for ch in CLASH_SECRET) or "\r" in CLASH_SECRET or "\n" in CLASH_SECRET:
         raise ValueError("Clash secret 含非法控制字符，拒绝发送")
+    # 端点会搬家（服务模式在 /var/run，非服务模式在 /tmp），先挑一个能用的。
+    target = clash_socket() or CLASH_SOCK
     # Unit tests use /dev/null as a socket sentinel and replace ``run`` with a
     # response fixture.  Keep that seam secret-free; real sockets always use
     # the stdlib path below.
-    if CLASH_SOCK == pathlib.Path("/dev/null") or not CLASH_SOCK.is_socket():
+    if target == pathlib.Path("/dev/null") or not target.is_socket():
         code, response = run(["__claude_guard_clash_fixture__", method.upper(), path], timeout=timeout)
         if method.upper() != "GET" and code == 0 and (response or "").strip().isdigit():
             return int(response.strip()), ""
@@ -169,7 +267,7 @@ def clash_http(method: str, path: str, body: bytes | None = None,
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
-        sock.connect(str(CLASH_SOCK))
+        sock.connect(str(target))
         sock.sendall(request)
         try:
             response = http.client.HTTPResponse(sock)
@@ -823,7 +921,6 @@ def _read_fake_ip_prefixes() -> tuple:
     """
     for p in (
         HOME / "Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml",
-        CLASH_SOCK,
     ):
         try:
             if p.suffix in (".yaml", ".yml"):
@@ -1004,7 +1101,10 @@ def check_clash_groups() -> dict:
         "global_now": None, "claude_group": {}, "fail_closed": {},
         "claude_rules": [], "fallback": None,
     }
-    if not CLASH_SOCK.exists():
+    out["sock_tried"] = [str(p) for p in clash_sock_paths()]
+    resolved = clash_socket()
+    out["sock"] = str(resolved) if resolved else ""
+    if resolved is None:
         return out
 
     def api(path):
@@ -2732,7 +2832,10 @@ def build_summary(report: dict) -> list:
     # ── 代理与线路 ──
     fc = cg.get("fail_closed") or {}
     if not cg.get("reachable"):
-        add("绝不直连", S_NA, "Clash 控制接口不可达，这一项没测到")
+        tried = "、".join(cg.get("sock_tried") or [])
+        add("绝不直连", S_NA,
+            f"Clash 控制接口不可达，这一项没测到（试过：{tried}）" if tried
+            else "Clash 控制接口不可达，这一项没测到")
     elif fc.get("ok"):
         # 两种模式下「成立」的理由不同，说明文字也得跟着变，否则会写出让人误解的链路
         grp = cg.get("claude_group") or {}
@@ -3027,6 +3130,20 @@ def build_summary(report: dict) -> list:
             "无冲突" if not tension else "时区在东亚、出口在美国（文章两条建议互斥，已确认按此组合走，无需改动）")
 
     return rows
+
+
+def write_html_twin(before: dict, after: dict) -> None:
+    """把这一轮的结果落成 HTML 报告并用默认浏览器打开。
+
+    报告是给人看的附属产物：渲染失败只提示、不往上抛，否则一次成功的加固会因为模板里
+    某个字段没对上而以 traceback 收场。
+    """
+    try:
+        from report_html import write_report
+        page = write_report(after, before=before, open_it=True)
+        print(f"\nHTML 报告：{page}")
+    except Exception as error:      # 同上：附属产物不该影响主流程的结论
+        print(f"\nHTML 报告生成失败（上面的结论不受影响）：{error}", file=sys.stderr)
 
 
 def print_summary_table(report: dict) -> None:
@@ -3326,6 +3443,28 @@ def check_claude_storage() -> dict:
     if not out["cli"]["all"] and not out["bundled"]["all"]:
         out["note"] = "没找到 Claude CLI 的安装目录，这一项跳过"
     return out
+
+
+def write_cleanup_manifest(reason: str, items: list, extra: dict = None) -> pathlib.Path:
+    """把「这次删了什么」写成一份账本，落在备份目录里。
+
+    为什么必须有：这些文件是直接 rmtree/unlink 的，不像改配置文件那样有备份可对照。
+    clean_claude_storage 的注释写着「账本由调用方写」，但两条调用路径原先都没写，
+    于是删掉几百 MB 之后除了终端输出查无此事（2026-10-13 发现并补上）。
+    """
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    path = BACKUP_ROOT / f"cleanup-{stamp}.json"
+    body = {
+        "createdAt": dt.datetime.now().isoformat(),
+        "reason": reason,
+        "items": items,
+        "totalBytes": sum(int(i.get("bytes") or 0) for i in items if i.get("ok")),
+    }
+    if extra:
+        body.update(extra)
+    path.write_text(json.dumps(body, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
 
 
 def clean_claude_storage(report: dict) -> list[dict]:
@@ -4904,7 +5043,7 @@ def clear_clash_dns_leak(rep: dict) -> str:
     except (OSError, ValueError, TimeoutError, RuntimeError):
         # Tests may replace the command runner while using a missing socket;
         # this fixture carries only method/path and never the authorization.
-        if not CLASH_SOCK.exists():
+        if not (clash_socket() or CLASH_SOCK).is_socket():
             fixture_code, fixture_body = run(["__claude_guard_clash_fixture__", "PUT", "/configs"], timeout=10)
             code_s = int((fixture_body or "0").strip()) if fixture_code == 0 and (fixture_body or "").strip().isdigit() else 0
         else:
@@ -5506,7 +5645,8 @@ def print_audit(r: dict) -> None:
         elif fc:
             print("    ⚠ 绝不直连不成立：" + "；".join(fc.get("reasons", [])))
     else:
-        print("  Clash   ：控制接口不可达，跳过")
+        tried = "、".join(g.get("sock_tried") or [])
+        print("  Clash   ：控制接口不可达，跳过" + (f"（试过：{tried}）" if tried else ""))
 
     print("\n═══ 残留与完整性 ═══")
     b = r["A2_anthropic_base_url"]
@@ -5848,6 +5988,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.save_audit:
             p = save_audit_report(report)
             print(f"\n报告已存：{p}")
+            try:
+                from report_html import write_report
+                print(f"HTML 版  ：{write_report(report, report_path=str(p))}")
+            except Exception as error:
+                print(f"HTML 版生成失败（上面的结论不受影响）：{error}", file=sys.stderr)
         else:
             print("\n只读审计未写入报告、出口历史或缓存；如需保存请加 --save-audit。")
         return 0
@@ -6000,13 +6145,17 @@ def main(argv: list[str] | None = None) -> int:
         cleanup_errors = []
         if do_storage:
             _mark_backup_in_progress(backup, "storage")
-            for d in clean_claude_storage(report):
+            storage_done = clean_claude_storage(report)
+            for d in storage_done:
                 label = d["path"].replace(str(HOME) + "/", "")
                 if d.get("ok"):
                     print(f"       已清 {label}  ({d.get('bytes', 0) / 2 ** 20:.0f} MB)")
                 else:
                     print(f"       跳过 {label} —— {d.get('error')}")
                     cleanup_errors.append(f"存储 {label}：{d.get('error')}")
+            if storage_done:
+                # 删掉的东西没有备份可对照，账本必须写：事后能查「哪一次删了哪些路径」。
+                print(f"       账本 {write_cleanup_manifest('系统级 Claude 环境按需清理', storage_done)}")
             _refresh_backup_manifest(backup, "storage")
 
         if do_dead_permissions:
@@ -6110,6 +6259,7 @@ def main(argv: list[str] | None = None) -> int:
             if "A7_webrtc" in report:
                 fresh["A7_webrtc"] = report["A7_webrtc"]
             print_before_after(report, fresh)
+            write_html_twin(report, fresh)
         except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
             raise RuntimeError(f"复检失败：{error}；已执行改动的回滚路径：{backup}") from error
         return 0
