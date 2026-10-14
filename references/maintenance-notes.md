@@ -18,6 +18,17 @@
 
 工作树的 `.git` 是文件（内容指向真实 gitdir），不能用目录存在性当作仓库判断；`.claude/worktrees/.DS_Store` 这类孤立文件也不应计为工作树。
 
+## 测试的环境隔离
+
+这套用例的结果不能取决于开发机 exports 了什么。`main()` 是**按体检结果问不定数量的问题**的，可清理项多一项就多一问；而 `auto_clean_plan` 里有一项是现场读环境的：`"project_junk": bool(project_roots())`（只看有没有配项目根，不看真有没有垃圾）。2026-10-14 因此出过一次「环境串味」：开发机 `export CLAUDE_GUARD_PROJECT_ROOTS=...`，交互多出「清理项目级 .claude 垃圾」一问，用例里写死的四段答案错位，5 个用例报 `StopIteration`（完全看不出是哪个问题对不上），自检跟着变红；同一份代码在不带变量的终端里跑就是全绿。
+
+两处防线：
+
+- `tests/test_account_guard.py` 的 `setUpModule()` 在整套用例开始前摘掉所有 `CLAUDE_GUARD_*`，`tearDownModule()` 结束再放回。需要某个变量才能测的用例自己用 `mock.patch.dict` 设。
+- `prompt_answering()` 按**提示语**作答而不是按顺序：CONFIRM 那一问回 `CONFIRM`，含「遥测开关」的回合选项号，带 `[y/N]` 的（`ask_yes` 自己补的标记）回 `y`/`n`；认不出来的提示语直接 `AssertionError` 并带上原文。改 `main()` 的问句顺序不会再让用例炸成看不懂的报错。
+
+改完必须**两种环境各跑一遍**（带 `CLAUDE_GUARD_PROJECT_ROOTS` 和不带），两边都全过才算修好。跑自检时若单测红，`selfcheck.py` 会把整套输出落到 `~/ClaudeGuardBackups/tests-failure-<时间戳>.log` 并在说明里给出路径——只留摘要不留现场，问题就不可复现。
+
 ## 必须人工处理的事项
 
 ```bash

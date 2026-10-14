@@ -4,7 +4,7 @@
 把散在 SKILL.md 和桌面指令文档各节的复核命令串成一条。检查七件事：技能文件
 齐全 → 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四
 开关 → 完整环境体检，跑完出两张表：先一张七项自检的结论表，再把最后那项
-「完整环境体检」的 25 项逐条展开（明细取自体检自己输出的 JSON，判定不在
+「完整环境体检」的 26 项逐条展开（明细取自体检自己输出的 JSON，判定不在
 这里重写一遍，免得两处各说各话）。
 
 用法：
@@ -110,7 +110,17 @@ def check_tests() -> None:
     # 所以这里既看退出码也看末尾的 OK。
     fails = [ln.strip() for ln in out.splitlines()
              if ln.startswith(("FAIL:", "ERROR:", "AssertionError"))]
-    add("单元测试", BAD, f"{n} 个用例里有失败：" + ("；".join(fails[:3]) or tail(out)))
+    # 2026-10-14：有两次自检报出同样三个 ERROR，可当时只留了三行名字，事后回溯不出去
+    # （那三个用例随后单跑、连跑、并发跑都是 OK）。完整输出落盘，下次能查到现场。
+    log = ""
+    try:
+        g.BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+        path = g.BACKUP_ROOT / f"tests-failure-{g.now_stamp()}.log"
+        path.write_text(out, encoding="utf-8")
+        log = f"；完整输出：{path}"
+    except Exception as exc:  # 日志失败不能盖过测试失败本身
+        log = f"；完整输出落盘失败（{type(exc).__name__}）"
+    add("单元测试", BAD, f"{n} 个用例里有失败：" + ("；".join(fails[:3]) or tail(out)) + log)
 
 
 # ── 4. 三个 LaunchAgent 守护 ─────────────────────────────────────────
@@ -256,8 +266,14 @@ def check_audit(project_roots: str = ""):
     detail = f"{total} 项：已解决 {solved}、待处理 {todo}、未解决 {bad}、未测到 {na}"
     if bad:
         add("完整环境体检", BAD, detail + "；有未解决项，跑不带参数的 account_guard.py 处理")
-    elif todo or na:
-        add("完整环境体检", HINT, detail + "；有待处理的，跑不带参数的 account_guard.py 处理")
+    elif todo:
+        add("完整环境体检", HINT, detail + "；有可自动处理的，跑不带参数的 account_guard.py 处理")
+    elif na:
+        # 只有「未测到」时别说成有待处理：那些项要么是设计如此（浏览器复核要现场开一次），
+        # 要么得声明目标（预期出口），跑加固流程并不能把它们变绿。
+        add("完整环境体检", HINT,
+            detail + "；这些不是待处理，是需要现场复核或先声明目标："
+                     "python3 scripts/account_guard.py --commands 里给了逐条命令")
     else:
         add("完整环境体检", OK, detail)
     return "", report

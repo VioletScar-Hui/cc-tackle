@@ -25,6 +25,7 @@ import html
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -48,8 +49,8 @@ GROUPS = (
     ("代码与仓库", ("代码是否落在本地 Git",)),
 )
 
-# 每一行的依据来自报告里的哪个字段。「看依据」按钮就把这几个字段原样摊开，
-# 不做二次加工，免得页面上的说法和原始读数对不上。
+# 每一行的依据来自报告里的哪个字段。「看依据」按钮把这几个字段摊开，数值不动，
+# 只摘掉出处标注；页面上的说法和原始读数仍然对得上。
 ROW_SOURCE = {
     "出口 IP 与归属": ("A1_export_ip",),
     "出口 ASN 类型": ("A1_export_ip",),
@@ -358,13 +359,18 @@ def _fix_bar(name: str, live, actions) -> str:
 
 
 def _evidence(rep: dict, name: str) -> str:
-    """一行结论的原始依据：把来源字段原样贴出来，不做二次加工。"""
+    """一行结论的原始依据：把来源字段贴出来，数值与结构不改。
+
+    唯一的加工是把「文章 §2.2」这类出处标注摘掉（strip_article_refs）——页面是给人看的
+    结论页，不带出处；落盘的报告 JSON 里出处完好，要看原始措辞去
+    ~/ClaudeGuardBackups/audit-*.json。
+    """
     keys = ROW_SOURCE.get(name) or ()
     blocks = []
     for k in keys:
         if k not in rep:
             continue
-        body = json.dumps(rep[k], ensure_ascii=False, indent=2)
+        body = strip_article_refs(json.dumps(rep[k], ensure_ascii=False, indent=2))
         if len(body) > EVIDENCE_CAP:
             body = body[:EVIDENCE_CAP] + "\n… （已截断，完整内容见报告 JSON）"
         blocks.append(f"<pre>{_esc(body)}</pre>")
@@ -373,21 +379,75 @@ def _evidence(rep: dict, name: str) -> str:
     return "".join(blocks)
 
 
+_ARTICLE_QUOTE = re.compile(r"文章原话[：:]?「[^」]*」")
+_PAREN = re.compile(r"（[^）]*）")
+_HAS_WORD = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]")
+
+
+def strip_article_refs(text: str) -> str:
+    """把「文章 2.2」「文章原话：「…」」这类出处从页面文字里摘掉。
+
+    页面是结论页：读的人要的是做什么，不是这句话出自哪里。逐条出处留在
+    references/article-mapping.md 里备查，页面不带。规则分四步：
+
+    1. 整段引文（文章原话「…」）连引号一起删掉；
+    2. 括号内按逗号拆，含「文章」的那一截删掉；括号里全被删光就整对括号删掉；
+    3. 括号外按句号、分号拆，含「文章」的整句删掉；整句只剩标点就丢；
+       一句话里只有前半截带出处时，再按逗号拆一次，保留没出处的后半截；
+    4. 收尾扫掉多余标点、空括号和残留的破折号。
+    """
+    if not text or "文章" not in text:
+        return text
+
+    t = _ARTICLE_QUOTE.sub("", text)
+
+    def _paren(match):
+        inner = match.group(0)[1:-1]
+        kept = [part for part in inner.split("，") if "文章" not in part]
+        return f"（{'，'.join(kept)}）" if kept else ""
+
+    t = _PAREN.sub(_paren, t)
+
+    kept = []
+    for sentence in re.split(r"(?<=[。；])", t):
+        if "文章" not in sentence:
+            kept.append(sentence)
+            continue
+        rest = "".join(part for part in re.split(r"(?<=[，])", sentence) if "文章" not in part)
+        if _HAS_WORD.search(rest):
+            kept.append(rest)
+    t = "".join(kept)
+
+    t = re.sub(r"[，、；]{2,}", "，", t)
+    t = re.sub(r"^[，。、；：—－\s]+", "", t)
+    t = re.sub(r"[，、；：\s]+$", "", t)
+    t = re.sub(r"[—－]{2,}$", "", t.strip())
+    t = t.replace("（）", "")
+    # 引文夹在句子中间时（「文章原话：「老 Gmail 更稳」的说法…」），删掉引文会剩下一个
+    # 悬空的「的」，补一个「这」把它接回去
+    if t.startswith("的"):
+        t = "这种" + t[1:]
+    return t.strip()
+
+
 def _manual_html(manual) -> str:
     out = []
     for grp in manual:
         title, items = grp[0], grp[1]
         body = []
         for it in items:
-            name, src, steps, note = (list(it) + [None] * 4)[:4]
+            name, _src, steps, note = (list(it) + [None] * 4)[:4]
             lis = "".join(f"<li>{_esc(s)}</li>" for s in (steps or ()))
+            # 出处标签（文章 2.2 这种）不进页面；说明里带出处的部分也一并摘掉
+            name = strip_article_refs(name)
+            note = strip_article_refs(note) if note else ""
             body.append(
-                f"<h4>{_esc(name)}<span>{_esc(src)}</span></h4>"
+                f"<h4>{_esc(name)}</h4>"
                 f"<ol>{lis}</ol>"
                 + (f"<div class='why'>{_esc(note)}</div>" if note else "")
             )
         out.append(
-            f"<details class='manual'><summary>{_esc(title)}<em>{len(items)} 条</em></summary>"
+            f"<details class='manual'><summary>{_esc(strip_article_refs(title))}<em>{len(items)} 条</em></summary>"
             f"<div class='ma'>{''.join(body)}</div></details>"
         )
     return "".join(out)
@@ -447,7 +507,7 @@ def render(report: dict, before: dict = None, report_path=None,
             f"<div class='item {k}'><div class='dot'>{mark}</div><div style='flex:1'>"
             f"<div class='name-row'><div class='name'>{_esc(name)}</div>"
             f"{_fix_bar(name, live, actions)}</div>"
-            f"<div class='detail'>{_esc(detail) or '（没有说明）'}</div>"
+            f"<div class='detail'>{_esc(strip_article_refs(detail)) or '（没有说明）'}</div>"
             f"<details><summary>看依据</summary>{_evidence(report, name)}</details>"
             f"</div></div>"
         )
@@ -459,11 +519,11 @@ def render(report: dict, before: dict = None, report_path=None,
             f"<div class='item {_kind(r[1])}'><div class='dot'>{'!' if _kind(r[1])=='warn' else '✗'}</div>"
             f"<div style='flex:1'><div class='name-row'><div class='name'>{_esc(r[0])}</div>"
             f"{_fix_bar(r[0], live, actions)}</div>"
-            f"<div class='detail'>{_esc(r[2])}</div></div></div>"
+            f"<div class='detail'>{_esc(strip_article_refs(r[2]))}</div></div></div>"
             for r in todo
         )
     else:
-        todo_html = "<div class='card'>25 项全部通过，不需要你做任何事。</div>"
+        todo_html = f"<div class='card'>{len(rows)} 项全部通过，不需要你做任何事。</div>"
 
     changed = ""
     if before_rows:

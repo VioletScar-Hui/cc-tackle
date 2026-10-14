@@ -36,6 +36,74 @@ import report_serve as rs  # noqa: E402
 import selfcheck as selfcheck_module  # noqa: E402
 
 
+_SAVED_GUARD_ENV: dict = {}
+
+
+def setUpModule() -> None:
+    """跑测试前把 CLAUDE_GUARD_* 环境变量摘掉。
+
+    这套用例必须与开发机的环境无关。main() 是**按体检结果问不定数量的问题**的：
+    多一项可清理就多一问，而 auto_clean_plan 里还有几项是现场读环境的
+    （`project_junk` 只看有没有配项目根）。所以开发机 export 了
+    CLAUDE_GUARD_PROJECT_ROOTS，交互就多一问，写死答案序列的用例会炸成
+    StopIteration —— 那是环境串味，不是代码坏了。2026-10-14 实测：
+    带这几个变量跑自检里的单测，5 个用例报 StopIteration，跑 759 秒；
+    不带就是 507 个全过、45 秒。
+    """
+    for key in [k for k in os.environ if k.startswith("CLAUDE_GUARD_")]:
+        _SAVED_GUARD_ENV[key] = os.environ.pop(key)
+
+
+def tearDownModule() -> None:
+    os.environ.update(_SAVED_GUARD_ENV)
+
+
+def prompt_answering(telemetry: str = "0", yes: bool = False):
+    """按提示语本身作答，不按「第几个问题」作答。
+
+    写死 `side_effect=["0", "n", "n", "CONFIRM"]` 会随环境炸掉（见 setUpModule），
+    而且报出来的是 StopIteration，看不出是哪个问题对不上。这里改成读提示语：
+    CONFIRM 那一问回 CONFIRM，遥测那一问回选项号，其余问句一律 n（要 yes 就 y）。
+    遇到认不出来的提示语直接报错并带上原文，免得又变成看不懂的 StopIteration。
+    """
+    def answer(prompt: str = "") -> str:
+        text = str(prompt)
+        if "CONFIRM" in text:
+            return "CONFIRM"
+        if "遥测开关" in text:
+            return telemetry
+        if "[y/N]" in text:          # ask_yes 会自己补上 "[y/N]："，别按问号判
+            return "y" if yes else "n"
+        raise AssertionError(f"测试没准备这个问题的答案：{text!r}")
+    return answer
+
+
+class TestHarnessIsolation(unittest.TestCase):
+    """守门：这套用例不能读开发机的 CLAUDE_GUARD_* 环境。
+
+    2026-10-14 出过一次「环境串味」：开发机 export 了 CLAUDE_GUARD_PROJECT_ROOTS，
+    main() 的交互就多一问（清项目级 .claude 垃圾），而用例里写死了四段答案，
+    于是 5 个用例报 StopIteration，自检跟着变红。代码没坏，是测试继承了环境。
+    """
+
+    def test_guard_env_is_scrubbed_for_the_whole_run(self):
+        leftovers = [k for k in os.environ if k.startswith("CLAUDE_GUARD_")]
+        self.assertEqual(leftovers, [], f"测试期间不该有这些环境变量：{leftovers}")
+
+    def test_prompt_helper_matches_the_three_shapes(self):
+        answer = prompt_answering(telemetry="2")
+        self.assertEqual(answer("完全理解后输入 CONFIRM 开始；其他输入取消："), "CONFIRM")
+        self.assertEqual(answer("遥测开关：0 保持；1 关三项。选择 [0]："), "2")
+        self.assertEqual(answer("生成 claude-safe 包装脚本？ [y/N]："), "n")
+        self.assertEqual(prompt_answering(yes=True)("随便一问？ [y/N]："), "y")
+
+    def test_prompt_helper_refuses_unknown_prompts(self):
+        # 认不出来时必须炸，并且把提示语原文带出来；否则又会退化成一个看不懂的 StopIteration
+        with self.assertRaises(AssertionError) as ctx:
+            prompt_answering()("裸提示符> ")
+        self.assertIn("裸提示符", str(ctx.exception))
+
+
 class TestClassifyAsn(unittest.TestCase):
     """文章 2.3：出口 ASN 类型必须是 ISP / Residential，不能是 Hosting。"""
 
@@ -209,7 +277,7 @@ class TestProxyResidueSafety(unittest.TestCase):
         with mock.patch.object(g, "run", side_effect=fake_run):
             with self.assertRaises(RuntimeError) as ctx:
                 g.clear_proxy_residue(residue)
-        self.assertIn("状态已变化", str(ctx.exception))
+        self.assertIn("变成了启用状态", str(ctx.exception))
 
     def test_counts_only_when_disabled(self):
         residue = [{"service": "Wi-Fi", "kind": "webproxy", "server": "127.0.0.1", "port": "7897"}]
@@ -229,6 +297,27 @@ class TestProxyResidueSafety(unittest.TestCase):
     def test_empty_residue_is_noop(self):
         self.assertEqual(g.clear_proxy_residue([]), 0)
 
+    def test_already_clean_after_audit_is_not_a_failure(self):
+        """报告之后被别人清掉了，目标状态已达成，不该报失败。
+
+        2026-10-14 真机点按钮实测撞上的就是这一态：定时脚本
+        local.proxy-residue-cleanup 每 5 分钟跑一次，抢在前面把残留清了。
+        旧版直接抛「状态已变化」，页面上显示「这几项没成」，行也一直红着。
+        """
+        residue = [{"service": "Wi-Fi", "kind": "webproxy", "server": "127.0.0.1", "port": "7897"}]
+        issued = []
+
+        def fake_run(cmd, timeout=20):
+            if "networksetup" in cmd and "-getwebproxy" in cmd:
+                return 0, "Enabled: No\nServer: 0.0.0.0\nPort: 0\n"
+            issued.append(cmd)
+            return 0, ""
+
+        with mock.patch.object(g, "run", side_effect=fake_run):
+            self.assertEqual(g.clear_proxy_residue(residue), 0)
+        self.assertEqual(g.clear_proxy_residue.skipped, 1)
+        self.assertEqual(issued, [], "已经是干净的，一个写操作都不该发")
+
     def test_refuses_when_residue_changed_after_audit(self):
         residue = [{"service": "Wi-Fi", "kind": "webproxy", "server": "127.0.0.1", "port": "7897"}]
 
@@ -238,7 +327,7 @@ class TestProxyResidueSafety(unittest.TestCase):
             return 0, ""
 
         with mock.patch.object(g, "run", side_effect=fake_run):
-            with self.assertRaisesRegex(RuntimeError, "状态已变化"):
+            with self.assertRaisesRegex(RuntimeError, "换成了别的值"):
                 g.clear_proxy_residue(residue)
 
 
@@ -527,7 +616,7 @@ class TestFailureReporting(unittest.TestCase):
              mock.patch.object(g, "print_audit"), \
              mock.patch.object(g, "apply_telemetry", side_effect=lambda m: (calls.append(m), boom())[1]), \
              mock.patch.object(g.sys, "stdin", mock.Mock(isatty=lambda: True)), \
-             mock.patch("builtins.input", side_effect=["2", "n", "n", "CONFIRM"]), \
+             mock.patch("builtins.input", side_effect=prompt_answering(telemetry="2")), \
              mock.patch.object(g.sys, "stdout", io.StringIO()), \
              mock.patch.object(g.sys, "stderr", err):
             rc = g.main([])
@@ -727,7 +816,7 @@ class TestAllowedChanges(unittest.TestCase):
              mock.patch.object(g, "audit", return_value=report), \
              mock.patch.object(g, "print_audit"), \
              mock.patch.object(g.sys, "stdin", mock.Mock(isatty=lambda: True)), \
-             mock.patch("builtins.input", side_effect=["0", "n", "n", "CONFIRM"]), \
+             mock.patch("builtins.input", side_effect=prompt_answering()), \
              mock.patch.object(g.sys, "stdout", io.StringIO()), \
              mock.patch.object(g.sys, "stderr", io.StringIO()):
             rc = g.main([])
@@ -5077,6 +5166,40 @@ class TestHtmlReport(unittest.TestCase):
         rep.update(over)
         return rep
 
+    def test_page_carries_no_article_citations(self):
+        """页面是结论页：读的人要做什么，不需要知道出自哪篇文章。
+
+        出处与逐条映射留在 references/article-mapping.md 和落盘的报告 JSON 里；
+        这一条守着「页面里一个字都不提出处」，免得哪天又把「文章 2.2」渲染回来。
+        """
+        h = rh.render(self._report())
+        self.assertNotIn("文章", h)
+        self.assertNotIn("§", h)
+
+    def test_strip_keeps_the_advice_and_drops_the_quote(self):
+        self.assertEqual(
+            rh.strip_article_refs("文章原话：「两端要对齐」。两道都要关，只关自动设置不够"),
+            "两道都要关，只关自动设置不够")
+        self.assertEqual(
+            rh.strip_article_refs("文章 2.6 把它列进「一号一环境」的必做项。这一步没有本地接口"),
+            "这一步没有本地接口")
+
+    def test_strip_keeps_the_half_of_a_parenthetical_that_matters(self):
+        self.assertEqual(
+            rh.strip_article_refs("时区在东亚、出口在美国（文章两条建议互斥，已确认按此组合走，无需改动）"),
+            "时区在东亚、出口在美国（已确认按此组合走，无需改动）")
+        self.assertEqual(rh.strip_article_refs("五、使用行为（文章称为「第三层」）"), "五、使用行为")
+
+    def test_strip_repairs_a_dangling_particle(self):
+        # 引文夹在句子中间时，删掉会剩下「的说法没有公开依据」这种断头话
+        self.assertEqual(
+            rh.strip_article_refs("文章原话：「老 Gmail 更稳」的说法没有公开依据"),
+            "这种说法没有公开依据")
+
+    def test_strip_leaves_clean_text_alone(self):
+        for text in ("没有出处的一句话", "", "出口 IP 与归属"):
+            self.assertEqual(rh.strip_article_refs(text), text)
+
     def test_page_is_self_contained(self):
         h = rh.render(self._report())
         self.assertNotIn('src="http', h)
@@ -5127,6 +5250,112 @@ class TestHtmlReport(unittest.TestCase):
         self.assertIn("<!DOCTYPE html>", body)
 
 
+class TestFixButtonBacksUpFirst(unittest.TestCase):
+    """点页面上的修复按钮时，备份必须是「改动之前」的那一份。
+
+    2026-10-14 实测抓到过顺序反的那版：State.fix 先 apply 再 create_backup，
+    于是备份目录里的 .zshrc 已经没有那行代理了——照着它回滚，等于把改完的状态
+    再写一遍，等于没有备份。终端流程一直是「备份先拍」，两边现在一致。
+    """
+
+    def _sandbox(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / ".zshrc").write_text(
+            "# 注释要保留\nexport EDITOR=vim\nexport HTTPS_PROXY=http://127.0.0.1:7897\n",
+            encoding="utf-8")
+        report = {
+            "A1_terminal_env": {
+                "rc_files": {".zshrc": [{"line": 3,
+                                         "text": "export HTTPS_PROXY=http://127.0.0.1:7897"}]},
+                "npm": {}, "git": {}, "env_hits": [], "env_info": [],
+            },
+            "A2_anthropic_base_url": {"hits": []},
+            "A1_proxy_residue": {"residue": [], "enabled": [], "scutil": {}, "network_services": []},
+        }
+        patcher = mock.patch.object(g, "HOME", tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        bp = mock.patch.object(g, "BACKUP_ROOT", tmp / "backups")
+        bp.start()
+        self.addCleanup(bp.stop)
+        return tmp, report
+
+    def test_backup_holds_the_pre_fix_content(self):
+        tmp, report = self._sandbox()
+        rs.State(report).fix("rc_proxy")
+        copies = list((tmp / "backups").glob("guard-*/files/*.zshrc"))
+        self.assertTrue(copies, "必须留下备份")
+        self.assertIn("HTTPS_PROXY", copies[0].read_text(encoding="utf-8"),
+                      "备份里必须是改动前的原文，否则回滚等于把改完的状态再写一遍")
+        self.assertNotIn("HTTPS_PROXY", (tmp / ".zshrc").read_text(encoding="utf-8"),
+                         "线上那份要真的清干净")
+        self.assertIn("EDITOR=vim", (tmp / ".zshrc").read_text(encoding="utf-8"))
+
+    def test_backup_failure_leaves_everything_alone(self):
+        tmp, report = self._sandbox()
+        boom = mock.patch.object(g, "create_backup", side_effect=RuntimeError("备份不了"))
+        boom.start()
+        self.addCleanup(boom.stop)
+        with self.assertRaises(RuntimeError):
+            rs.State(report).fix("rc_proxy")
+        self.assertIn("HTTPS_PROXY", (tmp / ".zshrc").read_text(encoding="utf-8"),
+                      "备份失败时一个字符都不该改")
+
+
+class TestDeadPermsFixIsBackedUp(unittest.TestCase):
+    """settings 失效权限这一笔也必须先备份。
+
+    2026-10-14 实测抓到：报告里 dead[].file 存的是相对家目录的路径
+    （account_guard.py 里 rel = str(f).replace(str(HOME) + "/", "")），而
+    _paths_dead_perms 原来直接 pathlib.Path(f)，相对路径 is_file() 为假，
+    于是这一笔在没有备份的情况下改了文件。修法：g.HOME / f（pathlib 对
+    绝对路径返回 f 本身，两种形态都对）。
+    """
+
+    def _sandbox(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        settings = tmp / "ipe" / "demo" / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps(
+            {"permissions": {"allow": ["Bash(git status)", "Bash(kill 4321)"]}}),
+            encoding="utf-8")
+        report = {
+            "A1_terminal_env": {"rc_files": {}, "npm": {}, "git": {},
+                                "env_hits": [], "env_info": []},
+            "A2_anthropic_base_url": {"hits": []},
+            "A1_proxy_residue": {"residue": [], "enabled": [],
+                                 "scutil": {}, "network_services": []},
+            "A26_claude_settings": {"dead": [
+                {"file": "ipe/demo/.claude/settings.json",
+                 "rule": "Bash(kill 4321)", "why": "一次性的 PID"}]},
+        }
+        patcher = mock.patch.object(g, "HOME", tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        bp = mock.patch.object(g, "BACKUP_ROOT", tmp / "backups")
+        bp.start()
+        self.addCleanup(bp.stop)
+        return tmp, settings, report
+
+    def test_relative_report_path_is_resolved_and_backed_up(self):
+        tmp, settings, report = self._sandbox()
+        message = rs.State(report).fix("dead_permissions")
+        copies = list((tmp / "backups").glob("guard-*/files/*settings.json"))
+        self.assertTrue(copies, "报告存相对路径时也要解析到家目录下再备份")
+        self.assertIn("Bash(kill 4321)", copies[0].read_text(encoding="utf-8"),
+                      "备份里必须是删之前的原文")
+        self.assertIn("备份", message)
+
+    def test_live_file_keeps_the_good_rule(self):
+        tmp, settings, report = self._sandbox()
+        rs.State(report).fix("dead_permissions")
+        live = settings.read_text(encoding="utf-8")
+        self.assertNotIn("kill 4321", live, "一次性 PID 的授权要真的删掉")
+        self.assertIn("Bash(git status)", live, "正常授权要留着")
+
+
 class TestReportServe(unittest.TestCase):
     """报告页的按钮：只认白名单动作、只认带令牌的请求、静态页不出按钮。
 
@@ -5136,7 +5365,11 @@ class TestReportServe(unittest.TestCase):
 
     REPORT = {
         "timestamp": "2026-10-13 22:00:00",
-        "A1_proxy_residue": {"residue": [], "enabled": {}},
+        # 这里必须留一项「未启用但存着值」的残留：按钮只挂在待处理的行上，
+        # 全绿的报告页是没有任何修复按钮的（2026-10-14 改成按行状态出按钮）。
+        "A1_proxy_residue": {"residue": [{"service": "Wi-Fi", "kind": "web",
+                                          "server": "127.0.0.1", "port": 7897}],
+                             "enabled": {}},
         "A12_clash_groups": {"reachable": True, "mode": "rule",
                              "tun": {"enable": True, "strict-route": True},
                              "claude_group": {"type": "Selector", "now": "N1", "members": ["N1"]},
@@ -5253,12 +5486,161 @@ class TestReportServe(unittest.TestCase):
         self.assertEqual(body["source"], "test")
 
 
-if __name__ == "__main__":
-    # 这个块必须待在文件最末尾。2026-10-10 发现它一度停在中间（第 2403 行），
-    # 于是它后面定义的 6 个类、40 个用例从来没被执行过——`unittest.main()` 在第 2403
-    # 行就跑完了收集，而那几个类那时还没被定义。症状是「测试全过」，实际只跑了
-    # 227/267。往这个文件里加用例时，务必加在下面这行之上。
-    unittest.main(verbosity=2)
+class TestDeclaredExpected(unittest.TestCase):
+    """预期出口是你自己的声明：命令行优先，其次环境变量，都没有才算没声明。"""
+
+    def setUp(self):
+        for name in (g.EXPECTED_COUNTRY_ENV, g.EXPECTED_EXIT_IP_ENV):
+            self.addCleanup(os.environ.pop, name, None)
+            os.environ.pop(name, None)
+
+    def _fake_ip(self):
+        return {"ip": "198.51.100.10", "country": "US", "city": "Springfield",
+                "org": "Example ISP", "sources": {}, "verdict": "疑似住宅/ISP"}
+
+    def test_command_line_wins_over_the_environment(self):
+        os.environ[g.EXPECTED_COUNTRY_ENV] = "JP"
+        self.assertEqual(g.declared_expected("US", None), ("US", None))
+
+    def test_environment_supplies_it_when_the_flag_is_absent(self):
+        os.environ[g.EXPECTED_COUNTRY_ENV] = "US"
+        os.environ[g.EXPECTED_EXIT_IP_ENV] = "203.0.113.9"
+        self.assertEqual(g.declared_expected(None, None), ("US", "203.0.113.9"))
+
+    def test_blank_environment_value_is_not_a_declaration(self):
+        os.environ[g.EXPECTED_COUNTRY_ENV] = "   "
+        self.assertEqual(g.declared_expected(None, None), (None, None))
+
+    def test_nothing_anywhere_stays_undeclared(self):
+        self.assertEqual(g.declared_expected(None, None), (None, None))
+
+    def test_blank_cli_value_falls_back_to_the_environment(self):
+        os.environ[g.EXPECTED_COUNTRY_ENV] = "US"
+        self.assertEqual(g.declared_expected("   ", None), ("US", None))
+
+    def test_bad_environment_value_names_the_variable(self):
+        os.environ[g.EXPECTED_COUNTRY_ENV] = "USA"
+        with self.assertRaises(ValueError) as caught:
+            g.declared_expected(None, None)
+        self.assertIn(g.EXPECTED_COUNTRY_ENV, str(caught.exception))
+
+    def test_audit_reads_the_environment_declaration(self):
+        """守着「声明换个入口就没了」那个坑：命令行拿不到参数时也得认。"""
+        os.environ[g.EXPECTED_COUNTRY_ENV] = "US"
+        with mock.patch.object(g, "check_export_ip", return_value=self._fake_ip()):
+            report = g.audit()
+        got = report["A1_export_ip"].get("expected") or {}
+        # 注意层级：这里是 expected_exit_result 的整个返回值，
+        # 声明的国家在它自己的 expected 下面（2026-10-14 在这里读错过一次）。
+        self.assertEqual((got.get("expected") or {}).get("country"), "US")
+        self.assertEqual(got.get("status"), "ok")
+
+    def test_audit_explicit_argument_beats_the_environment(self):
+        os.environ[g.EXPECTED_COUNTRY_ENV] = "US"
+        with mock.patch.object(g, "check_export_ip", return_value=self._fake_ip()):
+            report = g.audit(expected_country="JP")
+        self.assertEqual((report["A1_export_ip"].get("expected") or {}).get("status"), "bad")
+
+    def test_help_renders(self):
+        """--help 曾经因为 help= 后面写了花括号（那是 set，不是字符串拼接）而崩掉。"""
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as caught:
+                g.main(["--help"])
+        self.assertEqual(caught.exception.code, 0)
+        text = buf.getvalue()
+        self.assertIn(g.EXPECTED_COUNTRY_ENV, text)
+        self.assertIn(g.EXPECTED_EXIT_IP_ENV, text)
+
+    def test_runner_sits_at_the_very_end_exactly_once(self):
+        """这个文件踩过两次同一个坑：runner 停在中间，后面的用例静默不跑。"""
+        text = pathlib.Path(__file__).read_text(encoding="utf-8")
+        # 只数整行，别数子串：下面那行断言本身也含这个字面量。
+        runners = [n for n, line in enumerate(text.splitlines(), 1)
+                   if line.startswith('if __name__ == "__main__":')]
+        self.assertEqual(len(runners), 1, f"runner 出现在这些行：{runners}")
+        tail = text.rstrip().splitlines()[-1]
+        self.assertEqual(tail.strip(), "unittest.main(verbosity=2)")
+
+
+class TestStorageThreshold(unittest.TestCase):
+    """可清理量那一行不该为 0.4 MB 一直挂着「待处理」。"""
+
+    def _row(self, state):
+        rows = g.build_summary({"A25_claude_storage": state})
+        return [r for r in rows if r[0] == "系统级可清理量"][0]
+
+    def test_human_bytes_speaks_kb_below_one_megabyte(self):
+        self.assertEqual(g.human_bytes(0), "0 KB")
+        self.assertEqual(g.human_bytes(450355), "440 KB")
+        self.assertEqual(g.human_bytes(1 << 20), "1.0 MB")
+        self.assertEqual(g.human_bytes(int(43.8 * (1 << 20))), "43.8 MB")
+        self.assertEqual(g.human_bytes(2 << 30), "2.00 GB")
+        self.assertEqual(g.human_bytes(-5), "0 KB")
+        self.assertEqual(g.human_bytes(None), "未知")
+
+    def test_small_cache_is_not_worth_cleaning(self):
+        self.assertFalse(g.storage_worth_cleaning(
+            {"cleanable_bytes": 450355, "caches": [{"name": "Cache", "bytes": 450355}],
+             "cli": {"stale": []}, "bundled": {"stale": []}}))
+
+    def test_big_cache_is_worth_cleaning(self):
+        self.assertTrue(g.storage_worth_cleaning(
+            {"cleanable_bytes": 45 * (1 << 20), "caches": [{"name": "Cache", "bytes": 1}],
+             "cli": {"stale": []}, "bundled": {"stale": []}}))
+
+    def test_a_stale_version_is_always_worth_cleaning(self):
+        self.assertTrue(g.storage_worth_cleaning(
+            {"cleanable_bytes": 10, "caches": [], "cli": {"stale": ["2.1.293"]},
+             "bundled": {"stale": []}}))
+
+    def test_accepts_a_whole_report_too(self):
+        self.assertTrue(g.storage_worth_cleaning(
+            {"A25_claude_storage": {"cleanable_bytes": 99 * (1 << 20), "caches": [],
+                                    "cli": {"stale": []}, "bundled": {"stale": []}}}))
+
+    def test_row_is_green_when_only_a_small_cache_remains(self):
+        status, detail = self._row({"cleanable_bytes": 450355,
+                                    "caches": [{"name": "Cache"}, {"name": "Code Cache"}],
+                                    "cli": {"current": "2.1.296", "stale": []},
+                                    "bundled": {"current": "2.1.293", "stale": []}})[1:]
+        self.assertIs(status, g.S_OK)
+        self.assertIn("440 KB", detail)
+        self.assertNotIn("0 MB", detail)
+
+    def test_row_is_pending_for_a_real_amount(self):
+        status, detail = self._row({"cleanable_bytes": 45 * (1 << 20),
+                                    "caches": [{"name": "Cache"}],
+                                    "cli": {"current": "2.1.296", "stale": []},
+                                    "bundled": {"current": "2.1.293", "stale": []}})[1:]
+        self.assertIs(status, g.S_FIX)
+        self.assertIn("45.0 MB", detail)
+
+
+class TestFixButtonsFollowRowStatus(unittest.TestCase):
+    """报绿的行上不该还挂着「清理」按钮。"""
+
+    def _actions_for(self, row):
+        state = {"cleanable_bytes": 450355, "caches": [{"name": "Cache"}],
+                 "cli": {"current": "2.1.296", "stale": []},
+                 "bundled": {"current": "2.1.293", "stale": []}}
+        if row == "big":
+            state["cleanable_bytes"] = 45 * (1 << 20)
+        return rs.ui_actions({"A25_claude_storage": state})
+
+    def test_button_disappears_once_the_row_is_green(self):
+        self.assertNotIn("系统级可清理量", self._actions_for("small"))
+
+    def test_button_stays_while_the_row_is_pending(self):
+        actions = self._actions_for("big")
+        self.assertIn("系统级可清理量", actions)
+        self.assertEqual(actions["系统级可清理量"][0]["id"], "claude_storage")
+
+    def test_no_report_keeps_the_old_behaviour(self):
+        """不给报告时保持原样：静态报告走的是另一条路。"""
+        self.assertIn("系统级可清理量", rs.ui_actions())
 
 
 if __name__ == "__main__":
