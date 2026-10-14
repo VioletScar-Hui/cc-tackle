@@ -69,6 +69,8 @@ def check_files() -> None:
     need = [
         "SKILL.md",
         "scripts/account_guard.py",
+        "scripts/report_html.py",
+        "scripts/report_serve.py",
         "tests/test_account_guard.py",
         "references/article-mapping.md",
     ]
@@ -146,8 +148,9 @@ def check_kernel() -> None:
     try:
         status, out = g.clash_http("GET", "/configs", timeout=20)
     except (RuntimeError, OSError, ValueError) as exc:
+        tried = "、".join(str(x) for x in g.clash_sock_paths())
         add("Clash 内核", BAD,
-            f"控制接口读不到（内核没跑、socket 或 secret 变了）：{type(exc).__name__}")
+            f"控制接口读不到（内核没跑、socket 或 secret 变了；试过 {tried}）：{type(exc).__name__}")
         return
     if status < 200 or status >= 300 or not out.lstrip().startswith("{"):
         add("Clash 内核", BAD,
@@ -308,6 +311,14 @@ def main() -> int:
     if report_path:
         print()
         print(f"  完整体检报告（未截断的全文在里面）：{report_path}")
+    if report:
+        # 同一份报告也渲染成 HTML 并打开：终端表格适合扫一眼，报告页适合看清整体。
+        try:
+            import report_html
+            page = report_html.write_report(report, open_it=True, report_path=report_path or "")
+            print(f"  HTML 报告：{page}")
+        except Exception as error:
+            print(f"  HTML 报告生成失败：{error}")
     print(f"  项目根（A14 / A24 扫这里）：{roots or '未指定'}　—　{roots_source}")
     if n_bad:
         print(f"\n  有 {n_bad} 项没过。逐项看：python3 scripts/account_guard.py --commands")

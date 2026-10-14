@@ -83,6 +83,27 @@ python3 scripts/selfcheck.py --fast
 
 自检会串联技能文件、Python 编译、单元测试、守护脚本、Clash 状态、系统代理和完整环境审计。`--fast` 用于跳过耗时较长的单元测试。
 
+### 报告页：静态 HTML 与可点修复
+
+每跑完一次都会生成一份自包含的 HTML 报告，落在 `~/ClaudeGuardBackups/report-<时间戳>.html`。整页不引用任何外部资源（没有 CDN、没有 web font、没有 JS），页面上的数字全部来自报告本身——判定与终端输出同源，都是 `build_summary`。
+
+```bash
+python3 scripts/report_html.py --open              # 用最新那份报告重渲染
+python3 scripts/report_html.py <报告.json> --out ~/Desktop
+```
+
+想让它**点着修**，用本地服务模式：
+
+```bash
+python3 scripts/report_serve.py
+```
+
+体检完起一个只绑 `127.0.0.1` 的服务并打开页面。能自动修的项右边多一个按钮，点一下执行、页面刷新、顶部写明这次做了什么；顶部另有「修复全部可自动修的项」和「重新体检」，页脚「结束本地服务」，空闲 30 分钟自动退出。安全边界：端口随机、URL 带一次性令牌、POST 需自定义头、动作白名单，不带令牌一律 404。
+
+按钮只出现在本来就敢自动做的项上：系统代理残留、shell/npm/git 代理、settings.json 端点与凭据、Clash DNS、浏览器 Intl、系统级可清理量、settings 失效权限、项目级垃圾与失效工作树注册。需要人拿主意的（遥测开关、IPv6、定位服务）和必须人工的（手机时区、支付、浏览器隔离）不出按钮。
+
+删掉的旧版本与缓存没法像配置文件那样回滚，所以每次清理都会在 `~/ClaudeGuardBackups/cleanup-<时间戳>.json` 留一份账本，写明删了哪些路径、各多大。
+
 ### 专项检查与清单
 
 ```bash
@@ -207,11 +228,14 @@ git clone https://github.com/VioletScar-Hui/claude-account-guard.git \
 ├── SKILL.md                    # 检查项、判据和执行边界
 ├── scripts/
 │   ├── account_guard.py        # 主体脚本
-│   └── selfcheck.py            # 一键自检
+│   ├── selfcheck.py            # 一键自检
+│   ├── report_html.py          # 把结果渲染成自包含的 HTML 报告
+│   └── report_serve.py         # 带修复按钮的本地服务版
 ├── tests/
 │   └── test_account_guard.py   # 单元测试与隔离夹具
 ├── references/
 │   ├── article-mapping.md      # 检查项与参考来源的映射
+│   ├── report-page.md          # 报告页与可点修复的边界说明
 │   └── webrtc.md               # WebRTC 判据与实测说明
 └── docs/
     ├── readme-hero.png         # README 顶部插图
