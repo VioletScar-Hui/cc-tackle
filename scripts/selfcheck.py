@@ -86,7 +86,7 @@ def check_files() -> None:
             f"frontmatter name={fname or '(缺失)'} 与目录名 {SKILL.name} 不一致，"
             "进仓时校验器会拒")
         return
-    add("技能文件齐全", OK, f"4 个文件都在；name={fname} 与目录名一致")
+    add("技能文件齐全", OK, f"{len(need)} 个文件都在；name={fname} 与目录名一致")
 
 
 # ── 2. 语法 ─────────────────────────────────────────────────────────
