@@ -298,7 +298,7 @@ class State:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "claude-account-guard-report"
+    server_version = "cc-tackle-report"
     state: State = None          # 由 serve() 挂上
     token: str = ""
 

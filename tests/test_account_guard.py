@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-account-guard 的测试。
+"""CC tackle 的测试。
 
 覆盖三类东西：
   1. 纯函数逻辑（ASN 归类、参数解析）—— 回归曾经真实出过的 bug；
@@ -12,11 +12,13 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
 import pathlib
 import plistlib
+import re
 import shutil
 import socket
 import subprocess
@@ -350,11 +352,50 @@ class TestEntryGates(unittest.TestCase):
 
 
 class TestProjectRoots(unittest.TestCase):
-    """A14 的目录不能再写死在某台机器上。"""
+    """A14 的目录不能再写死在某台机器上；也不能因为没人设环境变量就少判两项。
 
-    def test_empty_when_unset(self):
-        with mock.patch.dict("os.environ", {}, clear=True):
+    2026-10-15：原来只认 CLAUDE_GUARD_PROJECT_ROOTS，于是直接敲
+    `python3 scripts/account_guard.py --audit` 时「代码是否落在本地 Git」与
+    「项目级 .claude 规模」两项变成「未测到」——裸跑 6 项未测到、带上就少 2 项。
+    selfcheck.py 一直有三级兜底，account_guard.py 没有，两边各说各话。现在对齐。
+    """
+
+    def _empty_home(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        return tmp
+
+    def test_falls_back_to_the_repo_the_skill_lives_in(self):
+        tmp = self._empty_home()
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(g, "run", return_value=(0, str(tmp) + "\n")):
+            roots, source = g.project_roots_default()
+        self.assertEqual(roots, [tmp])
+        self.assertIn("git 仓", source)
+
+    def test_falls_back_to_the_legacy_home_dir(self):
+        tmp = self._empty_home()
+        (tmp / "ipe").mkdir()
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(g, "HOME", tmp), \
+             mock.patch.object(g, "run", return_value=(1, "")):
+            roots, source = g.project_roots_default()
+            # 必须连真正的入口一起断言：只测 project_roots_default 的话，
+            # 上面那个 return 换成旧写法（只认环境变量）测试照样「通过」。
+            self.assertEqual(g.project_roots(), [tmp / "ipe"])
+        self.assertEqual(roots, [tmp / "ipe"])
+        self.assertIn("~/ipe", source)
+
+    def test_empty_when_unset_and_nothing_to_fall_back_to(self):
+        tmp = self._empty_home()
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(g, "HOME", tmp), \
+             mock.patch.object(g, "run", return_value=(1, "")):
             self.assertEqual(g.project_roots(), [])
+
+    def test_env_still_wins(self):
+        with mock.patch.dict("os.environ", {"CLAUDE_GUARD_PROJECT_ROOTS": "/a:/b"}):
+            self.assertEqual([str(x) for x in g.project_roots()], ["/a", "/b"])
 
     def test_parses_colon_separated(self):
         with mock.patch.dict("os.environ", {"CLAUDE_GUARD_PROJECT_ROOTS": "/a:/b"}):
@@ -596,49 +637,96 @@ class TestFailureReporting(unittest.TestCase):
         不 patch 就会去读真实家目录。
     """
 
-    def _run_main(self, tmp, boom):
-        report = {
-            "A1_proxy_residue": {"residue": [], "enabled": [], "scutil": {}, "network_services": []},
-            "A1_terminal_env": {"rc_files": {}, "npm": {}, "git": {}, "env_hits": [], "env_info": []},
-            "A2_anthropic_base_url": {"hits": []},
-            "A5_ipv6": {"services": {}, "global_addresses": []},
-        }
+    def _run_main(self, tmp, boom, at: str = "settings"):
+        """把中间某一步做成会抛错的，观察 main 的处理。
+
+        三个曾经踩过的坑，写测试时必须避开：
+          * 遥测答案必须是 2 —— 选 0 时 main 走 `if telemetry else '保持'` 短路，
+            那一步根本不执行，这里也就测不到东西；
+          * HOME 必须一起 patch —— targets 里有 HOME/'.claude.json'，
+            不 patch 就会去读真实家目录；
+          * write_html_twin 必须 patch —— 不 patch 的话，凡是跑到底的用例
+            都会真的 `open` 一个 HTML 页面出来。
+
+        2026-10-15 起注入口默认换成了「settings.json 端点」那一步：遥测那一步
+        失败已经改成「其余步骤继续」，不再是中止路径的触发点（要测遥测失败，
+        传 at="telemetry"，见 test_telemetry_failure_does_not_abort_the_run）。
+        """
         settings = tmp / ".claude" / "settings.json"
         settings.parent.mkdir(parents=True, exist_ok=True)
         settings.write_text('{"env": {}}', encoding="utf-8")
         (tmp / ".claude.json").write_text('{"userID": "fake"}', encoding="utf-8")
-        err = io.StringIO()
+        report = {
+            "A1_proxy_residue": {"residue": [], "enabled": [], "scutil": {},
+                                 "network_services": []},
+            "A1_terminal_env": {"rc_files": {}, "npm": {}, "git": {},
+                                "env_hits": [], "env_info": []},
+            # 这一条让「settings 端点」那一笔真的会执行，boom 才有地方抛
+            "A2_anthropic_base_url": {"hits": [{"file": str(settings),
+                                                "key": "ANTHROPIC_BASE_URL",
+                                                "value": "http://example.invalid"}]},
+            "A5_ipv6": {"services": {}, "global_addresses": []},
+        }
+        err, out = io.StringIO(), io.StringIO()
         calls = []
+        if at == "telemetry":
+            telemetry_patch = mock.patch.object(g, "apply_telemetry", side_effect=boom)
+            settings_patch = mock.patch.object(g, "clear_anthropic_base_url",
+                                               return_value="（这一步没走到）")
+        else:
+            telemetry_patch = mock.patch.object(
+                g, "apply_telemetry",
+                side_effect=lambda m: (calls.append(m), "已写入 DISABLE_TELEMETRY")[1])
+            settings_patch = mock.patch.object(g, "clear_anthropic_base_url", side_effect=boom)
         with mock.patch.object(g, "HOME", tmp), \
              mock.patch.object(g, "SETTINGS", settings), \
              mock.patch.object(g, "BACKUP_ROOT", tmp / "backups"), \
              mock.patch.object(g, "audit", return_value=report), \
              mock.patch.object(g, "print_audit"), \
-             mock.patch.object(g, "apply_telemetry", side_effect=lambda m: (calls.append(m), boom())[1]), \
+             mock.patch.object(g, "write_html_twin"), \
+             telemetry_patch, \
+             settings_patch, \
              mock.patch.object(g.sys, "stdin", mock.Mock(isatty=lambda: True)), \
              mock.patch("builtins.input", side_effect=prompt_answering(telemetry="2")), \
-             mock.patch.object(g.sys, "stdout", io.StringIO()), \
+             mock.patch.object(g.sys, "stdout", out), \
              mock.patch.object(g.sys, "stderr", err):
             rc = g.main([])
-        return rc, err.getvalue(), calls
+        return rc, err.getvalue(), calls, out.getvalue()
 
     def test_apply_is_actually_reached(self):
         # 先确认这个测试场景真的能触发到写入步骤，否则下面两个断言全是空的
         tmp = pathlib.Path(tempfile.mkdtemp())
-        _, _, calls = self._run_main(tmp, lambda: None)
+        _, _, calls, _ = self._run_main(tmp, lambda: None)
         self.assertEqual(calls, [2], "apply_telemetry 必须被调用，否则测试没测到东西")
 
     def test_runtime_error_after_backup_names_the_backup(self):
         tmp = pathlib.Path(tempfile.mkdtemp())
-        rc, err, calls = self._run_main(tmp, lambda: (_ for _ in ()).throw(RuntimeError("模拟写入失败")))
+        rc, err, calls, _ = self._run_main(
+            tmp, lambda: (_ for _ in ()).throw(RuntimeError("模拟写入失败")))
         self.assertEqual(calls, [2])
         self.assertEqual(rc, 2)
         self.assertIn("备份（回滚用）", err)
         self.assertIn("停止前已执行的改动会保留", err)
 
+    def test_telemetry_failure_does_not_abort_the_run(self):
+        """2026-10-15：遥测那一步失败不再让整轮停下。
+
+        用户当天就是这么停的（而且那次还是误报），一次失败把 [4/6] 之后的步骤、
+        收尾的复检对照表和 HTML 全带走了。现在它只打一行警告，后面照跑。
+        """
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        rc, err, _, out = self._run_main(
+            tmp, lambda: (_ for _ in ()).throw(RuntimeError("模拟遥测写入失败")),
+            at="telemetry")
+        self.assertEqual(rc, 0, f"遥测失败不该让整轮停下：{err}")
+        self.assertIn("遥测开关写入失败（其余步骤继续）", out)
+        self.assertIn("端点/代理变量", out, "后面的步骤必须照常执行")
+        self.assertIn("完成。受保护文件未被动过。", out)
+
     def test_keyboard_interrupt_is_handled(self):
         tmp = pathlib.Path(tempfile.mkdtemp())
-        rc, err, calls = self._run_main(tmp, lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+        rc, err, calls, _ = self._run_main(
+            tmp, lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
         self.assertEqual(calls, [2])
         self.assertEqual(rc, 2)
         self.assertIn("已中断", err)
@@ -646,7 +734,7 @@ class TestFailureReporting(unittest.TestCase):
 
     def test_backup_only_covers_the_patched_home(self):
         tmp = pathlib.Path(tempfile.mkdtemp())
-        _, out, _ = self._run_main(tmp, lambda: None)
+        _, out, _, _ = self._run_main(tmp, lambda: None)
         # 备份清单里不该出现真实家目录
         self.assertNotIn(str(pathlib.Path.home()), str(tmp / "backups") if False else out)
         manifests = list((tmp / "backups").glob("guard-*/manifest.json"))
@@ -826,8 +914,228 @@ class TestAllowedChanges(unittest.TestCase):
         self.assertIn("EDITOR=vim", text, "无关行必须保留")
 
 
+def _pb_varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _pb_bytes(field: int, payload: bytes) -> bytes:
+    """拼一个 protobuf 的 length-delimited 字段，测试里造 CRX 头用。
+
+    长度要用 varint：公钥 294 字节、签名 256 字节，一个字节装不下。
+    """
+    return bytes([(field << 3) | 2]) + _pb_varint(len(payload)) + payload
+
+
+def _fake_crx(public_key: bytes, *, update_url: str = g.WEBRTC_CRX_ENDPOINT,
+              name: str = "WebRTC Network Limiter", version: str = "0.2.1.4",
+              permissions=("privacy",)) -> bytes:
+    """按 CRX3 的格式造一个包：头里放签名块，后面跟一个装 manifest 的 zip。
+
+    扩展 ID 是公钥哈希推出来的，所以调用方只要把 `g.WEBRTC_LIMITER_ID` 换成
+    `_crx_id(public_key)`，就能造出「签名对得上」的那种包。
+    """
+    import io as _io
+    import zipfile as _zip
+    manifest = json.dumps({"manifest_version": 3, "name": name, "version": version,
+                           "update_url": update_url, "permissions": list(permissions)})
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", manifest)
+    proof = _pb_bytes(1, public_key) + _pb_bytes(2, b"\x00" * 256)
+    header = _pb_bytes(2, proof) + _pb_bytes(3, b"signed-header")
+    return b"Cr24" + (3).to_bytes(4, "little") + len(header).to_bytes(4, "little") + header + buf.getvalue()
+
+
+def _crx_id(public_key: bytes) -> str:
+    digest = hashlib.sha256(public_key).digest()[:16]
+    return "".join("abcdefghijklmnop"[b >> 4] + "abcdefghijklmnop"[b & 15] for b in digest)
+
+
+class TestWebrtcLimiterDownload(unittest.TestCase):
+    """WebRTC Network Limiter 的下载与身份核对。
+
+    这里最要紧的一条是「下到的确实是这个扩展」：判据用签名块里的公钥算出的 ID，
+    不是 manifest 里的名字——名字是商店页面显示用的，改一行就行。
+    """
+
+    KEY = b"\x30\x82\x01\x22" + bytes(range(256)) + b"\x00" * 34
+
+    def test_crx_url_carries_id_prodversion_and_install_source(self):
+        url = g.webrtc_limiter_crx_url("155.0.8059.40")
+        self.assertIn("prod=chromiumcrx", url)
+        self.assertIn("prodversion=155.0.8059.40", url)
+        self.assertIn(g.WEBRTC_LIMITER_ID, url.replace("%3D", "="))
+        self.assertIn("installsource%3Dondemand", url)
+
+    def test_id_comes_from_the_signing_key_not_the_name(self):
+        blob = _fake_crx(self.KEY)
+        self.assertIn(_crx_id(self.KEY), g.crx_public_key_ids(blob))
+        with mock.patch.object(g, "WEBRTC_LIMITER_ID", _crx_id(self.KEY)):
+            ok, why = g.verify_webrtc_limiter_crx(blob)
+        self.assertTrue(ok, why)
+
+    def test_a_package_signed_by_another_key_is_refused(self):
+        blob = _fake_crx(b"\x30\x82\x01\x22" + b"other-key" * 30)
+        ok, why = g.verify_webrtc_limiter_crx(blob)
+        self.assertFalse(ok)
+        self.assertIn("扩展 ID 对不上", why)
+
+    def test_a_package_from_somewhere_else_is_refused(self):
+        blob = _fake_crx(self.KEY, update_url="https://evil.example/update/crx")
+        with mock.patch.object(g, "WEBRTC_LIMITER_ID", _crx_id(self.KEY)):
+            ok, why = g.verify_webrtc_limiter_crx(blob)
+        self.assertFalse(ok)
+        self.assertIn("不是商店的包", why)
+
+    def test_garbage_is_refused_with_a_readable_reason(self):
+        for blob in (b"", b"<html>", b"Cr24" + b"\x09\x00\x00\x00" + b"\x00" * 20):
+            ok, why = g.verify_webrtc_limiter_crx(blob)
+            self.assertFalse(ok)
+            self.assertTrue(why)
+
+    def test_download_lands_the_file_and_records_the_hash(self):
+        blob = _fake_crx(self.KEY)
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+
+        def fake_run(cmd, timeout=20, env=None):
+            if "-o" not in cmd:                 # 还有一次是问 Chrome 版本号
+                return 0, "155.0.8059.40"
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_bytes(blob)
+            return 0, ""
+
+        with mock.patch.object(g, "HOME", tmp), \
+             mock.patch.object(g, "WEBRTC_LIMITER_ID", _crx_id(self.KEY)), \
+             mock.patch.object(g, "run", side_effect=fake_run):
+            got = g.download_webrtc_limiter()
+        self.assertTrue(got["ok"], got.get("why"))
+        self.assertEqual(got["sha256"], hashlib.sha256(blob).hexdigest())
+        self.assertEqual(got["version"], "0.2.1.4")
+        self.assertTrue(got["path"].is_file())
+        self.assertFalse(list(got["path"].parent.glob("*.part")))
+
+    def test_a_failed_download_leaves_nothing_behind(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with mock.patch.object(g, "HOME", tmp), mock.patch.object(
+                g, "run", return_value=(22, "curl: (22) The requested URL returned error: 404")):
+            got = g.download_webrtc_limiter()
+        self.assertFalse(got["ok"])
+        self.assertIn("下载失败", got["why"])
+        # 目录可以建（为了落 .part），但一个包文件都不能留下。
+        self.assertFalse(list(tmp.rglob("*.crx")))
+        self.assertFalse(list(tmp.rglob("*.part")))
+
+    def test_a_corrupt_download_is_not_kept(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+
+        def fake_run(cmd, timeout=20, env=None):
+            if "-o" not in cmd:
+                return 0, "155.0.8059.40"
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_bytes(b"<html>not a crx</html>")
+            return 0, ""
+
+        with mock.patch.object(g, "HOME", tmp), mock.patch.object(g, "run", side_effect=fake_run):
+            got = g.download_webrtc_limiter()
+        self.assertFalse(got["ok"])
+        self.assertIn("没通过校验", got["why"])
+        self.assertFalse(list((tmp / ".local").rglob("*.crx")))
+
+
+class TestWebrtcLimiterState(unittest.TestCase):
+    """装没装、设置对不对：读每个资料的 Secure Preferences。"""
+
+    def _home(self, entries):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        for prof, setting in entries:
+            d = tmp / "Library" / "Application Support" / "Google" / "Chrome" / prof
+            d.mkdir(parents=True)
+            (d / "Secure Preferences").write_text(json.dumps({
+                "extensions": {"settings": {g.WEBRTC_LIMITER_ID: {
+                    "manifest": {"version": "0.2.1.4"}, "from_webstore": True,
+                    "preferences": {"webrtc.ip_handling_policy": setting}}}}}) , encoding="utf-8")
+        return tmp
+
+    def test_reads_the_setting_out_of_secure_preferences(self):
+        tmp = self._home([("Profile 1", g.WEBRTC_LIMITER_SETTING)])
+        with mock.patch.object(g, "HOME", tmp):
+            state = g.webrtc_limiter_state()
+        self.assertTrue(state["readable"])
+        self.assertEqual(state["profiles"], ["Profile 1"])
+        self.assertEqual(state["setting"], g.WEBRTC_LIMITER_SETTING)
+
+    def test_unreadable_profiles_never_means_not_installed(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with mock.patch.object(g, "HOME", tmp):
+            state = g.webrtc_limiter_state()
+        self.assertFalse(state["readable"])
+        self.assertIn("读不到", state["why"])
+        with mock.patch.object(g, "webrtc_limiter_state", return_value=state), \
+             mock.patch.object(g, "download_webrtc_limiter",
+                               return_value={"ok": False, "why": "没网"}), \
+             mock.patch.object(g, "open_verify_page", return_value={"opened": False}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = g.install_webrtc_limiter()
+        self.assertIsNone(got["installed"])
+
+    def test_an_installed_profile_is_reported_as_installed(self):
+        tmp = self._home([("Profile 1", g.WEBRTC_LIMITER_SETTING)])
+        with mock.patch.object(g, "HOME", tmp):
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = g.install_webrtc_limiter(
+                    open_store=False)
+        self.assertIs(got["installed"], True)
+
+
+class TestWebrtcLimiterCli(unittest.TestCase):
+    """--install-webrtc-limiter 不需要 TTY，也不受「Claude Code 只放行只读」限制。"""
+
+    def test_flag_runs_without_a_tty(self):
+        with mock.patch.object(sys, "argv", ["account_guard.py", "--install-webrtc-limiter"]), \
+             mock.patch.object(g, "install_webrtc_limiter",
+                               return_value={"ok": True, "download": {"ok": True}}), \
+             mock.patch.object(g, "running_under_claude", return_value=True), \
+             mock.patch.object(sys.stdin, "isatty", return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(g.main(), 0)
+
+    def test_a_failed_download_exits_two(self):
+        with mock.patch.object(sys, "argv", ["account_guard.py", "--install-webrtc-limiter"]), \
+             mock.patch.object(g, "install_webrtc_limiter",
+                               return_value={"ok": False, "download": {"ok": False}}), \
+             mock.patch.object(g, "running_under_claude", return_value=False), \
+             mock.patch.object(sys.stdin, "isatty", return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(g.main(), 2)
+
+
+def _no_real_project_scan(case: unittest.TestCase) -> None:
+    """让这个用例不要真去扫开发机的项目根。
+
+    项目根的三级兜底会落到 `~/ipe`，本机是 67 个 `.claude` / 13.4 GB，扫一次
+    27 秒。用例要的是报告形状与声明读取，不该依赖开发机上有没有那个目录，
+    也不该每个跑真 audit 的用例都扫一遍 —— 2026-10-15 就是这么把自检里的
+    单测段顶过 900 秒超时的。
+    """
+    patcher = mock.patch.object(g, "project_roots", return_value=[])
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
 class TestAuditShape(unittest.TestCase):
     """体检报告的键必须齐全，否则依赖它的 print_audit 会 KeyError。"""
+
+    def setUp(self):
+        _no_real_project_scan(self)
 
     REQUIRED = (
         "A1_export_ip", "A1_proxy_residue", "A1_terminal_env", "A2_anthropic_base_url",
@@ -1782,7 +2090,12 @@ class TestProjectClaudeCheck(unittest.TestCase):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
 
     def test_without_roots_it_says_how_to_enable(self):
-        with mock.patch.dict("os.environ", {}, clear=True):
+        # 必须把三级兜底全堵死才算「没有项目根」：HOME 下没有 ipe、git 也认不出来。
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(g, "HOME", tmp), \
+             mock.patch.object(g, "run", return_value=(1, "")):
             r = g.check_project_claude()
         self.assertIn("CLAUDE_GUARD_PROJECT_ROOTS", r["note"])
 
@@ -5552,6 +5865,7 @@ class TestDeclaredExpected(unittest.TestCase):
     """预期出口是你自己的声明：命令行优先，其次环境变量，都没有才算没声明。"""
 
     def setUp(self):
+        _no_real_project_scan(self)
         for name in (g.EXPECTED_COUNTRY_ENV, g.EXPECTED_EXIT_IP_ENV):
             self.addCleanup(os.environ.pop, name, None)
             os.environ.pop(name, None)
@@ -5703,6 +6017,92 @@ class TestFixButtonsFollowRowStatus(unittest.TestCase):
     def test_no_report_keeps_the_old_behaviour(self):
         """不给报告时保持原样：静态报告走的是另一条路。"""
         self.assertIn("系统级可清理量", rs.ui_actions())
+
+
+class TestManualActionsAreWellFormed(unittest.TestCase):
+    """人工清单的「步骤」必须真是一串步骤。
+
+    写成 `("先把本机残留清干净")` 就是少了逗号——在 Python 里那是**字符串**不是元组，
+    于是 `for step in steps` 按字符迭代：终端一行一个字，报告页一个 <li> 一个字。
+    2026-10-15 真出现过，是用户看报告时问「这个怎么这样排版」才发现。
+    """
+
+    def _entries(self):
+        for group, items in g.MANUAL_ACTIONS:
+            for entry in items:
+                yield group, entry
+
+    def test_steps_are_a_sequence_not_a_string(self):
+        for group, (title, _src, steps, _why) in self._entries():
+            self.assertIsInstance(steps, (tuple, list), f"{group}／{title} 的步骤不是序列")
+            self.assertTrue(steps, f"{group}／{title} 没有步骤")
+
+    def test_no_step_is_a_single_character(self):
+        for group, (title, _src, steps, _why) in self._entries():
+            for step in steps:
+                self.assertIsInstance(step, str, f"{group}／{title}")
+                self.assertGreaterEqual(len(step.strip()), 4,
+                                        f"{group}／{title} 的步骤太短（像是被按字符拆过）：{step!r}")
+
+    def test_titles_sources_and_notes_are_filled(self):
+        for group, (title, src, _steps, why) in self._entries():
+            for field, value in (("标题", title), ("出处", src), ("说明", why)):
+                self.assertIsInstance(value, str, f"{group} 的{field}")
+                self.assertTrue(value.strip(), f"{group} 的{field}是空的")
+
+    def test_report_page_shows_steps_one_per_line(self):
+        """报告页里那份清单的 <li> 数要等于步骤总数，且没有单字条目。"""
+        page = rh.render({})
+        section = page.split("必须人工做的")[1].split("自己再核一遍")[0]
+        items = re.findall(r"<li>(.*?)</li>", section, re.S)
+        total = sum(len(steps) for _g, (_t, _s, steps, _w) in self._entries())
+        self.assertEqual(len(items), total)
+        for item in items:
+            self.assertGreaterEqual(len(re.sub(r"<[^>]+>", "", item).strip()), 4, item)
+
+
+class TestDetectionSiteLinks(unittest.TestCase):
+    """报告页末尾那组自查入口。用户要自己点开核对的东西，脚本不代跑。"""
+
+    URLS = (
+        "https://ippure.com/", "https://ippure.com/claude.html", "https://ipinfo.io/",
+        "https://browserleaks.com/webrtc", "https://browserleaks.com/dns",
+        "https://ping0.cc/", "https://ip.net.coffee/", "https://ip.net.coffee/claude/",
+        "https://cleanip.io/",
+    )
+
+    def _page(self):
+        return rh.render({})
+
+    def test_every_link_is_on_the_page(self):
+        page = self._page()
+        for url in self.URLS:
+            self.assertIn(url, page, url)
+
+    def test_links_open_in_a_new_tab_without_a_referrer(self):
+        page = self._page()
+        for url in self.URLS:
+            i = page.index(url)
+            chunk = page[i - 80:i + len(url) + 80]
+            self.assertIn('target=\'_blank\'', chunk)
+            self.assertIn("noopener", chunk)
+
+    def test_each_link_says_what_it_answers(self):
+        for _group, sites in rh.DETECTION_SITES:
+            for url, note in sites:
+                self.assertTrue(note.strip(), url)
+                self.assertLess(len(note), 60, url)
+
+    def test_page_still_loads_nothing_from_those_sites(self):
+        """页面上只放链接：没有外链图片、脚本或样式表，离线打开也不会去连它们。"""
+        page = self._page()
+        for bad in ("src=\'http", 'src="http', "<script src=", "<link rel=\"stylesheet\" href=\"http"):
+            self.assertNotIn(bad, page)
+        self.assertNotIn("<img", page.split("自己再核一遍")[1])
+
+    def test_no_article_citation_leaks_into_the_new_section(self):
+        section = self._page().split("自己再核一遍")[1]
+        self.assertNotIn("文章", section)
 
 
 class TestReportGroupsCoverEveryRow(unittest.TestCase):
@@ -6292,6 +6692,320 @@ class TestProxyBackendRows(unittest.TestCase):
         self.assertIn("未检测", detail["代理后端"])
         self.assertIn("Clash 控制接口不可达", detail["绝不直连"])
         self.assertIn("未检测", detail["DNS 泄漏"])
+
+
+class TestApplyTelemetryIsIdempotent(unittest.TestCase):
+    """2026-10-15 实测的误报：三个遥测键本来就是 1，脚本却报
+    「遥测键写入后复验未生效」并停在 [3/6]，后面几步全没跑。
+
+    根因是复验拿「改动前的状态」当基准：键本来就是目标值时，这次写入不产生
+    任何变化，after == before 成立，于是把「已经是对的」判成「没写进去」。
+    正确基准是「目标状态」。
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.settings = self.tmp / "settings.json"
+        patcher = mock.patch.object(g, "SETTINGS", self.settings)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _seed(self, env: dict) -> None:
+        self.settings.write_text(json.dumps({"env": env}, ensure_ascii=False), encoding="utf-8")
+
+    def test_already_at_target_is_not_an_error(self):
+        self._seed({k: "1" for k in g.TELEMETRY_KEYS})
+        before = self.settings.read_bytes()
+        message = g.apply_telemetry(1)          # 修复前这里抛 RuntimeError
+        self.assertIn("无需改动", message)
+        self.assertEqual(self.settings.read_bytes(), before, "没有变化时不该改写文件")
+
+    def test_partial_state_is_completed_and_other_keys_survive(self):
+        self._seed({"DISABLE_TELEMETRY": "1", "KEEP_ME": "1"})
+        message = g.apply_telemetry(1)
+        self.assertIn("DISABLE_ERROR_REPORTING", message)
+        env = json.loads(self.settings.read_text(encoding="utf-8"))["env"]
+        self.assertEqual(env["KEEP_ME"], "1", "env 里别的键一个都不能动")
+        for key in g.TELEMETRY_KEYS:
+            self.assertEqual(env[key], "1")
+
+    def test_write_that_does_not_take_is_still_an_error(self):
+        self._seed({})
+        with mock.patch.object(g, "write_json", lambda *a, **k: None):
+            with self.assertRaises(RuntimeError) as caught:
+                g.apply_telemetry(1)
+        self.assertIn("复验未生效", str(caught.exception))
+
+    def test_mode_zero_never_touches_the_file(self):
+        self._seed({"KEEP_ME": "1"})
+        before = self.settings.read_bytes()
+        self.assertEqual(g.apply_telemetry(0), "保持")
+        self.assertEqual(self.settings.read_bytes(), before)
+
+
+class TestNoBackupWhenNothingToWrite(unittest.TestCase):
+    """一个写操作都不会发生的运行不该留下备份目录。
+
+    用户 2026-10-15 的原话：「正常跑完的话就不需要备份了」。
+    开工前没人知道会不会顺利跑完，所以有写入时备份一步都不能省；
+    但「全选保持」这种零写入的运行，备份里没有任何可回滚的东西。
+    """
+
+    def _run(self, telemetry: str):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        report = {
+            "A1_proxy_residue": {"residue": [], "enabled": [], "scutil": {},
+                                 "network_services": []},
+            "A1_terminal_env": {"rc_files": {}, "npm": {}, "git": {},
+                                "env_hits": [], "env_info": []},
+            "A2_anthropic_base_url": {"hits": []},
+            "A5_ipv6": {"services": {}, "global_addresses": []},
+        }
+        settings = tmp / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text('{"env": {}}', encoding="utf-8")
+        (tmp / ".claude.json").write_text('{"userID": "fake"}', encoding="utf-8")
+        backups = tmp / "backups"
+        with mock.patch.object(g, "HOME", tmp), \
+             mock.patch.object(g, "SETTINGS", settings), \
+             mock.patch.object(g, "BACKUP_ROOT", backups), \
+             mock.patch.object(g, "audit", return_value=report), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "write_html_twin"), \
+             mock.patch.object(g.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch("builtins.input", side_effect=prompt_answering(telemetry=telemetry)), \
+             mock.patch.object(g.sys, "stdout", io.StringIO()), \
+             mock.patch.object(g.sys, "stderr", io.StringIO()):
+            rc = g.main([])
+        created = sorted(d.name for d in backups.iterdir()) if backups.exists() else []
+        return rc, created
+
+    def test_zero_write_run_leaves_no_backup(self):
+        rc, created = self._run("0")
+        self.assertEqual(rc, 0)
+        self.assertEqual(created, [], f"没有任何改动却建了备份：{created}")
+
+    def test_a_real_write_still_gets_a_backup(self):
+        rc, created = self._run("2")
+        self.assertEqual(rc, 0)
+        self.assertTrue([n for n in created if n.startswith("guard-")],
+                        f"有写入时必须仍然建备份，实际：{created}")
+
+
+class TestRememberedExpectedExit(unittest.TestCase):
+    """声明的预期出口要记住。
+
+    声明的内容（我期望从哪个国家出去）不会因为换了一天就失效；每次都要重新声明，
+    就等于每次都可能忘了声明、那一项永远停在「未测到」。落盘只发生在允许写状态的
+    调用里 —— 只读审计仍然一个字都不写。
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        for name, value in (("HOME", self.tmp),
+                            ("EXPECTED_COUNTRY_ENV", "CLAUDE_GUARD_EXPECTED_COUNTRY"),
+                            ("EXPECTED_EXIT_IP_ENV", "CLAUDE_GUARD_EXPECTED_EXIT_IP")):
+            patcher = mock.patch.object(g, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_state_path_follows_home(self):
+        self.assertEqual(g.expected_state_path(),
+                         self.tmp / ".local" / "state" / "claude-guard" / "expected-exit.json")
+
+    def test_saved_declaration_is_used_when_nothing_is_declared_now(self):
+        g.remember_declared_expected("US", "203.0.113.9")
+        self.assertEqual(g.declared_expected(), ("US", "203.0.113.9"))
+
+    def test_a_fresh_declaration_wins_over_the_saved_one(self):
+        g.remember_declared_expected("US", None)
+        self.assertEqual(g.declared_expected("JP", None)[0], "JP")
+
+    def test_reading_never_writes(self):
+        g.declared_expected()
+        self.assertFalse(g.expected_state_path().exists())
+
+    def test_broken_state_file_is_ignored(self):
+        path = g.expected_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ not json", encoding="utf-8")
+        self.assertEqual(g.declared_expected(), (None, None))
+
+    def test_invalid_saved_values_do_not_fail_the_run(self):
+        path = g.expected_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"country": "!!", "exitIp": "not-an-ip"}), encoding="utf-8")
+        self.assertEqual(g.declared_expected(), (None, None))
+
+
+class TestSelfcheckParsesStdoutOnly(unittest.TestCase):
+    """自检解析体检 JSON 时只能看 stdout。
+
+    踩过的坑：selfcheck 的 sh() 把 stdout 与 stderr 合并返回，而 --verify-browser
+    的复核进度走在 stderr 上；合起来就让整份 JSON 解析不了，自检那一项报
+    「没读出 JSON 报告（退出码 0）」——退出码是好的，问题在解析。
+    """
+
+    def _fake_run(self, seen, payload, err):
+        def run(cmd, **kwargs):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, payload, err)
+        return run
+
+    def test_progress_lines_on_stderr_do_not_break_the_report(self):
+        report = {"A1_export_ip": {"ip": "203.0.113.10", "country": "US"}}
+        payload = json.dumps(report, ensure_ascii=False)
+        seen = []
+        with mock.patch.object(selfcheck_module.subprocess, "run",
+                              side_effect=self._fake_run(seen, payload, "噪音：已替你打开复核页")), \
+             mock.patch.object(selfcheck_module, "add") as add_row:
+            _path, got = selfcheck_module.check_audit(browser=True)
+        self.assertEqual(got, report)
+        self.assertIn("--verify-browser", seen[0])
+        statuses = [call.args[1] for call in add_row.call_args_list if len(call.args) > 1]
+        self.assertNotIn(selfcheck_module.BAD, statuses)
+
+    def test_browser_can_be_left_out(self):
+        seen = []
+        with mock.patch.object(selfcheck_module.subprocess, "run",
+                              side_effect=self._fake_run(seen, "{}", "")), \
+             mock.patch.object(selfcheck_module, "add"):
+            selfcheck_module.check_audit(browser=False)
+        self.assertNotIn("--verify-browser", seen[0])
+
+
+class TestJsonStdoutStaysClean(unittest.TestCase):
+    """--json 的 stdout 只能是那一个 JSON 文档，别人靠它解析。
+
+    踩过的坑：--verify-browser 的复核进度是直接 print 的，自检脚本拿
+    `--audit --json --verify-browser` 调过去就解析不了，整项被判失败，
+    而退出码还是 0 —— 只能靠这条用例钉住。
+    """
+
+    def _run(self, argv):
+        report = {"A1_export_ip": {"ip": "203.0.113.10", "country": "US"}}
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["account_guard.py"] + argv), \
+             mock.patch.object(g, "audit", return_value=report), \
+             mock.patch.object(g, "check_webrtc", return_value={}), \
+             mock.patch.object(g, "verify_browser_locale") as locale_probe, \
+             mock.patch.object(g, "verify_media_permission") as media_probe, \
+             mock.patch.object(g, "running_under_claude", return_value=False), \
+             contextlib.redirect_stdout(out):
+            locale_probe.side_effect = lambda *a, **k: print("噪音：复核页已打开 http://127.0.0.1:1/x")
+            media_probe.side_effect = lambda *a, **k: print("噪音：结果已存")
+            code = g.main()
+        return code, out.getvalue()
+
+    def test_json_mode_emits_only_json_even_when_the_probes_are_chatty(self):
+        code, out = self._run(["--audit", "--json", "--verify-browser"])
+        self.assertEqual(code, 0)
+        parsed = json.loads(out)          # 解析不了就是回归
+        self.assertEqual(parsed["A1_export_ip"]["ip"], "203.0.113.10")
+
+    def test_human_mode_still_shows_the_progress_on_stdout(self):
+        code, out = self._run(["--audit", "--json"])
+        self.assertEqual(code, 0)
+        json.loads(out)                   # 不带复核时本来也干净
+
+
+class TestBrowserVerifyAutoOpen(unittest.TestCase):
+    """复核页由脚本自己打开，并把「这次是谁开的」记进缓存。
+
+    为什么必须这样：结论要归到某个浏览器资料上，而页面自己报不出资料身份。
+    只发一条链接让用户在别处打开的话，这一项永远停在「资料身份未由脚本验证」，
+    也就是永远测不完 —— 用户 2026-10-15 问的正是这件事。
+    """
+
+    def test_opens_chrome_with_the_declared_profile(self):
+        seen = []
+        env = {"CLAUDE_GUARD_BROWSER_PROFILE": "Claude",
+               "CLAUDE_GUARD_BROWSER_PROFILE_DIR": "Profile 1"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(g, "run",
+                               side_effect=lambda cmd, timeout=20: (seen.append(cmd), (0, ""))[1]):
+            out = g.open_verify_page("http://127.0.0.1:1/tok/", "复核页")
+        self.assertTrue(out["opened"])
+        self.assertIn("Google Chrome", seen[0])
+        self.assertIn("--profile-directory=Profile 1", seen[0])
+        self.assertEqual(seen[0][-1], "http://127.0.0.1:1/tok/")
+
+    def test_failure_is_reported_not_faked(self):
+        with mock.patch.object(g, "run", return_value=(1, "no such app")):
+            out = g.open_verify_page("http://127.0.0.1:1/tok/", "复核页")
+        self.assertFalse(out["opened"])
+        self.assertIn("no such app", out.get("reason", ""))
+
+    def _locale_cache(self, **extra):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        cache = tmp / "browser-locale.json"
+        data = {"intlLocale": "en-US", "language": "en-US", "checkedAt": "2026-10-15 13:00",
+                "profileScope": "Claude"}
+        data.update(extra)
+        cache.write_text(json.dumps(data), encoding="utf-8")
+        return cache
+
+    def test_check_trusts_a_cache_the_script_opened(self):
+        """缓存里记着「复核页是脚本按 Profile 1 开的」，就不再算「身份未验证」。"""
+        cache = self._locale_cache(openedBy="script", openedProfileDir="Profile 1")
+        with mock.patch.object(g, "LOCALE_CACHE", cache), \
+             mock.patch.object(g, "cache_is_fresh", return_value=(True, "")):
+            out = g.check_browser_locale()
+        self.assertFalse(out.get("scope_unverified"))
+        self.assertTrue(out.get("opened_by_script"))
+        self.assertIn("Profile 1", out.get("source") or "")
+
+    def test_check_still_flags_a_cache_opened_by_hand(self):
+        cache = self._locale_cache(openedBy="user")
+        with mock.patch.object(g, "LOCALE_CACHE", cache), \
+             mock.patch.object(g, "cache_is_fresh", return_value=(True, "")):
+            out = g.check_browser_locale()
+        self.assertTrue(out.get("scope_unverified"))
+
+    def _locale_report(self, **extra):
+        # 判定读的是 check_browser_locale() 组装出来的 measured，不是缓存里的 intlLocale。
+        bl = {"measured": "en-US", "intlLocale": "en-US", "language": "en-US",
+              "country": "US", "cn": False, "checked_at": "2026-10-15 13:00"}
+        bl.update(extra)
+        return {"A27_browser_locale": bl}
+
+    def test_locale_row_greens_for_a_script_opened_page(self):
+        report = self._locale_report(opened_by_script=True,
+                                     source="浏览器实测（脚本打开的复核页，资料 Profile 1）")
+        rows = dict((n, s) for n, s, _ in g.build_summary(report))
+        self.assertIs(rows["浏览器 Intl 区域设置"], g.S_OK)
+
+    def test_locale_row_stays_unknown_without_that_proof(self):
+        report = self._locale_report(scope_unverified=True,
+                                     source="浏览器实测（用户声明资料：Claude；资料身份未由脚本验证）")
+        rows = dict((n, s) for n, s, _ in g.build_summary(report))
+        self.assertIs(rows["浏览器 Intl 区域设置"], g.S_NA)
+
+    def test_webrtc_row_greens_for_a_script_opened_page(self):
+        report = {"A7_webrtc": {"available": False, "note": "未探测"}}
+        media = {"ok": True, "camera": "denied", "microphone": "denied",
+                 "detail": "NotAllowedError", "checkedAt": "2026-10-15 13:00",
+                 "openedBy": "script"}
+        with mock.patch.object(g, "load_media_permission", return_value=media), \
+             mock.patch.object(g, "cache_is_fresh", return_value=(True, "")):
+            rows = dict((n, s) for n, s, _ in g.build_summary(report))
+        self.assertIs(rows["WebRTC 泄漏"], g.S_OK)
+
+    def test_webrtc_row_stays_unknown_for_a_hand_opened_page(self):
+        report = {"A7_webrtc": {"available": False, "note": "未探测"}}
+        media = {"ok": True, "camera": "denied", "microphone": "denied",
+                 "checkedAt": "2026-10-15 13:00", "openedBy": "user"}
+        with mock.patch.object(g, "load_media_permission", return_value=media), \
+             mock.patch.object(g, "cache_is_fresh", return_value=(True, "")):
+            rows = dict((n, s) for n, s, _ in g.build_summary(report))
+        self.assertIs(rows["WebRTC 泄漏"], g.S_NA)
 
 
 if __name__ == "__main__":

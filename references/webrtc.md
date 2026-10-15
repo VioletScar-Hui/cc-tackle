@@ -39,3 +39,54 @@
 这里面有个坑值得记下来：**探测用哪个浏览器会决定结论真假**。同样给了媒体权限，headless shell 只给 1 个候选、看不到任何 IP，完整 Chromium 给 4 个、露出真实地址。也就是说用 headless shell 测，「授权后会不会露」这个问题永远答「不会」——一个看起来干净的假阴性。所以 `find_chromium()` 现在把完整版排在前面，结果里也会标明用的是哪个。
 
 （曾试过把 TUN 地址从 `198.18.0.1` 换成普通的 `172.19.0.1`，让泄漏出来的地址不那么显眼。写了 `tun.inet4-address` 但 mihomo 在配置重载时不重建 TUN 接口，要生效得重启内核；而重启后接口地址与 fake-IP 段不在同一网段，可能影响 fake-IP 路由。这个改动只在「已经授权、真实内网 IP 也一起漏」的场景下才有意义，收益不值这个险，已回滚。）
+
+## 把 WebRTC Network Limiter 装上
+
+文章 2.5② 推的那个扩展就是 Google 官方的 **WebRTC Network Limiter**，商店里查得到的 ID 是 `npeicpdbkakmehahjeeohfdhnlpdklia`，主页：
+
+```
+https://chromewebstore.google.com/detail/npeicpdbkakmehahjeeohfdhnlpdklia
+```
+
+本 skill 能把扩展包直接下到本机：
+
+```
+python3 scripts/account_guard.py --install-webrtc-limiter
+```
+
+这条命令做三件事：先报本机每个 Chrome 资料里装没装、设置对不对；再把扩展包下到 `~/.local/state/claude-guard/extensions/`；最后在声明的资料里把商店页打开。装的那一下仍然要你点——**Chrome 在 macOS 上不接受脚本代装扩展**，这一条不是没做，是做不到。
+
+### 下下来的包怎么确信是它
+
+包走的是商店自己的分发接口，不是第三方镜像：
+
+```
+https://clients2.google.com/service/update2/crx?response=redirect
+  &prod=chromiumcrx&prodversion=<本机 Chrome 版本>&acceptformat=crx2,crx3
+  &x=id%3D<扩展 ID>%26installsource%3Dondemand%26uc
+```
+
+`prod=chromiumcrx`、`x=` 里那串 id 与 installsource 一个都不能少，少一个服务端回的是商店页面而不是包（实测：返回 302 加一段 HTML）。
+
+下到之后按三道核：`Cr24` 魔数加版本头 → 包里 zip 的 `manifest.json` 能读出来且 `update_url` 指向商店 → **签名块里的公钥算出来的扩展 ID 与申请时那个一致**。第三道是最硬的：扩展 ID 本来就是发布者公钥的 SHA-256 前 16 字节按 `a`–`p` 映射出来的，名字能在 manifest 里随便改，ID 改不了。商店下发的包里有两块签名（Google 的商店密钥和发布者密钥），只有发布者那块对得上，所以两块都算、命中一块即认。
+
+2026-10-15 实机下到的：`0.2.1.4`（manifest v3），11439 字节，sha256 `3a4205af59c2df0d…`。
+
+### 怎么知道已经装上了
+
+读每个资料的 `Secure Preferences`（不是 `Preferences`——实测同一个资料的 `Preferences` 里 `extensions.settings` 是空的，带 MAC 保护的扩展设置在这个文件里），看 `extensions.settings.<ID>` 在不在、`preferences` 里的 `webrtc.ip_handling_policy` 是不是 `disable_non_proxied_udp`。
+
+macOS 的 TCC 可能不让脚本读另一个 App 的资料目录（本机从 DSH 里跑就是 `Operation not permitted`，双击终端跑则通常可以）。**读不到时报「读不到」，不报「没装」**——这两件事不一样。
+
+### 想彻底免手工
+
+唯一能无人值守装上的路子是机器级策略，代价是浏览器从此显示「由组织管理」、这个扩展你自己也卸不掉：
+
+```
+sudo defaults write "/Library/Managed Preferences/com.google.Chrome" \
+    ExtensionInstallForcelist -array "npeicpdbkakmehahjeeohfdhnlpdklia;https://clients2.google.com/service/update2/crx"
+```
+
+要不要吃这个代价由你决定，体检脚本不替你决定。没网或下不动时的后备：把下下来的 `.crx` 拖进 `chrome://extensions/`（先打开右上角的开发者模式）。
+
+装完记得：它只是把 `webRTCIPHandlingPolicy` 设成 `disable_non_proxied_udp`，**网页视频通话从此建不起来**，而且这个设置是按资料生效的，别的资料要单独装。要按需决定，别一刀切。

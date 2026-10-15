@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-account-guard 一键自检。
+"""CC tackle 一键自检。
 
 把散在 SKILL.md 和桌面指令文档各节的复核命令串成一条。检查七件事：技能文件
 齐全 → 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四
@@ -57,6 +57,22 @@ def sh(cmd, timeout=60, cwd=None, env=None):
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, f"{type(exc).__name__}: {exc}"
+
+
+def sh_split(cmd, timeout=60, cwd=None, env=None):
+    """跑一条命令，stdout 与 stderr 分开返回。
+
+    要解析 JSON 的命令必须用这个：sh() 把两股合在一起，进度行或告警混进来
+    就整份解析不了（实测被 --verify-browser 的复核进度行坑过一次）。
+    """
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd) if cwd else None, env=env, check=False,
+        )
+        return p.returncode, (p.stdout or ""), (p.stderr or "")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, "", f"{type(exc).__name__}: {exc}"
 
 
 def tail(text: str, n: int = 300) -> str:
@@ -239,7 +255,7 @@ def project_roots_default() -> tuple:
     return "", "没有可用的项目根，这一项会被跳过"
 
 
-def check_audit(project_roots: str = ""):
+def check_audit(project_roots: str = "", browser: bool = True):
     """跑完整体检，返回 (报告路径, 报告字典)。
 
     第二项留给调用方展开成逐条明细。读不出来时为 None —— 那种情况下汇总行已经
@@ -250,12 +266,17 @@ def check_audit(project_roots: str = ""):
         env["CLAUDE_GUARD_PROJECT_ROOTS"] = project_roots
     else:
         env.pop("CLAUDE_GUARD_PROJECT_ROOTS", None)
-    code, out = sh([sys.executable, str(HERE / "account_guard.py"), "--audit", "--json"],
-                   timeout=900, cwd=SKILL, env=env)
+    cmd = [sys.executable, str(HERE / "account_guard.py"), "--audit", "--json"]
+    if browser:
+        # 让脚本自己弹出浏览器复核页：不弹的话「浏览器 Intl」「WebRTC」两项必然没结论。
+        cmd.append("--verify-browser")
+    code, out, err = sh_split(cmd, timeout=900, cwd=SKILL, env=env)
     try:
         report = json.loads(out)
     except (ValueError, TypeError):
-        add("完整环境体检", BAD, f"没读出 JSON 报告（退出码 {code}）：{tail(out)}")
+        # stdout 里没有 JSON，就把两股都摊出来，别只说一句「读不出来」。
+        add("完整环境体检", BAD,
+            f"没读出 JSON 报告（退出码 {code}）：{tail(err or out)}")
         return "", None
     rows = g.build_summary(report)
     total = len(rows)
@@ -272,23 +293,25 @@ def check_audit(project_roots: str = ""):
         # 只有「未测到」时别说成有待处理：那些项要么是设计如此（浏览器复核要现场开一次），
         # 要么得声明目标（预期出口），跑加固流程并不能把它们变绿。
         add("完整环境体检", HINT,
-            detail + "；这些不是待处理，是需要现场复核或先声明目标："
-                     "python3 scripts/account_guard.py --commands 里给了逐条命令")
+            detail + "；剩下的要么是这次的开关关掉了（--no-browser / 没声明目标），"
+                     "要么本来就靠 --commands 里的手工命令")
     else:
         add("完整环境体检", OK, detail)
     return "", report
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="claude-account-guard 一键自检（只读）")
+    ap = argparse.ArgumentParser(description="CC tackle 一键自检（只读）")
     ap.add_argument("--fast", action="store_true", help="跳过单元测试")
     ap.add_argument("--no-audit", action="store_true", help="跳过完整环境体检")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="不自动打开浏览器复核页（浏览器 Intl 与 WebRTC 会变成「未测到」）")
     args = ap.parse_args()
 
     # 项目根先定下来：它会决定体检里 A14 / A24 扫哪儿，选中的那一级要打出来。
     roots, roots_source = project_roots_default()
 
-    print(f"claude-account-guard 一键自检  ——  {SKILL}")
+    print(f"CC tackle 一键自检  ——  {SKILL}")
     print("只读，不改任何配置。\n")
 
     check_files()
@@ -305,7 +328,10 @@ def main() -> int:
     if args.no_audit:
         add("完整环境体检", HINT, "--no-audit 跳过了")
     else:
-        report_path, report = check_audit(roots)
+        # 在 Claude Code 里跑时脚本只放行纯 --audit，加了开关也会被拒，所以先降级并说清楚。
+        want_browser = not args.no_browser
+        under_cc = g.running_under_claude()
+        report_path, report = check_audit(roots, browser=want_browser and not under_cc)
 
     # 逐条展开用报告自己算，不把判定重写一遍 —— 否则展开和 --audit 迟早各说各话。
     sub_rows = g.build_summary(report) if report else []
@@ -324,6 +350,10 @@ def main() -> int:
         print()
         print(g.render_table(("检查项", "状态", "实测结果"),
                              [(n, s.strip(), g.truncate(d, 72)) for n, s, d in sub_rows]))
+    if want_browser and under_cc:
+        print()
+        print("  注意：这次是在 Claude Code 里跑的，脚本只放行只读审计，复核页没有弹。")
+        print("       要连浏览器一起测：在终端或双击桌面的 claude-环境检查.command。")
     if report_path:
         print()
         print(f"  完整体检报告（未截断的全文在里面）：{report_path}")

@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>claude-account-guard</h1>
+  <h1>CC tackle</h1>
   <p><strong>Claude Code 本机环境体检与可控清理</strong></p>
   <p>macOS · 核心检测使用 Python 标准库 · 证据优先 · 改动可复核</p>
   <p>
@@ -21,7 +21,7 @@
 
 > **用途边界**：这是一个面向 macOS 本机的环境检查与维护工具。它帮助你发现网络出口、代理残留、时区、浏览器测量和 Claude Code 本地配置中的可见问题；它不能解释服务端风控原因，也不能保证账号可用或通过任何服务的审核。
 
-`claude-account-guard` 把检测、证据、备份和复验放在同一条命令链里。默认先看清楚环境，再决定是否处理。普通 `--audit` 默认不写审计报告、出口历史或缓存；需要保存时显式使用 `--audit --save-audit`。完整加固会先展示执行清单，只有确认后才锁定目标、备份和修改。
+CC tackle 把检测、证据、备份和复验放在同一条命令链里。默认先看清楚环境，再决定是否处理。普通 `--audit` 默认不写审计报告、出口历史或缓存；需要保存时显式使用 `--audit --save-audit`。完整加固会先展示执行清单，只有确认后才锁定目标、备份和修改。
 
 <a id="features"></a>
 
@@ -56,8 +56,8 @@ python3 scripts/account_guard.py             # 修：列清单 → 敲一次 CON
 ### 只读审计入口
 
 ```bash
-git clone https://github.com/VioletScar-Hui/claude-account-guard.git
-cd claude-account-guard
+git clone https://github.com/VioletScar-Hui/cc-tackle.git
+cd cc-tackle
 python3 scripts/account_guard.py --audit
 ```
 
@@ -120,12 +120,16 @@ python3 scripts/report_serve.py
 ```bash
 python3 scripts/account_guard.py --manual       # 打印人工核对清单
 python3 scripts/account_guard.py --commands     # 打印检测网站与命令
-python3 scripts/account_guard.py --audit --webrtc # 在审计中附加 WebRTC 探测
-python3 scripts/account_guard.py --check-media  # 等待浏览器回传媒体权限
-python3 scripts/account_guard.py --check-locale # 等待浏览器回传 Intl 区域
+python3 scripts/account_guard.py --audit --webrtc       # 在审计中附加 WebRTC 探测
+python3 scripts/account_guard.py --audit --verify-browser # 脚本自己开复核页，一次跑完不留未测到
+python3 scripts/account_guard.py --install-webrtc-limiter # 下载 WebRTC Network Limiter 扩展包并打开商店页
+python3 scripts/account_guard.py --check-media           # 单独跑：开复核页并等回传媒体权限
+python3 scripts/account_guard.py --check-locale          # 单独跑：开复核页并等回传 Intl 区域
 ```
 
-`--audit --webrtc` 会启动临时浏览器资料进行探测，并在结束后清理；它不会修改日常浏览器资料。`--check-media` 和 `--check-locale` 会在本机保存回传缓存。
+`--install-webrtc-limiter` 只下载与报告，不改本机配置，所以不需要 TTY：它把扩展包从商店的官方分发接口下到 `~/.local/state/claude-guard/extensions/`，核对签名公钥算出来的扩展 ID，并报出每个 Chrome 资料里装没装。**安装那一下仍然只能你自己点**：Chrome 在 macOS 上不接受脚本代装扩展。
+
+`--audit --webrtc` 会启动临时浏览器资料进行探测，并在结束后清理；它不会修改日常浏览器资料。`--check-media` 和 `--check-locale` 会在本机保存回传缓存，并且会自己把复核页打开——想指定开在哪个 Chrome 资料（就是你日常用 Claude 的那个）就设 `CLAUDE_GUARD_BROWSER_PROFILE_DIR`，例如 `Profile 1`。脚本自己打开的复核页写进缓存的 `openedBy` 是 `script`，这两项才判结论；别人手工打开的记 `user`，只当参考、不作通过证据。
 WebRTC 专项探测会直接启动本机可用的 Chromium；其余核心检测使用 Python 标准库。
 
 ### 需要修改本机状态时
@@ -166,7 +170,7 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 | Claude Code | `settings.json` 端点与凭据、遥测开关、第三方客户端、CLI 签名完整性 |
 | 环境卫生 | 项目级 `.claude`、失效权限、过期工作树登记、可回收系统体积 |
 
-浏览器缓存型结果只在缓存不超过 24 小时、且与显式设置的 `CLAUDE_GUARD_BROWSER_PROFILE` 匹配时作为参考；否则标记为未测到或要求重新测量。这个资料名由用户声明，脚本无法独立证明打开复核页面的浏览器资料身份，所以仅凭匹配缓存也不会标记为通过。
+浏览器缓存型结果要同时满足三件事才出结论：不超过 24 小时、`profileScope` 与显式设置的 `CLAUDE_GUARD_BROWSER_PROFILE` 一致、以及缓存里的 `openedBy` 是 `script`（复核页由脚本自己拉起，而不是别人手工打开）。这个资料名由用户声明，脚本能证明的是「哪个资料打开了这个页面」，不能独立证明它就是你的日常账号，所以页面上会把依据写成「浏览器实测（脚本打开的复核页，资料 Profile 1）」而不是一句「通过」。
 
 状态表会区分：
 
@@ -210,12 +214,13 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 
 ```bash
 export CLAUDE_GUARD_PROJECT_ROOTS="$HOME/code:$HOME/work"
-export CLAUDE_GUARD_BROWSER_PROFILE="my-claude-profile"
+export CLAUDE_GUARD_BROWSER_PROFILE="my-claude-profile"      # 你给这个资料起的名字（写进缓存做范围校验）
+export CLAUDE_GUARD_BROWSER_PROFILE_DIR="Profile 1"          # 复核页开在哪个 Chrome 目录里
 export CLAUDE_GUARD_EXPECTED_COUNTRY="US"           # 你声明这条线路应该落在哪一国
 export CLAUDE_GUARD_EXPECTED_EXIT_IP="203.0.113.10" # 可选：把出口 IP 也一起钉死
 ```
 
-`CLAUDE_GUARD_EXPECTED_COUNTRY` / `CLAUDE_GUARD_EXPECTED_EXIT_IP` 和对应的两个命令行参数是同一件事：声明你预期的出口。命令行优先，其次环境变量；两处都没给，「预期出口是否符合」那一项就如实报「未测到」，脚本不会替你猜一个。
+`CLAUDE_GUARD_EXPECTED_COUNTRY` / `CLAUDE_GUARD_EXPECTED_EXIT_IP` 和对应的两个命令行参数是同一件事：声明你预期的出口。命令行优先，其次环境变量，最后是设过 `--save-audit` 之后记在 `~/.local/state/claude-guard/expected-exit.json` 里的那份；三处都没有，「预期出口是否符合」那一项就如实报「未测到」，脚本不会替你猜一个。只读审计不写这份记录。
 
 如果本机 secret 不是默认值，请通过已有安全机制预先注入 `CLASH_SECRET` 环境变量；不要在命令行、shell 历史、脚本或仓库中写明文 secret。
 
@@ -226,8 +231,8 @@ export CLAUDE_GUARD_EXPECTED_EXIT_IP="203.0.113.10" # 可选：把出口 IP 也�
 把仓库放入本机的 skills 目录，并保持目录名与 `SKILL.md` frontmatter 的 `name` 完全一致：
 
 ```bash
-git clone https://github.com/VioletScar-Hui/claude-account-guard.git \
-  ~/.claude/skills/claude-account-guard
+git clone https://github.com/VioletScar-Hui/cc-tackle.git \
+  ~/.claude/skills/cc-tackle
 ```
 
 安装后仍建议从普通终端先运行 `--audit`，再根据实际报告决定是否继续加固。
@@ -268,7 +273,7 @@ python3 tests/test_account_guard.py
 
 测试应在隔离夹具中运行；真实设备、真实代理、真实浏览器权限和管理员设置不属于单元测试的覆盖范围。
 
-每次推送到 `main`、提交 Pull Request 或手动运行时，GitHub Actions 会在 macOS 上用 Python 3.11 和 3.13 执行编译检查、单元测试和命令帮助检查。CI 只运行隔离的只读检查，不会执行真实的审计、加固、恢复或自检操作：[`查看 CI 工作流`](https://github.com/VioletScar-Hui/claude-account-guard/actions/workflows/tests.yml)。
+每次推送到 `main`、提交 Pull Request 或手动运行时，GitHub Actions 会在 macOS 上用 Python 3.11 和 3.13 执行编译检查、单元测试和命令帮助检查。CI 只运行隔离的只读检查，不会执行真实的审计、加固、恢复或自检操作：[`查看 CI 工作流`](https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml)。
 
 <a id="references"></a>
 

@@ -52,6 +52,45 @@ GROUPS = (
     ("代码与仓库", ("代码是否落在本地 Git",)),
 )
 
+# 页面末尾给的自查入口。这些是给用户自己点开核对的第三方检测站：脚本不代跑，
+# 也不抓它们的任何资源——页面上只有链接，没有外链图片或脚本，离线打开也不会去连它们。
+DETECTION_SITES = (
+    ("出口与归属", (
+        ("https://ipinfo.io/", "IP 归属、ASN 与运营商；看「是机房还是住宅」用的就是它"),
+        ("https://ping0.cc/", "IP 类型与风控值：原生还是广播、多少人共用这个出口"),
+        ("https://cleanip.io/", "聚合 20+ 数据源的纯净度评分与欺诈分"),
+        ("https://ippure.com/", "IP 纯净度与风险系数，附带浏览器指纹总览"),
+    )),
+    ("针对 Claude 的区域指纹与线路", (
+        ("https://ippure.com/claude.html", "六项区域指纹加权：时区、语言、中文字体、Intl 区域设置、时区偏移、Emoji"),
+        ("https://ip.net.coffee/claude/", "Claude 相关域名实际的出口与纯净度"),
+    )),
+    ("分流有没有生效", (
+        ("https://ip.net.coffee/", "国内外 35+ 站点各自的出口 IP，用来核对规则有没有按预期分流"),
+    )),
+    ("泄漏面", (
+        ("https://browserleaks.com/webrtc", "WebRTC 候选里有没有真实 IP 或 TUN 地址"),
+        ("https://browserleaks.com/dns", "到底是谁在替你解析域名，有没有国内解析器"),
+    )),
+    ("顺手装一个扩展", (
+        ("https://chromewebstore.google.com/detail/npeicpdbkakmehahjeeohfdhnlpdklia",
+         "WebRTC Network Limiter：Google 官方扩展，把 WebRTC 的 UDP 限制成只走代理"),
+    )),
+)
+
+
+def _detection_sites_html() -> str:
+    blocks = []
+    for group, sites in DETECTION_SITES:
+        items = "".join(
+            f"<li><a href='{_esc(url)}' target='_blank' rel='noopener noreferrer'>{_esc(url)}</a>"
+            f"<span class='tiny'>{_esc(note)}</span></li>"
+            for url, note in sites
+        )
+        blocks.append(f"<div class='card'><h3>{_esc(group)}</h3><ul class='sites'>{items}</ul></div>")
+    return "<div class='grid g2'>" + "".join(blocks) + "</div>"
+
+
 # 每一行的依据来自报告里的哪个字段。「看依据」按钮把这几个字段摊开，数值不动，
 # 只摘掉出处标注；页面上的说法和原始读数仍然对得上。
 ROW_SOURCE = {
@@ -64,6 +103,7 @@ ROW_SOURCE = {
     "时区是否锁在台北": ("A21_timezone_layers",),
     "时区两道闸": ("A21_timezone_layers",),
     "绝不直连": ("A12_clash_groups",),
+    "代理后端": ("A28_proxy_backend",),
     "代码是否落在本地 Git": ("A14_local_git",),
     "作息与出口时区": ("A22_schedule",),
     "浏览器资料是否隔离": ("A23_browser_profiles",),
@@ -122,6 +162,12 @@ code,pre,.mono{font-family:var(--mono)}
 .chip.ok b{color:#7ee2a8}.chip.warn b{color:#ffd08a}.chip.bad b{color:#ffb4ae}.chip.na b{color:#b9c0cc}
 
 /* ── 关键实测 ── */
+.sites{list-style:none;margin:8px 0 0;padding:0}
+.sites li{padding:6px 0;border-bottom:1px dashed var(--line)}
+.sites li:last-child{border-bottom:0}
+.sites a{color:#0f233d;text-decoration:none;border-bottom:1px solid #cfd8e3;word-break:break-all}
+.sites a:hover{border-bottom-color:#0f233d}
+.sites .tiny{display:block;color:var(--muted);margin-top:2px;word-break:normal}
 .facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(228px,1fr));gap:10px;margin:18px 0 6px}
 .fact{background:#1b1f2a;border-radius:12px;padding:11px 13px}
 .fact .k{color:#9aa3b2;font-size:12px;margin-bottom:4px}
@@ -326,7 +372,17 @@ def _facts(rep: dict) -> list:
     grp = cg.get("claude_group") or {}
     fb = cg.get("fallback") or {}
     layers = tz.get("layers") or {}
+    pb = rep.get("A28_proxy_backend") or {}
+    caps = pb.get("capabilities") or {}
+    cap_bits = [
+        "能读 DNS" if caps.get("read_dns") else None,
+        "能读分流" if caps.get("read_routing") else None,
+        "能改 DNS" if caps.get("fix_dns") else None,
+        "改完可复验" if caps.get("verify_after_write") else "改完不能就地复验",
+    ]
     out = [
+        ("代理后端", pb.get("short") or pb.get("label")),
+        ("代理能力", "、".join([x for x in cap_bits if x]) or None),
         ("出口 IP", ip.get("ip")),
         ("归属", " / ".join([x for x in (ip.get("city"), ip.get("country")) if x])),
         ("运营商与 ASN", ip.get("org")),
@@ -567,7 +623,7 @@ def render(report: dict, before: dict = None, report_path=None,
 
 <div class="hero">
   <h1>Claude 环境体检报告</h1>
-  <div class="sub">claude-account-guard · {len(rows)} 项检查 · 未测到的项不计入分数</div>
+  <div class="sub">CC tackle · {len(rows)} 项检查 · 未测到的项不计入分数</div>
   <div class="hero-grid">
     <div class="ring" style="--p:{score_txt if sc['score'] is not None else 0};--ring:{sc['ring']}">
       <div class="ring-in"><div style="text-align:center"><b>{score_txt}</b><br><small>/ 100</small></div></div>
@@ -596,6 +652,9 @@ def render(report: dict, before: dict = None, report_path=None,
 
 <section><h2>必须人工做的 <span class="hint">{sum(len(x[1]) for x in g.MANUAL_ACTIONS)} 条，脚本碰不到</span></h2>
   {_manual_html(g.MANUAL_ACTIONS)}</section>
+
+<section><h2>自己再核一遍 <span class="hint">这些站脚本不代跑，点开自己看。最后一条是 Chrome 扩展，本 skill 用 <code>--install-webrtc-limiter</code> 把包装下到本机</span></h2>
+  {_detection_sites_html()}</section>
 
 <footer>
   {''.join(meta)}<br>
