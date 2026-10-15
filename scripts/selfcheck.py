@@ -358,13 +358,10 @@ def main() -> int:
         print()
         print(f"  完整体检报告（未截断的全文在里面）：{report_path}")
     if report:
-        # 同一份报告也渲染成 HTML 并打开：终端表格适合扫一眼，报告页适合看清整体。
-        try:
-            import report_html
-            page = report_html.write_report(report, open_it=True, report_path=report_path or "")
-            print(f"  HTML 报告：{page}")
-        except Exception as error:
-            print(f"  HTML 报告生成失败：{error}")
+        # 这里**刻意不渲染 HTML**：一次流程只留最后那一份带「修复前 → 修复后」对照的报告，
+        # 由加固收尾自己出。只读自检每跑一次就弹一个页面，等于把最终报告稀释成随手可得的快照。
+        print("  要这次体检的 HTML 快照（没有前后对照）："
+              "python3 scripts/account_guard.py --audit --report")
     print(f"  项目根（A14 / A24 扫这里）：{roots or '未指定'}　—　{roots_source}")
     if n_bad:
         print(f"\n  有 {n_bad} 项没过。逐项看：python3 scripts/account_guard.py --commands")

@@ -153,6 +153,15 @@ code,pre,.mono{font-family:var(--mono)}
 .grade{font-size:30px;font-weight:700;margin-right:2px}
 .grade small{font-size:12px;color:#9aa3b2;font-weight:400;display:block;margin-top:2px}
 .hero-note{color:#c7ccd6;font-size:13px}
+.cmp{display:flex;align-items:center;gap:10px;padding:7px 2px;border-bottom:1px dashed var(--line);font-size:13.5px}
+.cmp:last-child{border-bottom:0}
+.cmp-name{flex:1;min-width:0;color:var(--ink)}
+.cmp-mark{flex:0 0 32px;text-align:center;border-radius:8px;font-weight:600;padding:1px 0;font-size:13px}
+.cmp-mark.ok{color:var(--ok);background:var(--ok-bg)}
+.cmp-mark.warn{color:#a35c00;background:var(--warn-bg)}
+.cmp-mark.bad{color:var(--bad);background:var(--bad-bg)}
+.cmp-mark.na{color:var(--na);background:var(--na-bg)}
+.cmp-arrow{flex:0 0 14px;text-align:center;color:var(--na)}
 .delta{margin-top:8px;font-size:13px;color:#c7ccd6}
 .delta b{color:#fff}
 .delta .up{color:#7ee2a8}.delta .down{color:#ffb4ae}
@@ -586,14 +595,36 @@ def render(report: dict, before: dict = None, report_path=None,
 
     changed = ""
     if before_rows:
-        bmap = {r[0]: _kind(r[1]) for r in before_rows}
+        # 逐项把「动手前」与「动手后」两个记号并排摆出来。只列改好的那几项不够用：
+        # 这份页面本身就是前后对照，没变的项也要能看到它当时是什么。
         rank = {"bad": 0, "warn": 1, "ok": 2}
-        fixed = [r[0] for r in rows
-                 if rank.get(_kind(r[1]), 3) > rank.get(bmap.get(r[0], "na"), 3)]
-        if fixed:
-            changed = ("<section><h2>这一轮改好的 <span class='hint'>同一轮运行里，动手前后的对比</span></h2>"
-                       "<div class='card'>" + "".join(f"<div class='item ok'><div class='dot'>✓</div>"
-                       f"<div class='name'>{_esc(n)}</div></div>" for n in fixed) + "</div></section>")
+        bmap = {r[0]: r[1] for r in before_rows}
+        lines, fixed, worse, incomparable = [], 0, [], 0
+        for r in rows:
+            was, now = bmap.get(r[0], "·"), r[1]
+            a, b = rank.get(_kind(was)), rank.get(_kind(now))
+            # 「这次没测到」不参与比较：从 · 变成 ✓ 是这次量到了，不是被改好的，
+            # 反过来把 没测到 当成比 已解决 还高，就会把一整片正常的项报成「变差了」。
+            if a is None or b is None:
+                incomparable += 1
+            elif b > a:
+                fixed += 1
+            elif b < a:
+                worse.append(r[0])
+            lines.append(
+                "<div class='cmp'>"
+                f"<div class='cmp-name'>{_esc(r[0])}</div>"
+                f"<div class='cmp-mark {_kind(was)}'>{_esc((was or '·').strip())}</div>"
+                "<div class='cmp-arrow'>→</div>"
+                f"<div class='cmp-mark {_kind(now)}'>{_esc((now or '·').strip())}</div>"
+                "</div>")
+        note = f"同一轮运行里的两次真读数：这一轮改好 {fixed} 项"
+        if worse:
+            note += f"，另有 {len(worse)} 项比动手前差（" + "、".join(worse) + "）"
+        if incomparable:
+            note += f"；{incomparable} 项有一边是「没测到」，不计入对比"
+        changed = (f"<section><h2>修复前 → 修复后 <span class='hint'>{_esc(note)}</span></h2>"
+                   f"<div class='card'>{''.join(lines)}</div></section>")
 
     stamp = report.get("timestamp") or dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     meta = [f"<span class='pill'>报告 JSON：{_esc(report_path or '（未保存）')}</span>",

@@ -8078,11 +8078,14 @@ def main(argv: list[str] | None = None) -> int:
             "清理项目 .claude 下的 .DS_Store/__pycache__（会先备份）？"
         )
 
-        # 只询问意图；sudo 授权与 root 文件读取/备份都延后到 CONFIRM 之后。
-        do_ipv6 = do_loc = False
-        if ask_yes("处理需要管理员权限的两项（关闭 IPv6、关闭定位服务「设定时区」）？"):
+        # 只询问意图；密码本身在 CONFIRM 之后一次性收（见下面的 [0/6]）。
+        # do_root 单独记一笔：只要同意提权，定位库就要读一次——不读这一项永远
+        # 只有「读不到（要 root）」，跟用户答不答「关掉」无关。
+        do_ipv6 = do_loc = do_root = False
+        if ask_yes("处理需要管理员权限的两项（关闭 IPv6、定位服务「设定时区」）？"):
+            do_root = True
             do_ipv6 = ask_yes("关闭所有网络服务的 IPv6（文章 2.5 可选加固）？")
-            do_loc = ask_yes("关闭定位服务「设定时区」（需要管理员权限）？")
+            do_loc = ask_yes("读取定位服务状态，需要的话关掉「设定时区」（需要管理员权限）？")
 
         if telemetry == 1:
             print("\n⚠ 文章 §5 写明：关掉这些键会同时关掉功能旗标，Remote Control 可能用不了。")
@@ -8106,6 +8109,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  7b. 别家代理 DNS（{PROXY_BACKEND_LABELS.get(other_dns.get('backend'), '')}）："
                   f"{'是（改完要重启它）' if do_other_dns else '否（要显式加 --fix-unverified）'}")
         print(f"  8. 不可原样回滚清理：旧版本/缓存={'是' if do_storage else '否'}；失效权限={'是' if do_dead_permissions else '否'}；worktree 注册={'是' if do_stale_worktrees else '否'}")
+        if do_root:
+            print("  9. 管理员授权：动手前申请一次（终端隐藏输入开机密码，脚本不读不存），"
+                  "IPv6 与定位库都复用它")
         print("  绝不改动：session、project、history、skill、plugin、hook、command、agent、MCP 配置等受保护数据。")
         if input("完全理解后输入 CONFIRM 开始；其他输入取消：").strip() != "CONFIRM":
             print("已取消，没有修改任何内容。")
@@ -8120,6 +8126,36 @@ def main(argv: list[str] | None = None) -> int:
             print("等它跑完再来；若确认那个进程已经不在了，删掉锁文件即可。", file=sys.stderr)
             return 2
         print(f"  {lock_note}")
+
+        # [0/6] 管理员授权 —— 提权提前到动手之前，一次问清、后面全部复用。
+        # 以前是懒加载：真到要写 root 文件（[1/6] 备份）或关定位闸（[6/6]）时才弹
+        # 密码，而那时前面已经跑了几分钟的清理；出去接杯水回来授权就过期了，
+        # 下一步的 sudo -n 只会上报失败。现在先申请，后面每一步都吃这份缓存。
+        if do_root:
+            print("\n[0/6] 管理员授权 —— 下面这些要 root，只申请这一次：")
+            if do_ipv6:
+                print("       · 关闭所有网络服务的 IPv6")
+            print("       · 读一遍 /var/db/locationd/clients.plist"
+                  "（非 root 读不到，「时区两道闸」这一项就没结论）")
+            if do_loc:
+                print("       · 需要的话关掉定位服务里的「设定时区」")
+            print("       终端会隐藏提示输入一次开机密码，脚本不读取也不保存；")
+            print("       默认缓存 5 分钟，中途过期只会补问一次。")
+            try:
+                sudo_prime()
+            except Exception:
+                # 用户没输密码 / 输错了：不让整轮失败，把需要 root 的那几项跳过，
+                # 其余照常做完——因为「没授权」是用户的选择，不是脚本的故障。
+                print("       ⚠ 没有拿到管理员授权：IPv6 与定位库这两步这次跳过，其余照常。")
+                do_ipv6 = do_loc = do_root = False
+            if do_root:
+                loc = location_service_status(persist=True)
+                gate = location_gate_state(loc)
+                if gate is None:
+                    print(f"       定位库仍读不到：{loc.get('note')}")
+                else:
+                    print(f"       定位库已读到（root 实测于 {now_stamp()}）：「设定时区」"
+                          f"{'还开着' if gate else '已经关着'}；复检与后续审计都认这份读数")
 
         before = protected_snapshot()
         # Clash 配置也进备份：DNS 那一项要改生成物和 profile 的 Merge 增强文件两处，
@@ -8283,6 +8319,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if do_ipv6:
             _mark_backup_in_progress(backup, "ipv6")
+            ensure_sudo("关闭 IPv6")      # [0/6] 到这一步可能已过 5 分钟，过期会补问
             res = set_ipv6_off(list(report["A5_ipv6"]["services"]))
             if res["failed"]:
                 raise RuntimeError(f"IPv6 仅部分关闭：{res['done']}；失败：{res['failed']}")
