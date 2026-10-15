@@ -30,7 +30,7 @@
 <table>
   <tr>
     <td width="33%"><strong>网络身份</strong><br /><br />检查出口 IP 与 ASN 类型、出口变化、DNS、WebRTC、IPv6 和 Claude 域名的路由结果，并把“未测到”和“异常”分开。</td>
-    <td width="33%"><strong>代理链路</strong><br /><br />查看系统代理、shell、npm、git 与 Clash 配置中的残留或不一致项，保留原始证据供复核。</td>
+    <td width="33%"><strong>代理链路</strong><br /><br />查看系统代理、shell、npm、git 与代理软件配置中的残留或不一致项，保留原始证据供复核。</td>
     <td width="33%"><strong>Claude 配置</strong><br /><br />检查 <code>settings.json</code> 的端点、凭据和代理变量，以及遥测开关、CLI 签名和第三方客户端痕迹。</td>
   </tr>
   <tr>
@@ -109,6 +109,8 @@ python3 scripts/report_serve.py
 
 体检完起一个只绑 `127.0.0.1` 的服务并打开页面。能自动修的项右边多一个按钮，点一下执行、页面刷新、顶部写明这次做了什么；顶部另有「修复全部可自动修的项」和「重新体检」，页脚「结束本地服务」，空闲 30 分钟自动退出。安全边界：端口随机、URL 带一次性令牌、POST 需自定义头、动作白名单，不带令牌一律 404。
 
+别家代理（sing-box / v2ray / Surge）的 DNS 配置改动不在按钮里，也不默认执行：改完能不能生效取决于那个软件自己重启，脚本验不了，要用 `--fix-unverified` 显式开启，且会先备份。
+
 按钮只出现在本来就敢自动做的项上：系统代理残留、shell/npm/git 代理、settings.json 端点与凭据、Clash DNS、浏览器 Intl、系统级可清理量、settings 失效权限、项目级垃圾与失效工作树注册。需要人拿主意的（遥测开关、IPv6、定位服务）和必须人工的（手机时区、支付、浏览器隔离）不出按钮。
 
 删掉的旧版本与缓存没法像配置文件那样回滚，所以每次清理都会在 `~/ClaudeGuardBackups/cleanup-<时间戳>.json` 留一份账本，写明删了哪些路径、各多大。
@@ -159,7 +161,7 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 | 组别 | 典型检查 |
 | --- | --- |
 | 网络身份 | 出口 IP 与归属、ASN 类型、出口一致性、DNS、WebRTC、IPv6、Claude 域名路由 |
-| 代理链路 | 系统代理、shell 配置、npm/git 全局代理、Clash 模式和 DNS |
+| 代理链路 | 系统代理、shell 配置、npm/git 全局代理、代理后端的模式与 DNS |
 | 账号环境 | 时区层级、浏览器 Intl、浏览器资料复用、多账号痕迹、钥匙串条目 |
 | Claude Code | `settings.json` 端点与凭据、遥测开关、第三方客户端、CLI 签名完整性 |
 | 环境卫生 | 项目级 `.claude`、失效权限、过期工作树登记、可回收系统体积 |
@@ -199,7 +201,7 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 
 - 出口检查需要访问外部 IP/归属服务；这些服务只能看到本机发出的查询，不会收到项目文件。
 - WebRTC 和 Intl 检查通过本机回环页面等待浏览器回传；不会把完整审计报告上传到远端。
-- Clash 读取本机配置或 socket；自定义 secret 通过 `CLASH_SECRET` 传入，不要把它写进仓库。
+- 代理后端会自动识别：mihomo 内核（Clash Verge / ClashX / Mihomo Party / FlClash）、sing-box、Surge、v2ray / Xray、只有系统代理、VPN 隧道。依赖代理的只有「绝不直连」与「DNS 泄漏」两行，其余各项与代理软件无关。自定义 secret 通过 `CLASH_SECRET` 传入，不要把它写进仓库。
 - 脚本不会读取或保存 sudo 密码。Clash secret 从 `CLASH_SECRET` 读取；脚本调用本机 Clash API 时，会在 Python 内存中组装请求头，不把 secret 交给外部命令参数。仍请保护该环境变量，不要把它写入日志、脚本或仓库。
 - 默认项目范围可以通过 `CLAUDE_GUARD_PROJECT_ROOTS` 指定；自定义 `CLAUDE_CONFIG_DIR` 只会报告，不纳入加固范围。
 - 「系统级可清理量」少于 1 MB 不算待处理：Electron 的可再生缓存会被应用自己重建（实测清掉 43.8 MB，十几分钟后桌面版又长回 0.4 MB），为这点量常挂一个待处理没有意义。低于这个量时该行报通过，并写明还剩多少、为什么不动。

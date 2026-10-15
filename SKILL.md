@@ -61,7 +61,7 @@ python3 scripts/account_guard.py
 
 ## 运行顺序
 
-想先看全貌（只读，约 1.5 分钟），在本 skill 目录下跑 `python3 scripts/selfcheck.py`。它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表，并把体检那 26 项逐条展开；脚本按自己的位置定位，从任何工作目录调用都行，项目根没在 `CLAUDE_GUARD_PROJECT_ROOTS` 里指定时会自动用本 skill 所在的 git 仓并在末尾打出选中的是哪个。`--fast` 跳过单元测试，`--no-audit` 跳过体检。
+想先看全貌（只读，约 1.5 分钟），在本 skill 目录下跑 `python3 scripts/selfcheck.py`。它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表，并把体检那 27 项逐条展开；脚本按自己的位置定位，从任何工作目录调用都行，项目根没在 `CLAUDE_GUARD_PROJECT_ROOTS` 里指定时会自动用本 skill 所在的 git 仓并在末尾打出选中的是哪个。`--fast` 跳过单元测试，`--no-audit` 跳过体检。
 
 1. 如果当前执行者就是 Claude Code，只跑只读审计，并提醒用户换普通终端再执行加固（加固会改本机状态，不适合由正在使用它的进程发起）。
 
@@ -77,6 +77,12 @@ python3 scripts/account_guard.py
 
    ```bash
    python3 scripts/account_guard.py
+   ```
+
+   要连别家代理（sing-box / v2ray / Surge）的 DNS 配置一起改，加 `--fix-unverified`：改完能不能生效取决于那个软件自己重启，脚本验不了，所以默认不动，改之前照样先备份。
+
+   ```bash
+   python3 scripts/account_guard.py --fix-unverified
    ```
 
 ### 出口目标要由用户明确指定
@@ -141,6 +147,18 @@ python3 scripts/account_guard.py --audit \
 真机实测过节点死掉的行为：把专用组指向一个不可达地址后，`api.anthropic.com`、`claude.ai`、`www.baidu.com` 全部连接失败（curl 退出码 35），出口 IP 取不到，没有任何降级到备用节点或直连的路径。
 
 **这条覆盖不到的情况要说清**：内核（`verge-mihomo`）本身退出或 TUN 接口消失时，接管流量的那几条路由会随之消失，default 路由回到物理网卡，那一刻是全量直出。规则层和组配置都管不到这件事。缓解在于内核挂在 root 特权助手 `clash-verge-service` 底下，崩溃后会秒级重启。
+
+## 不只认 Clash
+
+上面那套判据是 mihomo 的。真正依赖代理软件的只有两行——「绝不直连」与「DNS 泄漏」，其余各项（出口 IP 与 ASN、系统代理残留、终端与 shell 残留、时区、CLI 完整性、浏览器两项）用哪一家都照跑。
+
+脚本会先认出这台机器上是哪一家（报告里的 `A28_proxy_backend`），再按它自己的能力去判：mihomo 内核读控制接口，sing-box 读 `clash_api` 或配置文件，Surge 读 profile 或 HTTP API，v2ray / Xray 读 `config.json`，只有系统代理与 VPN 就直说「没有分流概念」。认得出进程但配置格式不认识时，那一行写「脚本不认识它的配置格式」并给人工核对命令，不留白也不假装通过。
+
+四条硬规矩：**静态读配置不等于运行时**（要让 `ps` 里的 `-c` 路径与读到的配置对得上才据此报绿）；**只有改完能复验的才自动改**（mihomo 走原路；sing-box / v2ray / Surge 的配置改动要显式加 `--fix-unverified`，因为生效与否取决于那个软件自己重启）；**绝不替别家改分流规则**（只换解析器地址，改完复读核对）；**重载按各家官方支持的方式做**——sing-box 是 SIGHUP，Surge 是 `POST /v1/profiles/reload`，而 v2ray / Xray 收到 SIGHUP 会被直接杀掉，所以脚本只提示你自己重启。
+
+还有一条对任何后端都成立的判定：**流量到底有没有被接管**。`scutil --proxy` 四个开关全 0 也可能已经被 TUN 接管（本机实测：开关全 0，去 1.1.1.1 却走 utun1024）。判据是路由、那个 utun 有没有 IPv4 地址（系统自带的 utun 只有链路本地 v6）、以及本机有没有真能完成 SOCKS5 握手的端口（端口开着不等于它是代理）。认不出后端时，这一条是唯一还能说的实话。
+
+各家的端点、键名、重载方式，以及真机验证到什么程度，见 `references/proxy-backends.md`。其中 mihomo 是本机常态运行验证的，sing-box 是在 `/tmp` 起真实例验证的（含 SIGHUP 重载与 `PUT /configs` 是 no-op 这两条），Surge / v2ray / Xray 只有按官方文档写的夹具单测。
 
 ## 时区这一项只检测，不改写
 
