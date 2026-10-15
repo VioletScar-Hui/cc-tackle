@@ -54,10 +54,23 @@ def setUpModule() -> None:
     """
     for key in [k for k in os.environ if k.startswith("CLAUDE_GUARD_")]:
         _SAVED_GUARD_ENV[key] = os.environ.pop(key)
+    # report_html 的落盘目录是模块级常量（`pathlib.Path.home() / "ClaudeGuardBackups"`，
+    # 在 import 那一刻定死），patch `g.HOME` 或 `g.BACKUP_ROOT` 都带不走它。谁漏了
+    # patch `write_html_twin`，谁就把测试夹具写进用户真实的备份目录——2026-10-15
+    # 实测抓到一次：跑一遍单测就在 ~/ClaudeGuardBackups 里多出 4 份 36 KB 的假报告。
+    # 整个会话把它指到临时目录，漏了也只落在 /tmp。
+    global _TEST_REPORT_DIR
+    _TEST_REPORT_DIR = pathlib.Path(tempfile.mkdtemp(prefix="guard-report-"))
+    rh.BACKUP_DIR = _TEST_REPORT_DIR / "reports"
+
+
+_TEST_REPORT_DIR = None
 
 
 def tearDownModule() -> None:
     os.environ.update(_SAVED_GUARD_ENV)
+    if _TEST_REPORT_DIR is not None:
+        shutil.rmtree(_TEST_REPORT_DIR, ignore_errors=True)
 
 
 def prompt_answering(telemetry: str = "0", yes: bool = False):
@@ -906,7 +919,10 @@ class TestAllowedChanges(unittest.TestCase):
              mock.patch.object(g.sys, "stdin", mock.Mock(isatty=lambda: True)), \
              mock.patch("builtins.input", side_effect=prompt_answering()), \
              mock.patch.object(g.sys, "stdout", io.StringIO()), \
-             mock.patch.object(g.sys, "stderr", io.StringIO()):
+             mock.patch.object(g.sys, "stderr", io.StringIO()), \
+             mock.patch.object(g, "write_html_twin"):
+            # 这条会一路跑到收尾，必须挡住最后那份 HTML：report_html 的落盘目录是
+            # 模块级常量，patch g.BACKUP_ROOT 拦不住它（抓到过一次真写）。
             rc = g.main([])
         self.assertEqual(rc, 0, "有意清理 .zshrc 不该被报成受保护文件被改动")
         text = (tmp / ".zshrc").read_text(encoding="utf-8")
@@ -5600,14 +5616,18 @@ class TestHtmlReport(unittest.TestCase):
         sc = rh._score([("a", g.S_NA, "")])
         self.assertIsNone(sc["score"])
 
-    def test_before_after_shows_delta_and_fixed_list(self):
+    def test_before_after_shows_delta_and_the_whole_comparison(self):
         before = [("绝不直连", g.S_BAD, "不成立"), ("出口 IP 与归属", g.S_OK, "好")]
         after = [("绝不直连", g.S_OK, "成立"), ("出口 IP 与归属", g.S_OK, "好")]
         with mock.patch.object(g, "build_summary", side_effect=[after, before]):
             h = rh.render({"timestamp": "x"}, before={"timestamp": "y"})
-        self.assertIn("这一轮改好的", h)
-        self.assertIn("绝不直连", h.split("这一轮改好的")[1])
-        self.assertIn("修复前", h)
+        self.assertIn("修复前", h)                       # 分数行
+        self.assertIn("修复前 → 修复后", h)               # 逐项对照那节的标题
+        section = h.split("修复前 → 修复后")[1]
+        self.assertIn("绝不直连", section)
+        self.assertIn("出口 IP 与归属", section)          # 没变的那行也要摆出来
+        self.assertIn("class=\'cmp-mark bad\'>✗", section)   # 修复前是 ✗
+        self.assertIn("class=\'cmp-mark ok\'>✓", section)  # 修复后是 ✓
 
     def test_items_and_evidence_come_from_the_report(self):
         h = rh.render(self._report())
@@ -6820,6 +6840,7 @@ class TestRememberedExpectedExit(unittest.TestCase):
                          self.tmp / ".local" / "state" / "claude-guard" / "expected-exit.json")
 
     def test_saved_declaration_is_used_when_nothing_is_declared_now(self):
+        # 用文档保留段（RFC 5737）的地址，别把本机真实出口写进公开仓
         g.remember_declared_expected("US", "203.0.113.9")
         self.assertEqual(g.declared_expected(), ("US", "203.0.113.9"))
 
@@ -6842,6 +6863,238 @@ class TestRememberedExpectedExit(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"country": "!!", "exitIp": "not-an-ip"}), encoding="utf-8")
         self.assertEqual(g.declared_expected(), (None, None))
+
+
+class TestReportShowsBeforeAndAfter(unittest.TestCase):
+    """最后那份 HTML 要能逐项看出修复前后，不能只报一句「改好了几项」。"""
+
+    AFTER = {"__which": "after"}
+    BEFORE = {"__which": "before"}
+
+    def _render(self, before_rows, after_rows):
+        def fake_build(report):
+            return after_rows if report is self.AFTER else before_rows
+        with mock.patch.object(g, "build_summary", side_effect=fake_build):
+            return rh.render(self.AFTER, before=self.BEFORE)
+
+    def test_every_row_gets_both_marks_not_just_the_fixed_ones(self):
+        before_rows = [("出口 IP 与归属", g.S_OK, "没变"),
+                       ("系统代理残留", g.S_FIX, "有两处"),
+                       ("时区两道闸", g.S_FIX, "读不到")]
+        after_rows = [("出口 IP 与归属", g.S_OK, "没变"),
+                      ("系统代理残留", g.S_OK, "清干净了"),
+                      ("时区两道闸", g.S_FIX, "读不到")]
+        page = self._render(before_rows, after_rows)
+        self.assertIn("修复前 → 修复后", page)
+        self.assertIn("这一轮改好 1 项", page)
+        # 三行都要摆出来，包括没变的和没改动的那些
+        self.assertEqual(page.count("<div class='cmp'>"), 3)
+
+    def test_never_measured_is_not_a_regression(self):
+        """从「没测到」变成「已解决」是这次量到了，绝不能报成比动手前差。"""
+        before_rows = [("WebRTC 泄漏", g.S_NA, "没测"), ("出口 IP 与归属", g.S_NA, "没测")]
+        after_rows = [("WebRTC 泄漏", g.S_OK, "量到了"), ("出口 IP 与归属", g.S_OK, "量到了")]
+        page = self._render(before_rows, after_rows)
+        self.assertNotIn("比动手前差", page)
+        self.assertIn("2 项有一边是「没测到」，不计入对比", page)
+
+    def test_a_row_that_got_worse_is_called_out(self):
+        before_rows = [("WebRTC 泄漏", g.S_OK, "好")]
+        after_rows = [("WebRTC 泄漏", g.S_BAD, "漏了")]
+        page = self._render(before_rows, after_rows)
+        self.assertIn("比动手前差", page)
+        self.assertIn("WebRTC 泄漏", page)
+
+    def test_without_a_before_report_there_is_no_comparison_section(self):
+        with mock.patch.object(g, "build_summary", return_value=[("出口 IP 与归属", g.S_OK, "x")]):
+            page = rh.render({})
+        self.assertNotIn("修复前 → 修复后", page)
+
+
+class TestFullFlowEndsWithExactlyOneReport(unittest.TestCase):
+    """整轮加固只在最后落一份 HTML，而且那一份必须带「动手前」那份报告。"""
+
+    def test_one_html_at_the_end_carrying_the_before_report(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        before = {"A1_terminal_env": {"rc_files": {}, "npm": {}, "git": {},
+                                      "env_hits": [], "env_info": []}}
+        after = {"A1_terminal_env": {"rc_files": {}, "npm": {}, "git": {},
+                                     "env_hits": [], "env_info": []}, "复检": True}
+        calls = []
+        reports = [before, after]
+        # 空计划下只会问四个：遥测、包装脚本、管理员两项、然后 CONFIRM。答案个数必须与
+        # 问的个数对得上，多给一个就会把 CONFIRM 顶掉（实测踩过，rc 变成 1）。
+        with mock.patch.object(g, "HOME", tmp), \
+             mock.patch.object(g, "BACKUP_ROOT", tmp / "backups"), \
+             mock.patch.object(g, "audit", side_effect=lambda **kw: reports.pop(0)), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "print_summary_table"), \
+             mock.patch.object(g, "print_before_after"), \
+             mock.patch.object(g, "auto_clean_plan", return_value={
+                 "summary": [], "proxy_residue": [], "rc_files": {}, "npm_git": [],
+                 "settings_base_url": [], "settings_env_proxy": [], "ipv6": False,
+                 "location_timezone": False, "clash_dns": False, "browser_locale": False,
+                 "storage_bytes": 0, "dead_permissions": False, "stale_worktrees": [],
+                 "project_junk": []}), \
+             mock.patch.object(g, "create_backup", return_value=(tmp / "backups" / "guard-x", [])), \
+             mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=True), \
+             mock.patch("builtins.input", side_effect=["0", "n", "n", "CONFIRM"]), \
+             mock.patch("report_html.write_report",
+                        side_effect=lambda *a, **k: calls.append(k) or (tmp / "r.html")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = g.main([])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1, f"整轮该只落一份 HTML，实际 {len(calls)} 份")
+        self.assertIs(calls[0].get("before"), before, "最后那一份必须带着动手前那份报告")
+        self.assertTrue(calls[0].get("open_it"), "最后那份要直接打开给用户看")
+
+
+# auto_clean_plan 的完整键集合。缺键会让 main 在 plan["..."] 上 KeyError，
+# 所以这里给一份空计划当桩——改 main 的取值面时，这个常量也要跟着补。
+EMPTY_PLAN = {
+    "summary": [], "proxy_residue": [], "rc_files": {}, "npm_git": [],
+    "settings_base_url": [], "settings_env_proxy": [], "ipv6": False,
+    "location_timezone": False, "clash_dns": False, "browser_locale": False,
+    "storage_bytes": 0, "dead_permissions": False, "stale_worktrees": [],
+    "project_junk": [],
+}
+
+
+class TestElevationIsAskedBeforeTheWork(unittest.TestCase):
+    """提权提前到动手之前一次做完，而不是等写 root 文件时才弹密码。
+
+    背景：sudo 只缓存 5 分钟。原来的做法是懒加载——[1/6] 要备份 root 文件、
+    或 [6/6] 要关定位闸时才问，而那时前面已经跑了几分钟清理，出去接杯水
+    回来授权就过期了，带 -n 的那一步只会静默失败。
+    """
+
+    def _answers(self, *, ipv6="y", loc="n"):
+        def answer(prompt=""):
+            p = prompt.strip()
+            if "CONFIRM" in p:
+                return "CONFIRM"
+            if "遥测开关" in p:
+                return "0"
+            if "两项" in p:
+                return "y"
+            if "关闭所有网络服务的 IPv6" in p:
+                return ipv6
+            if "读取定位服务状态" in p:
+                return loc
+            return "n"
+        return answer
+
+    def _main(self, answer, *, prime_raises=False, calls=None):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        report = {
+            "A1_terminal_env": {"rc_files": {}, "npm": {}, "git": {},
+                                "env_hits": [], "env_info": []},
+            "A2_anthropic_base_url": {"hits": []},
+            "A5_ipv6": {"services": {"Wi-Fi": {"ipv6": "Automatic"}}, "global_addresses": []},
+        }
+        calls = calls if calls is not None else []
+
+        def fake_prime():
+            calls.append("prime")
+            if prime_raises:
+                raise RuntimeError("没拿到授权")
+
+        def fake_read(**kw):
+            calls.append(("read", kw.get("persist")))
+            return {"readable": True, "clients": {"TimeZone.bundle": {}}, "note": ""}
+
+        def fake_ipv6(services):
+            calls.append("ipv6")
+            return {"done": list(services), "failed": [], "rollback": []}
+
+        out = io.StringIO()
+        with mock.patch.object(g, "HOME", tmp), \
+             mock.patch.object(g, "SETTINGS", tmp / ".claude" / "settings.json"), \
+             mock.patch.object(g, "BACKUP_ROOT", tmp / "backups"), \
+             mock.patch.object(g, "audit", return_value=report), \
+             mock.patch.object(g, "auto_clean_plan", return_value={**EMPTY_PLAN, "ipv6": True}), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "print_summary_table"), \
+             mock.patch.object(g, "print_before_after"), \
+             mock.patch.object(g, "write_html_twin"), \
+             mock.patch.object(g, "sudo_prime", side_effect=fake_prime), \
+             mock.patch.object(g, "location_service_status", side_effect=fake_read), \
+             mock.patch.object(g, "set_ipv6_off", side_effect=fake_ipv6), \
+             mock.patch.object(g, "ensure_sudo"), \
+             mock.patch.object(g.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch("builtins.input", side_effect=answer), \
+             mock.patch.object(g.sys, "stdout", out), \
+             mock.patch.object(g.sys, "stderr", io.StringIO()):
+            rc = g.main([])
+        return rc, calls, out.getvalue()
+
+    def test_password_comes_before_the_first_root_step(self):
+        rc, calls, out = self._main(self._answers())
+        self.assertEqual(rc, 0)
+        self.assertIn("prime", calls)
+        self.assertIn("ipv6", calls)
+        self.assertLess(calls.index("prime"), calls.index("ipv6"),
+                        "授权必须在动手之前拿到")
+        self.assertLess(out.index("[0/6]"), out.index("[1/6]"),
+                        "授权那一步要排在六步之前")
+
+    def test_declining_to_close_the_gate_still_reads_the_plist(self):
+        """答「不关」也要读一次：不读这一项永远只有「读不到（要 root）」。"""
+        rc, calls, _out = self._main(self._answers(loc="n"))
+        self.assertEqual(rc, 0)
+        self.assertIn(("read", True), calls)
+        self.assertNotIn(("read", False), calls, "提权后这一次要落缓存，不能只读不记")
+
+    def test_no_authorization_skips_the_root_steps_and_finishes(self):
+        rc, calls, out = self._main(self._answers(), prime_raises=True)
+        self.assertEqual(rc, 0, "没输密码是用户的选择，不该让整轮失败")
+        self.assertIn("没有拿到管理员授权", out)
+        self.assertNotIn("ipv6", calls)
+        self.assertNotIn(("read", True), calls)
+
+    def test_the_plan_says_authorization_will_be_asked(self):
+        _rc, _calls, out = self._main(self._answers())
+        self.assertIn("9. 管理员授权", out)
+
+
+class TestSuiteNeverWritesIntoTheRealReportDir(unittest.TestCase):
+    """真实备份目录不该被测试碰到，哪怕某个用例忘了 patch。"""
+
+    def test_report_output_dir_points_somewhere_temporary(self):
+        self.assertIn("guard-report-", str(rh.BACKUP_DIR),
+                      "setUpModule 该把 report_html.BACKUP_DIR 指到临时目录")
+        self.assertNotEqual(pathlib.Path(rh.BACKUP_DIR),
+                            pathlib.Path.home() / "ClaudeGuardBackups")
+
+    def test_writing_without_out_dir_does_not_touch_the_home_backup_dir(self):
+        before = set((pathlib.Path.home() / "ClaudeGuardBackups").glob("report-*.html"))
+        rh.write_report({"timestamp": "x"}, report_path="")
+        after = set((pathlib.Path.home() / "ClaudeGuardBackups").glob("report-*.html"))
+        self.assertEqual(before, after, "没给 out_dir 的写入绝不能落到真实备份目录")
+
+
+class TestSelfcheckLeavesTheReportToTheEnd(unittest.TestCase):
+    """自检不该每跑一次就弹一个页面：一流程只留加固收尾那一份前后对照。"""
+
+    def test_the_self_check_opens_no_html(self):
+        with mock.patch.object(sys, "argv", ["selfcheck.py", "--fast"]), \
+             mock.patch.object(selfcheck_module, "project_roots_default",
+                               return_value=([], "测试")), \
+             mock.patch.object(selfcheck_module, "check_files"), \
+             mock.patch.object(selfcheck_module, "check_compile"), \
+             mock.patch.object(selfcheck_module, "check_guards"), \
+             mock.patch.object(selfcheck_module, "check_kernel"), \
+             mock.patch.object(selfcheck_module, "check_system_proxy"), \
+             mock.patch.object(selfcheck_module, "check_audit",
+                               return_value=("", {"A1_export_ip": {}})), \
+             mock.patch("report_html.write_report") as writer, \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            selfcheck_module.ROWS.clear()
+            selfcheck_module.main()
+        writer.assert_not_called()
+        self.assertIn("--audit --report", out.getvalue())
 
 
 class TestSelfcheckParsesStdoutOnly(unittest.TestCase):
