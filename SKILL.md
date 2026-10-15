@@ -1,5 +1,5 @@
 ---
-name: claude-account-guard
+name: cc-tackle
 metadata:
   version: "1.0.4"
 description: >-
@@ -8,7 +8,7 @@ description: >-
   不用于：账号申诉、付款退款与 claude.ai 网页端设置（人工流程，本 skill 不涉及）；业务仓代码修复；本机网络链路或内核故障排查。
 ---
 
-# Claude Code 环境检测与自动清理
+# CC tackle —— Claude Code 环境检测与自动清理
 
 本 skill 的产出是「一张环境体检总表 + 用户明确选择后的改动记录」。它不改业务仓代码、不做账号申诉、不碰付款，也不处理其它工具（`~/.codex`、`~/.dsh`）自己的配置——那些只报告不代改。
 
@@ -57,11 +57,11 @@ python3 scripts/account_guard.py
 - 第 2 条命令自己就是完整流水线：**动手前体检一次 → 备份 → 执行改动 → 改动之后重新体检一次 → 打印前后对照表 → 落一份带前后对照的 HTML 并打开**。不需要另外跑一遍后测，也不要拿加固前那份报告充当结果。
 - 只想要一份 HTML、不想被 `--save-audit` 顺带写 JSON 和出口历史时，加 `--report`：`--audit --report` 给「只有这一次体检」的页面，完整流程里它默认就出页面。
 - 在 CONFIRM 处取消时，加过 `--report` 的同样会给一份 HTML，并注明「已取消，这是改动前的状态」——取消不等于什么都不给。
-- 浏览器 Intl 与 WebRTC 那两项要现场跑复核（`--check-locale` / `--audit --webrtc`），它们不在上面这条流水线里，因为都需要有人打开一个本地页面。不跑就在报告里显示 `·`（没测到），不会假装通过。
+- 浏览器 Intl 与 WebRTC 那两项默认要有人开一次本地复核页，所以以前它们不在上面这条流水线里，只在报告里显示 `·`（没测到），不会假装通过。加 `--verify-browser`（配合 `--audit`）后脚本自己把两个复核页在你指定的资料里打开并等回传，一次跑完就能出结论。判据是**谁打开的**：脚本自己开的页面算证据，手工开的只当参考——脚本能证明的是「我让哪个资料打开了这个页面」，不是「这个资料就是你的日常账号」。在 Claude Code 里跑时这条会被拒（那里只放行纯 `--audit`），换普通终端或双击桌面入口。
 
 ## 运行顺序
 
-想先看全貌（只读，约 1.5 分钟），在本 skill 目录下跑 `python3 scripts/selfcheck.py`。它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表，并把体检那 27 项逐条展开；脚本按自己的位置定位，从任何工作目录调用都行，项目根没在 `CLAUDE_GUARD_PROJECT_ROOTS` 里指定时会自动用本 skill 所在的 git 仓并在末尾打出选中的是哪个。`--fast` 跳过单元测试，`--no-audit` 跳过体检。
+想先看全貌（只读，约 1.5 分钟），在本 skill 目录下跑 `python3 scripts/selfcheck.py`。它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表，并把体检那 27 项逐条展开；脚本按自己的位置定位，从任何工作目录调用都行，项目根没在 `CLAUDE_GUARD_PROJECT_ROOTS` 里指定时会自动用本 skill 所在的 git 仓并在末尾打出选中的是哪个。它跑体检时会带上 `--verify-browser`，也就是把浏览器 Intl 与 WebRTC 两个复核页一起弹出来并等回传，所以一次就能把这 27 项全部测到、不留「未测到」。`--fast` 跳过单元测试，`--no-audit` 跳过体检，`--no-browser` 不弹复核页（那两项会退回「未测到」）。在 Claude Code 里跑 selfcheck 时脚本会自动降级成纯只读审计并在末尾说明。
 
 1. 如果当前执行者就是 Claude Code，只跑只读审计，并提醒用户换普通终端再执行加固（加固会改本机状态，不适合由正在使用它的进程发起）。
 
@@ -95,7 +95,7 @@ python3 scripts/account_guard.py --audit \
   --expected-exit-ip 203.0.113.10
 ```
 
-`--expected-country` 只接受 ISO 3166-1 两字母代码，`--expected-exit-ip` 接受合法的 IPv4 或 IPv6。这两个值也可以放进 `CLAUDE_GUARD_EXPECTED_COUNTRY` 与 `CLAUDE_GUARD_EXPECTED_EXIT_IP` 环境变量（命令行优先），这样 `selfcheck.py`、报告服务这些拿不到命令行的入口认的是同一份声明；两处都没给才算没声明。声明必须由你显式给出，脚本不会从上一次记录或当前实测结果自动填入。没有指定目标时，报告只能说「未声明目标」，不能说目标匹配；实测出口和目标不一致时先检查线路，脚本不会根据错误的国家自动改 Chrome 的语言或区域。
+`--expected-country` 只接受 ISO 3166-1 两字母代码，`--expected-exit-ip` 接受合法的 IPv4 或 IPv6。这两个值也可以放进 `CLAUDE_GUARD_EXPECTED_COUNTRY` 与 `CLAUDE_GUARD_EXPECTED_EXIT_IP` 环境变量（命令行优先），这样 `selfcheck.py`、报告服务这些拿不到命令行的入口认的是同一份声明；两处都没给才算没声明。带持久化的那几种运行方式（`--save-audit`）会把你给的声明记进 `~/.local/state/claude-guard/expected-exit.json`，第三次运行的入口（比如自检脚本、报告服务）就认这份记录，不会因为换个入口就退回「未声明」；只读 `--audit` 一个字节都不写。声明必须由你显式给出，脚本不会从当前实测结果自动填入。没有指定目标时，报告只能说「未声明目标」，不能说目标匹配；实测出口和目标不一致时先检查线路，脚本不会根据错误的国家自动改 Chrome 的语言或区域。
 
 退出码：`0` 正常完成；`1` 用户在 CONFIRM 处取消；`2` 拒绝执行或中途停止；`3` 加固已完成但检测到受保护文件被本脚本之外的进程改动（stderr 会给出文件和备份路径）。
 
@@ -258,8 +258,11 @@ python3 -m unittest discover -s tests -v
 ## 浏览器 Intl 区域设置
 
 `Intl.DateTimeFormat().resolvedOptions().locale`，ippure 权重 10，只认大陆简体。见 mapping A27。
-浏览器媒体权限与 Intl 缓存必须同时满足 24 小时 freshness 和资料范围匹配：先在运行复核前显式设置 `CLAUDE_GUARD_BROWSER_PROFILE`（例如 `work-chrome-profile`）。缓存中的 `profileScope` 必须与当前环境值完全一致；未设置或切换资料后都按未测处理，不能作为通过证据。脚本无法从本地复核页自行识别 Chrome 资料路径，不会写入伪造的资料标签。
-`--audit` 不能和 `--check-media`、`--check-locale` 同时使用；后两项会写入浏览器复核缓存，需单独运行并明确选择资料范围。用户声明的资料标签不能由脚本验证身份，因此复用缓存时即使标签匹配，媒体与 Intl 结论仍按未确证处理。
+浏览器媒体权限与 Intl 缓存必须同时满足 24 小时 freshness 和资料范围匹配：运行复核前显式设置 `CLAUDE_GUARD_BROWSER_PROFILE`（例如 `work-chrome-profile`），缓存中的 `profileScope` 必须与当前环境值完全一致；未设置或切换资料后都按未测处理。脚本无法从本地复核页自行识别 Chrome 资料路径，不会写入伪造的资料标签。
+决定这两项能不能算证据的是缓存里的 `openedBy`：`--verify-browser`（以及 `--check-media` / `--check-locale`）由脚本自己拉起 `CLAUDE_GUARD_BROWSER_PROFILE_DIR` 指定的 Chrome 资料去开复核页，回传记 `openedBy=script`，这两项才出结论；页面是别人手工打开、脚本只等回传时记 `openedBy=user`，即使 `profileScope` 对上、时效也在，仍按未确证处理。脚本能证明的是「哪个资料打开了这个页面」，不是「这个资料就是你的日常账号」，所以页面上写的是「浏览器实测（脚本打开的复核页，资料 Profile 1）」，把依据一并摊开。
+`--audit` 不能和 `--check-media`、`--check-locale` 同时使用（那两项会写缓存、要和体检分开跑）；要用一次跑完就走 `--audit --verify-browser`。
+
+WebRTC 那两项的修法里有一条是装扩展：文章 2.5② 推的 Google 官方扩展 **WebRTC Network Limiter**，`python3 scripts/account_guard.py --install-webrtc-limiter` 会把扩展包从商店的官方分发接口下到 `~/.local/state/claude-guard/extensions/`，报出本机每个 Chrome 资料里装没装、设置对不对，再把商店页在你声明的资料里打开。**装的那一下只能你自己点**——Chrome 在 macOS 上不接受脚本代装扩展；唯一无人值守的路子是机器级策略 `ExtensionInstallForcelist`，代价是浏览器显示「由组织管理」且扩展卸不掉，那条命令写在 `references/webrtc.md` 里，吃不吃这个代价由你决定。下到的包要过三道核，最后一道是拿签名块里的公钥算出扩展 ID 与申请时那个比对——名字能改，ID 由公钥定。
 
 定位服务的 root 实测缓存只在 24 小时内有效，缺少时间戳或过期都按未测处理。只读审计不会创建临时探针文件；非 root 时不调用 sudo 探针，定位服务状态会如实显示为待复核。
 
@@ -350,7 +353,7 @@ networksetup -getwebproxy Wi-Fi; networksetup -getsecurewebproxy Wi-Fi; networks
 env | grep -iE "proxy|anthropic|claude"
 ```
 
-期望无输出。**原文这条写得太宽**：只要当前目录名里带 claude（比如就站在 `claude-account-guard` 目录下），`PWD` 就会被命中，实测踩过。真要查代理就拆成 `env | grep -i proxy`。
+期望无输出。**原文这条写得太宽**：只要当前目录名里带 claude（比如就站在 `cc-tackle` 目录下），`PWD` 就会被命中，实测踩过。真要查代理就拆成 `env | grep -i proxy`。
 
 **shell 配置里的代理行**（文章 2.5⑤）
 

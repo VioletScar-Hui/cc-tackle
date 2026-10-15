@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-account-guard —— 按《你的 Claude 账号是怎么被封的》四层防线做本机体检与加固。
+"""CC tackle —— 按《你的 Claude 账号是怎么被封的》四层防线做本机体检与加固。
 
 设计沿用 skills/claude-cleanup 的安全约定：
   * 只读审计永远安全，任何写操作都要真实 TTY + 逐项询问 + 最终 CONFIRM；
@@ -16,9 +16,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hmac
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -29,6 +31,7 @@ import socketserver
 import shutil
 import subprocess
 import unicodedata
+import zipfile
 import zoneinfo
 import sys
 import tempfile
@@ -77,10 +80,351 @@ EXPECTED_COUNTRY_ENV = "CLAUDE_GUARD_EXPECTED_COUNTRY"
 EXPECTED_EXIT_IP_ENV = "CLAUDE_GUARD_EXPECTED_EXIT_IP"
 
 
+BROWSER_PROFILE_DIR_ENV = "CLAUDE_GUARD_BROWSER_PROFILE_DIR"
+
+# WebRTC Network Limiter —— 文章 §2.5② 推的那个 Chrome 扩展。它做的就是往
+# chrome.privacy.network.webRTCIPHandlingPolicy 写 disable_non_proxied_udp
+# （「只走代理的 UDP」）：stock Chrome 的界面上没有这个开关，装扩展是普通用户
+# 自己办得到的唯一一条路。企业策略也能设，但要管理员写机器级 plist，且会让所有
+# 资料的网页通话都建不起来。
+WEBRTC_LIMITER_ID = "npeicpdbkakmehahjeeohfdhnlpdklia"
+WEBRTC_LIMITER_NAME = "WebRTC Network Limiter"
+WEBRTC_LIMITER_SETTING = "disable_non_proxied_udp"
+WEBRTC_LIMITER_STORE_URL = f"https://chromewebstore.google.com/detail/{WEBRTC_LIMITER_ID}"
+WEBRTC_CRX_ENDPOINT = "https://clients2.google.com/service/update2/crx"
+
+
 def browser_profile_scope() -> str | None:
     """Return the user supplied browser profile identity, if any."""
     value = os.environ.get(BROWSER_PROFILE_ENV, "").strip()
     return value or None
+
+
+def browser_profile_dir() -> str | None:
+    """要打开的那个 Chrome 资料目录，例如 `Profile 1`。
+
+    为什么要单独声明这个：复核结论得归到某个浏览器资料上，而页面自己报不出资料身份。
+    名字（`Claude`）只有人能看懂，`open --profile-directory=` 要的是目录名。
+    读 Chrome 的 Local State 能查到映射，但那个文件受 TCC 保护、脚本不一定读得到，
+    所以让用户显式写一个；写错时 Chrome 会安静地开默认资料，脚本无法察觉。
+    """
+    value = os.environ.get(BROWSER_PROFILE_DIR_ENV, "").strip()
+    return value or None
+
+
+def open_verify_page(url: str, what: str) -> dict:
+    """脚本自己把复核页打开，并回报「这次是谁开的」。
+
+    为什么必须由脚本开：复核结论要归到某个浏览器资料上。用户在别处打开、脚本只发
+    一条链接的话，那份结论只能一直挂着「资料身份未验证」；由脚本按声明的资料目录
+    打开，至少能说清「这次是脚本按哪个资料开的」。
+
+    开不出来就如实回报失败，绝不假装打开过 —— 调用方会把 URL 留在屏幕上让人手动开。
+    """
+    prof = browser_profile_dir()
+    cmd = ["open", "-na", "Google Chrome"]
+    if prof:
+        cmd += ["--args", f"--profile-directory={prof}"]
+    cmd.append(url)
+    try:
+        code, out = run(cmd, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"opened": False, "reason": str(error), "profileDir": prof}
+    if code != 0:
+        return {"opened": False, "reason": (out or "").strip() or f"open 退出码 {code}",
+                "profileDir": prof}
+    where = browser_profile_scope() or "未声明资料"
+    print(f"  已替你打开{what}（资料 {where}" + (f" / {prof}" if prof else "") + "）。", flush=True)
+    return {"opened": True, "profileDir": prof}
+
+
+def webrtc_limiter_dir() -> pathlib.Path:
+    """下下来的扩展包放哪。按调用时解析，不在 import 时定死（测试要能改 HOME）。"""
+    return HOME / ".local" / "state" / "claude-guard" / "extensions"
+
+
+def chrome_prodversion() -> str:
+    """本机 Chrome 的版本号，拼 CRX 直链要用。取不到就给个宽松的兜底值。"""
+    info = pathlib.Path("/Applications/Google Chrome.app/Contents/Info.plist")
+    code, out = run(["defaults", "read", str(info), "CFBundleShortVersionString"], timeout=10)
+    value = (out or "").strip()
+    return value if code == 0 and re.fullmatch(r"\d+(\.\d+)*", value) else "9999.0.0.0"
+
+
+def webrtc_limiter_crx_url(prodversion: str) -> str:
+    """商店官方的 CRX 直链。
+
+    参数照 Chrome 客户端那一套拼：prod 必须是 chromiumcrx、x 里要带 id 与
+    installsource=ondemand，少一个服务端就回商店页面而不是包（实测：少了
+    prod 那一串，回的是 302 加一段 HTML）。
+    """
+    machine = ""
+    try:
+        machine = os.uname().machine
+    except AttributeError:                       # pragma: no cover - 本 skill 只跑 macOS
+        pass
+    arch = "arm64" if machine in ("arm64", "aarch64") else "x64"
+    return (
+        f"{WEBRTC_CRX_ENDPOINT}?response=redirect&os=mac&arch={arch}&os_arch={arch}"
+        f"&nacl_arch={arch}&prod=chromiumcrx&prodchannel=unknown"
+        f"&prodversion={prodversion}&acceptformat=crx2,crx3"
+        f"&x=id%3D{WEBRTC_LIMITER_ID}%26installsource%3Dondemand%26uc"
+    )
+
+
+def _pb_varint(buf: bytes, pos: int) -> tuple:
+    shift = 0
+    value = 0
+    while pos < len(buf):
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+    raise ValueError("varint 越界")
+
+
+def _pb_fields(buf: bytes) -> list:
+    """把一段 protobuf 拆成 (字段号, 值)。只认 CRX 头里出现的两种 wire type。"""
+    out = []
+    pos = 0
+    while pos < len(buf):
+        key, pos = _pb_varint(buf, pos)
+        field, wire = key >> 3, key & 7
+        if wire == 2:
+            length, pos = _pb_varint(buf, pos)
+            out.append((field, buf[pos:pos + length]))
+            pos += length
+        elif wire == 0:
+            value, pos = _pb_varint(buf, pos)
+            out.append((field, value))
+        else:
+            break
+    return out
+
+
+def crx_public_key_ids(blob: bytes) -> list:
+    """从 CRX3 的签名块推出扩展 ID。
+
+    扩展 ID 本来就是**发布者公钥**的哈希前 16 字节按 a-p 映射出来的，所以这条比
+    读 manifest 里的名字硬得多：名字是商店页面显示用的，改一行就行，ID 由公钥定。
+    商店下发的包里有两块签名（Google 的商店密钥 + 发布者密钥），实测只有发布者
+    那块对得上，所以两块都算，命中任意一块即认。
+    """
+    if len(blob) < 12 or blob[:4] != b"Cr24":
+        return []
+    if int.from_bytes(blob[4:8], "little") != 3:
+        return []                                  # CRX2 结构不同，这里不猜
+    header = int.from_bytes(blob[8:12], "little")
+    ids = []
+    for field, proof in _pb_fields(blob[12:12 + header]):
+        if field != 2 or not isinstance(proof, bytes):
+            continue
+        for sub, value in _pb_fields(proof):
+            if sub != 1 or not isinstance(value, bytes) or not value:
+                continue
+            digest = hashlib.sha256(value).digest()[:16]
+            ids.append("".join("abcdefghijklmnop"[b >> 4] + "abcdefghijklmnop"[b & 15]
+                               for b in digest))
+    return ids
+
+
+def parse_crx(blob: bytes) -> dict:
+    """拆 CRX：认魔数、按版本算出 zip 的起点、读出 manifest。"""
+    if len(blob) < 16 or blob[:4] != b"Cr24":
+        return {"ok": False, "why": "不是 CRX（开头没有 Cr24）"}
+    version = int.from_bytes(blob[4:8], "little")
+    if version == 3:
+        start = 12 + int.from_bytes(blob[8:12], "little")
+    elif version == 2:
+        start = 16 + int.from_bytes(blob[8:12], "little") + int.from_bytes(blob[12:16], "little")
+    else:
+        return {"ok": False, "why": f"不认识的 CRX 版本 {version}"}
+    if start >= len(blob):
+        return {"ok": False, "why": "CRX 头部声明的长度不合理"}
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob[start:])) as zf:
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+    except Exception as error:                     # zipfile 抛的异常种类多，统一降级
+        return {"ok": False, "why": f"包里的 zip 或 manifest 读不出来：{error}"}
+    return {"ok": True, "crxVersion": version, "start": start, "manifest": manifest}
+
+
+def verify_webrtc_limiter_crx(blob: bytes) -> tuple:
+    """这份 CRX 是不是我们要的那个扩展：结构、来源、身份三道。"""
+    parsed = parse_crx(blob)
+    if not parsed["ok"]:
+        return False, parsed["why"]
+    manifest = parsed["manifest"]
+    update = str(manifest.get("update_url") or "")
+    if "clients2.google.com/service/update2/crx" not in update:
+        return False, f"update_url 不指向商店（{update or '空'}），不是商店的包"
+    ids = crx_public_key_ids(blob)
+    if WEBRTC_LIMITER_ID not in ids:
+        return False, "签名公钥算出来的扩展 ID 对不上：" + ("、".join(ids) or "一个都没解出来")
+    return True, f"{WEBRTC_LIMITER_NAME} {manifest.get('version')}（签名公钥 ID 已核对）"
+
+
+def chrome_profiles_dir() -> pathlib.Path:
+    """Chrome 的资料目录。按调用时解析，测试要能把 HOME 指到沙箱。"""
+    return HOME / "Library" / "Application Support" / "Google" / "Chrome"
+
+
+def webrtc_limiter_state() -> dict:
+    """这个扩展装没装、设置对不对。
+
+    读的是每个资料里的 `Secure Preferences` —— 扩展设置带 MAC 保护，存在这个文件，
+    不在 `Preferences`（实测：同一个资料的 Preferences 里 extensions.settings 是 0
+    条，Secure Preferences 里才是全部）。
+
+    macOS 的 TCC 可能不让脚本读另一个 App 的资料目录（本机从 DSH 里跑就是
+    `Operation not permitted`）：那种情况如实回报「读不到」，并给出手工入口，
+    绝不因为读不到就说「没装」。
+    """
+    out = {"readable": False, "profiles": [], "installed_in": [], "setting": None,
+           "why": ""}
+    base = chrome_profiles_dir()
+    try:
+        candidates = sorted(p for p in base.iterdir() if p.is_dir())
+    except OSError as error:
+        out["why"] = f"读不到 Chrome 资料目录（{error}）"
+        return out
+    out["readable"] = True
+    for prof in candidates:
+        pref = prof / "Secure Preferences"
+        try:
+            data = json.loads(pref.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        entry = (data.get("extensions", {}).get("settings", {}) or {}).get(WEBRTC_LIMITER_ID)
+        if not entry:
+            continue
+        prefs = entry.get("preferences") or {}
+        out["profiles"].append(prof.name)
+        out["installed_in"].append({
+            "profile": prof.name,
+            "version": (entry.get("manifest") or {}).get("version"),
+            "fromStore": entry.get("from_webstore"),
+            "setting": prefs.get("webrtc.ip_handling_policy"),
+        })
+        if out["setting"] is None:
+            out["setting"] = prefs.get("webrtc.ip_handling_policy")
+    return out
+
+
+def download_webrtc_limiter(dest=None, timeout: int = 90) -> dict:
+    """把扩展包下到本机。先落 .part，校验过了才改名——半个包不能冒充成品。"""
+    version = chrome_prodversion()
+    url = webrtc_limiter_crx_url(version)
+    target = pathlib.Path(dest) if dest else (webrtc_limiter_dir() / f"{WEBRTC_LIMITER_ID}.crx")
+    part = target.with_name(target.name + ".part")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        code, out = run(["curl", "-sSL", "--fail", "--max-time", str(max(30, timeout - 15)),
+                         "-o", str(part), url], timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"ok": False, "why": f"下载起不来：{error}", "url": url}
+    if code != 0 or not part.is_file():
+        part.unlink(missing_ok=True)
+        return {"ok": False,
+                "why": f"下载失败（curl 退出码 {code}）：{(out or '').strip()[:160]}",
+                "url": url}
+    blob = part.read_bytes()
+    good, why = verify_webrtc_limiter_crx(blob)
+    if not good:
+        part.unlink(missing_ok=True)
+        return {"ok": False, "why": f"下到的包没通过校验：{why}", "url": url}
+    part.replace(target)
+    hand_back_ownership(target)
+    manifest = parse_crx(blob)["manifest"]
+    return {"ok": True, "path": target, "bytes": len(blob),
+            "sha256": hashlib.sha256(blob).hexdigest(),
+            "version": manifest.get("version"),
+            "manifestVersion": manifest.get("manifest_version"),
+            "url": url, "chrome": version}
+
+
+def install_webrtc_limiter(open_store: bool = True) -> dict:
+    """下载扩展包 + 在你声明的资料里打开商店页，然后把还差哪一步说清楚。
+
+    脚本**不做**那一下安装：macOS 上的 Chrome 不接受非交互装扩展。唯一能无人值守
+    装上的路子是机器级策略 ExtensionInstallForcelist，代价是浏览器从此显示
+    「由组织管理」、这个扩展你自己也卸不掉——那不是体检脚本该替你决定的事。
+    所以这里只报「包在哪、页面开了没、还差哪一步」，绝不说「已安装」。
+    """
+    print("\nWebRTC Network Limiter —— 把 WebRTC 的 UDP 限制成只走代理")
+    print(f"  商店页：{WEBRTC_LIMITER_STORE_URL}")
+    state = webrtc_limiter_state()
+    if not state["readable"]:
+        print(f"  本机现状：{state['why']}；装没装自己看 chrome://extensions/")
+    elif state["installed_in"]:
+        for item in state["installed_in"]:
+            mark = "✓" if item["setting"] == WEBRTC_LIMITER_SETTING else "!"
+            print(f"  {mark} 资料 {item['profile']} 里已经装了 v{item['version']}"
+                  f"（商店来源 {item['fromStore']}），设置 "
+                  f"webrtc.ip_handling_policy={item['setting']}")
+        need = [i for i in state["installed_in"] if i["setting"] != WEBRTC_LIMITER_SETTING]
+        if not need:
+            print("    这台机器不用再装；下面这一步只在别的机器或别的资料上才需要。")
+    else:
+        print(f"  本机现状：{len(state['profiles'])} 个资料里都没读到它")
+    got = download_webrtc_limiter()
+    if got["ok"]:
+        print(f"  ✓ 扩展包已下到：{got['path']}")
+        print(f"    版本 {got['version']}（manifest v{got['manifestVersion']}），"
+              f"{got['bytes']} 字节，sha256 {got['sha256'][:16]}…")
+        print(f"    直链（按本机 Chrome {got['chrome']} 拼的）：{got['url']}")
+    else:
+        print(f"  ✗ 没下下来：{got['why']}")
+    opened = {"opened": False, "reason": "没有自动打开"}
+    if open_store and not os.environ.get("CLAUDE_GUARD_NO_OPEN"):
+        opened = open_verify_page(WEBRTC_LIMITER_STORE_URL, "扩展商店页")
+    if not opened.get("opened"):
+        print("  商店页没能自动打开，上面那条链接自己点开。")
+    print("\n  还差你点两下（Chrome 不允许脚本替你装扩展）：")
+    print("    1. 在商店页点「添加至 Chrome」，弹窗里点「添加扩展程序」")
+    print(f"    2. 装完到 chrome://extensions/ 确认列表里有它，ID 是 {WEBRTC_LIMITER_ID}")
+    print("  它没有选项页，装好即生效：写的是 webRTCIPHandlingPolicy="
+          f"{WEBRTC_LIMITER_SETTING}（「只走代理的 UDP」）。")
+    if got["ok"]:
+        print(f"  装不上或没网时的后备：把 {got['path']} 拖到 chrome://extensions/，"
+              "需要先打开右上角的开发者模式。")
+    print("  想彻底免手工（要管理员，且浏览器从此显示「由组织管理」）：")
+    print('    $ sudo defaults write "/Library/Managed Preferences/com.google.Chrome" \\')
+    print(f'        ExtensionInstallForcelist -array "{WEBRTC_LIMITER_ID};{WEBRTC_CRX_ENDPOINT}"')
+    return {"ok": got["ok"], "download": got, "opened": opened,
+            "state": state, "store": WEBRTC_LIMITER_STORE_URL,
+            # 读得到就说读到的，读不到就是 None —— 不把「读不到」说成「没装」。
+            "installed": bool(state["installed_in"]) if state["readable"] else None}
+
+
+def expected_state_path() -> pathlib.Path:
+    """记住「用户声明的预期出口」的状态文件。按调用时解析，不在 import 时定死。"""
+    return HOME / ".local" / "state" / "claude-guard" / "expected-exit.json"
+
+
+def load_declared_expected() -> dict:
+    try:
+        data = json.loads(expected_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def remember_declared_expected(country: str | None, exit_ip: str | None) -> None:
+    """把这次声明下来的目标记下来，供下次没有声明时使用。"""
+    if not country and not exit_ip:
+        return
+    try:
+        path = expected_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"country": country, "exitIp": exit_ip,
+                                    "declaredAt": now_stamp()},
+                                   ensure_ascii=False, indent=2), encoding="utf-8")
+        hand_back_ownership(path)
+    except OSError:
+        pass          # 记不住不影响这次判定，只是下次要重新声明
 
 
 def declared_expected(country: str | None = None,
@@ -90,8 +434,14 @@ def declared_expected(country: str | None = None,
     为什么要认环境变量：预期出口是用户自己的声明，不是脚本推断出来的事实。
     但 selfcheck.py、报告服务、桌面启动器这些调用点走的是 audit()，拿不到命令行
     参数；只认命令行的话，同一次声明换个入口就没了，那一项会在「已解决」和
-    「未测到」之间来回跳。所以命令行给不出时读环境变量，两处都没有才算没声明。
+    「未测到」之间来回跳。所以命令行给不出时读环境变量。
+
+    再往下还有第三级：**上次声明过的值**。声明的内容（我期望从哪个国家/哪个 IP
+    出去）不会因为换了一天就失效，而每次都要重新声明就等于每次都可能忘了声明、
+    那一项永远停在「未测到」。落盘只发生在允许写状态的调用里（见 audit 的 persist），
+    只读审计仍然一个字都不写。
     """
+    saved = load_declared_expected()
     picked = []
     for cli_value, env_name, normalize in (
         (country, EXPECTED_COUNTRY_ENV, normalize_expected_country),
@@ -110,6 +460,14 @@ def declared_expected(country: str | None = None,
             # 命令行那侧由 argparse 自己校验；能走到这里的基本都是环境变量写错了，
             # 报错要指名是哪个变量，不然用户只看到「--expected-country 不合法」。
             raise ValueError(f"{env_name} 的值不合法：{error}") from error
+    for i, (value, key) in enumerate(((picked[0], "country"), (picked[1], "exitIp"))):
+        if value is None and saved.get(key):
+            try:
+                picked[i] = (normalize_expected_country(saved[key]) if key == "country"
+                             else normalize_expected_ip(saved[key]))
+            except ValueError:
+                # 存下来的值不合法就当没有：状态文件坏掉不该让一次体检整个失败。
+                picked[i] = None
     return (picked[0], picked[1])
 
 TELEMETRY_KEYS = (
@@ -364,6 +722,18 @@ PROXY_BACKEND_LABELS = {
     "vpn": "VPN 隧道",
     "other": "认得出在跑，但脚本不认识它的配置格式",
     "none": "没有发现代理",
+}
+
+# 短名字：终端与报告页都从这里取，免得两处各写一份、日后改一处漏一处。
+PROXY_BACKEND_SHORT = {
+    "mihomo": "mihomo 内核",
+    "singbox": "sing-box",
+    "surge": "Surge",
+    "v2ray": "v2ray / Xray",
+    "system": "只有系统代理",
+    "vpn": "VPN 隧道",
+    "other": "认不出的后端",
+    "none": "没有代理",
 }
 
 # 进程名（小写、取 basename 后子串匹配）。顺序即探测优先级。
@@ -674,6 +1044,7 @@ def check_proxy_backend() -> dict:
                 out.update(backend="vpn", label=PROXY_BACKEND_LABELS["vpn"])
                 out["evidence"].append({"kind": "tunnel", "value": "、".join(vpn)})
 
+    out["short"] = PROXY_BACKEND_SHORT.get(out["backend"], out["backend"])
     out["other_backends"] = sorted(b for b in matched if b != out["backend"])
     out["capabilities"] = _capabilities(
         out["backend"], out["controller_ok"], bool(out["config"].get("path")))
@@ -2620,16 +2991,37 @@ def check_geo_words() -> dict:
     return out
 
 
-def project_roots() -> list[pathlib.Path]:
-    """A14 要扫描的项目目录。
+SKILL_DIR = pathlib.Path(__file__).resolve().parent.parent
 
-    刻意不猜：skill 不该把某台机器的目录结构写死。用环境变量
-    CLAUDE_GUARD_PROJECT_ROOTS（冒号分隔）指定；没指定就跳过这一项并说明怎么开。
+
+def project_roots_default() -> tuple[list[pathlib.Path], str]:
+    """A14 / A24 的扫描范围：环境变量 → skill 所在的 git 仓 → 老位置 ~/ipe。
+
+    三级兜底，而且选中的那一级会被打出来 —— 扫描范围静默换掉比不扫更糟。
+
+    为什么不能只认环境变量：直接敲 `python3 scripts/account_guard.py --audit`
+    （同事最常见的跑法，文档里也是这么写的）时没人设这个变量，于是
+    「代码是否落在本地 Git」与「项目级 .claude 规模」两项会莫名其妙变成「未测到」。
+    2026-10-15 实测：裸跑是 6 项未测到，带上项目根就少 2 项。selfcheck.py 一直有
+    这套兜底、account_guard.py 没有，两边各说各话。
     """
-    raw = os.environ.get("CLAUDE_GUARD_PROJECT_ROOTS", "")
-    if not raw.strip():
-        return []
-    return [pathlib.Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
+    raw = os.environ.get("CLAUDE_GUARD_PROJECT_ROOTS", "").strip()
+    if raw:
+        return ([pathlib.Path(x).expanduser() for x in raw.split(os.pathsep) if x.strip()],
+                "环境变量指定")
+    code, out = run(["git", "-C", str(SKILL_DIR), "rev-parse", "--show-toplevel"], timeout=20)
+    top = pathlib.Path(out.strip()) if code == 0 and out.strip() else None
+    if top is not None and top.is_dir():
+        return [top], "skill 所在的 git 仓"
+    legacy = HOME / "ipe"
+    if legacy.is_dir():
+        return [legacy], "老位置 ~/ipe"
+    return [], "没指定（设 CLAUDE_GUARD_PROJECT_ROOTS，或把 skill 装进一个 git 仓）"
+
+
+def project_roots() -> list[pathlib.Path]:
+    """A14 要扫描的项目目录。三级兜底见 project_roots_default。"""
+    return project_roots_default()[0]
 
 
 def check_consistency(ip: dict | None = None) -> dict:
@@ -2945,7 +3337,7 @@ def cache_is_fresh(data: dict, *, require_profile_scope: bool = True,
     return True, ""
 
 
-def verify_media_permission(timeout: int = 240) -> dict:
+def verify_media_permission(timeout: int = 240, auto_open: bool = False) -> dict:
     """起一个本地页面，请用户用日常浏览器打开，把真实权限状态收回来。
 
     为什么要用户配合：Chrome 的资料文件受 TCC 保护，读内容会报
@@ -3006,10 +3398,15 @@ def verify_media_permission(timeout: int = 240) -> dict:
     # flush 是必须的：这个函数会阻塞等待浏览器回传，而 Python 在 stdout 不是
     # TTY 时（后台跑、管道接出去）会缓冲——不刷新的话 URL 根本打不出来，
     # 用户看不到要打开哪个地址，就一直等到超时。
+    url = f"http://127.0.0.1:{port}/{token}/"
     print(f"\n  用你日常那个 Chrome 打开：\n", flush=True)
-    print(f"      http://127.0.0.1:{port}/{token}/\n", flush=True)
+    print(f"      {url}\n", flush=True)
     print(f"  链接里那串是本次随机令牌，别改也别分享；页面会自动检测并回传，最多等 {timeout} 秒（Ctrl-C 可取消）...",
           flush=True)
+    opened = open_verify_page(url, "媒体权限复核页") if auto_open else {"opened": False}
+    if auto_open and not opened.get("opened"):
+        print(f"  没能替你打开浏览器（{opened.get('reason')}）—— 手动打开上面那个地址即可。",
+              flush=True)
     try:
         ready.wait(timeout=timeout)
     except KeyboardInterrupt:
@@ -3028,6 +3425,13 @@ def verify_media_permission(timeout: int = 240) -> dict:
     # The browser cannot identify its profile to this local page.  Bind the
     # result only to an identifier the user supplied explicitly; without it
     # the cache remains visible but can never be treated as green evidence.
+    #
+    # 2026-10-15 加了一层可核验的证据：这次复核页是**谁打开的**。脚本自己用声明的
+    # 资料目录 open 出来的，就记 openedBy=script；只发链接、由用户自己在别处打开的，
+    # 仍然只有一份声明，判定那边照样不据此报绿。
+    got["openedBy"] = "script" if opened.get("opened") else "user"
+    if opened.get("profileDir"):
+        got["openedProfileDir"] = opened["profileDir"]
     scope = browser_profile_scope()
     if scope:
         got["profileScope"] = scope
@@ -3050,7 +3454,10 @@ def verify_media_permission(timeout: int = 240) -> dict:
         print("\n  这表示：网站拿不到摄像头/麦克风权限 → mDNS 混淆一直生效 → WebRTC 不泄漏。")
     else:
         print("\n  这表示：仍能拿到媒体权限，mDNS 混淆会被关掉，真实内网地址会出现在候选里。")
-        print("  修法：Chrome 设置 → 隐私和安全 → 网站设置 → 摄像头/麦克风 → 不允许网站使用。")
+        print("  修法一：Chrome 设置 → 隐私和安全 → 网站设置 → 摄像头/麦克风 → 不允许网站使用。")
+        print("  修法二：装 WebRTC Network Limiter 扩展（文章 2.5② 推的就是它）。")
+        print(f"    下包：python3 scripts/account_guard.py --install-webrtc-limiter")
+        print(f"    商店：{WEBRTC_LIMITER_STORE_URL}")
     return got
 
 
@@ -3426,9 +3833,19 @@ def check_browser_locale(ip: dict | None = None, expected: dict | None = None) -
     if cached.get("intlLocale") and cache_ok:
         out["measured"] = cached["intlLocale"]
         out["checked_at"] = cached.get("checkedAt")
-        out["scope_unverified"] = True
-        out["source"] = ("浏览器实测（用户声明资料：" + cached["profileScope"]
-                          + "；资料身份未由脚本验证）")
+        # 资料身份这回事：页面自己报不出来，所以判据是「这次复核页是谁打开的」。
+        # 脚本自己用声明的资料目录 open 出来的（--verify-browser 或 --check-locale
+        # 自动打开），至少能说清是脚本按哪个资料开的；只发链接、由用户在别处打开的，
+        # 仍然只有一份声明，不能据此报绿。
+        script_opened = cached.get("openedBy") == "script"
+        out["opened_by_script"] = script_opened
+        out["scope_unverified"] = not script_opened
+        if script_opened:
+            where = cached.get("openedProfileDir") or cached.get("profileScope") or "默认资料"
+            out["source"] = ("浏览器实测（脚本打开的复核页，资料 " + where + "）")
+        else:
+            out["source"] = ("浏览器实测（用户声明资料：" + str(cached.get("profileScope") or "未声明")
+                              + "；资料身份未由脚本验证）")
         # 时区是同一张复核页顺手带回来的（页面本来就在收 timeZone），
         # 以前收了没用。这里只报事实、不下判定 —— 见下面 facts 里的说明。
         if cached.get("timeZone"):
@@ -3512,7 +3929,7 @@ LOCALE_VERIFY_PAGE = """<!doctype html><meta charset="utf-8">
 </script>"""
 
 
-def verify_browser_locale(timeout: int = 240) -> dict:
+def verify_browser_locale(timeout: int = 240, auto_open: bool = False) -> dict:
     """起一个本地页面，请用户用日常浏览器打开，把真实的 Intl 区域设置收回来。
 
     为什么不自己测：Chrome 的资料文件受 TCC 保护，读不到 Profile 里的设置；而
@@ -3568,10 +3985,15 @@ def verify_browser_locale(timeout: int = 240) -> dict:
 
     # flush 必须加：这里会阻塞等浏览器回传，而 Python 在 stdout 不是 TTY 时
     # 会缓冲 —— 不刷新的话 URL 根本打不出来，用户不知道开哪个地址，只能等到超时。
+    url = f"http://127.0.0.1:{port}/{token}/"
     print("\n  用你要检查的那个 Chrome 资料打开：\n", flush=True)
-    print(f"      http://127.0.0.1:{port}/{token}/\n", flush=True)
+    print(f"      {url}\n", flush=True)
     print(f"  链接里那串是本次随机令牌，别改也别分享；页面会自动回传，最多等 {timeout} 秒（Ctrl-C 可取消）...",
           flush=True)
+    opened = open_verify_page(url, "浏览器 Intl 复核页") if auto_open else {"opened": False}
+    if auto_open and not opened.get("opened"):
+        print(f"  没能替你打开浏览器（{opened.get('reason')}）—— 手动打开上面那个地址即可。",
+              flush=True)
     try:
         ready.wait(timeout=timeout)
     except KeyboardInterrupt:
@@ -3587,6 +4009,10 @@ def verify_browser_locale(timeout: int = 240) -> dict:
         return {}
 
     got["checkedAt"] = now_stamp()
+    # 见 verify_media_permission 里同一段说明：记下这次复核页是谁打开的。
+    got["openedBy"] = "script" if opened.get("opened") else "user"
+    if opened.get("profileDir"):
+        got["openedProfileDir"] = opened["profileDir"]
     scope = browser_profile_scope()
     if scope:
         got["profileScope"] = scope
@@ -3978,7 +4404,13 @@ def build_summary(report: dict) -> list:
         # 注意：这条分支只在**没有**探测结果时走，探测跑过时以探测为准。
         mp = load_media_permission()
         media_cache_ok, media_cache_note = cache_is_fresh(mp)
-        if mp.get("ok") and media_cache_ok:
+        if mp.get("ok") and media_cache_ok and mp.get("openedBy") == "script":
+            # 复核页由脚本自己按声明的资料打开：网站拿不到摄像头/麦克风 → mDNS
+            # 混淆一直生效 → 这条链路不泄漏。这跟「没测到」是两回事。
+            add("WebRTC 泄漏", S_OK,
+                f"这次没跑探测；{mp.get('checkedAt')} 那次由脚本打开的复核页显示摄像头与麦克风"
+                f"都拿不到（{mp.get('detail') or 'NotAllowedError'}）→ mDNS 混淆生效，不泄漏")
+        elif mp.get("ok") and media_cache_ok:
             add("WebRTC 泄漏", S_NA,
                 f"这次没跑探测；缓存显示摄像头与麦克风都拿不到（复核于 {mp.get('checkedAt')}），"
                 f"但资料身份只有用户声明、未由脚本验证，不能据此报绿")
@@ -4966,16 +5398,31 @@ OTHER_HOME_RE = re.compile(
 MAX_PROJECT_DEPTH = 6
 
 
-def _dir_size(p: pathlib.Path) -> int:
-    """算目录实际占用。遇到读不到的条目跳过，不抛。"""
+def _dir_size_pair(p: pathlib.Path, sub: pathlib.Path | None = None) -> tuple[int, int]:
+    """一次遍历同时给出目录总体积、以及其中某个子目录的体积。
+
+    分开算会把子目录走两遍，而 `worktrees` 占项目级 `.claude` 的 99%：本机实测
+    67 个目录 13.4 GB，走两遍要 43 秒，一遍砍掉一半。
+    """
     total = 0
+    sub_total = 0
+    prefix = (str(sub).rstrip("/") + os.sep) if sub is not None else ""
     for dp, _dns, fns in os.walk(p, onerror=lambda e: None):
         for f in fns:
+            full = os.path.join(dp, f)
             try:
-                total += os.lstat(os.path.join(dp, f)).st_size
+                size = os.lstat(full).st_size
             except OSError:
-                pass
-    return total
+                continue
+            total += size
+            if prefix and full.startswith(prefix):
+                sub_total += size
+    return total, sub_total
+
+
+def _dir_size(p: pathlib.Path) -> int:
+    """算目录实际占用。遇到读不到的条目跳过，不抛。"""
+    return _dir_size_pair(p)[0]
 
 
 def _worktree_registrations(repo: pathlib.Path) -> tuple[list[dict], int]:
@@ -5045,10 +5492,8 @@ def check_project_claude() -> dict:
             if p.name == ".claude" and "node_modules" not in dp:
                 dns[:] = []          # 不往 .claude 里面再找嵌套的
                 out["dirs"] += 1
-                size = _dir_size(p)
+                size, wt_size = _dir_size_pair(p, p / "worktrees")
                 out["total_bytes"] += size
-                wt = p / "worktrees"
-                wt_size = _dir_size(wt) if wt.is_dir() else 0
                 out["worktrees_bytes"] += wt_size
                 sizes.append((size, wt_size, p))
             # 顺路看看这个仓库有没有过期的工作树注册。
@@ -5208,7 +5653,10 @@ MANUAL_ACTIONS = (
           "申请退款不会自动取消续费，记得同时取消"),
          "这是唯一一处「钱」的操作，本 skill 不代做"),
         ("别在同一台没清理过的电脑上秒开新号", "文章 §7 + §2.6",
-         ("先把本机残留清干净再考虑下一步"),
+         # 这里原来少了一个逗号：("…") 不是元组而是字符串，渲染步骤时按字符迭代，
+         # 报告页上就成了竖排一个字一个 <li>。2026-10-15 用户看到并问起才修。
+         ("先把本机残留清干净——这台机器上的体检与加固就是干这个的",
+          "清干净之后再考虑下一步，不要当天就开新号"),
          "文章原话「不要马上用同一台没清理过的电脑开新号硬冲」。条款也写明用新号绕过封禁本身违规——清残留是为了少被连坐，不是给开新号铺路"),
         ("被要求身份验证时，只能用本人真实证件", "文章 §1 九月新变化",
          ("按页面提示走官方身份验证流程，用本人真实证件",
@@ -5260,13 +5708,21 @@ MANUAL_CHECKS = (
           "# 再拿前缀去 ARIN 查一遍归属，whois 见得多"),
          "住宅 ISP 与机房 IP 的区别就在这一栏；机房段容易被判定为代理"),
         ("WebRTC 泄漏", "文章 2.5②",
-         ("# 修：Chrome 设置 → 隐私和安全 → 网站设置 → 摄像头 → 不允许网站使用",
-          "#     同一页把「麦克风」也设成不允许",
+         ("# 修一：Chrome 设置 → 隐私和安全 → 网站设置 → 摄像头 → 不允许网站使用",
+          "#       同一页把「麦克风」也设成不允许",
+          "# 修二：装 WebRTC Network Limiter 扩展（文章推的就是它）",
+          f"#       {WEBRTC_LIMITER_STORE_URL}",
+          "#       本 skill 能把扩展包直接下下来：",
+          "#       python3 scripts/account_guard.py --install-webrtc-limiter",
           "# 验：https://browserleaks.com/webrtc，看 Media Devices 里权限显示不是 Prompt"),
          "浏览器里没有开关能「授权之后仍藏住内网 IP」——mDNS 混淆只在页面没有摄像头/"
          "麦克风权限时生效，这是设计如此（P2P 媒体流需要真实局域网地址）。四个 "
          "webRTCIPHandlingPolicy 取值实测都没效果，它们是扩展 API 的参数不是命令行开关。"
-         "所以只能从权限下手：不让网站拿到权限，混淆就一直生效。"),
+         "所以两条路一起走：一是不让网站拿到权限，混淆就一直生效；二是装 "
+         "WebRTC Network Limiter（商店里那个 Google 官方扩展），它做的正是往 "
+         "webRTCIPHandlingPolicy 写 disable_non_proxied_udp —— 本机 Claude 资料里实测"
+         "装的就是它，设置栏就是 disable_non_proxied_udp。装扩展那一下只能你自己点，"
+         "Chrome 在 macOS 上不接受脚本代装。"),
         ("DNS 泄漏", "文章 2.5③",
          ("dig example.com +short",
           "# 浏览器打开 https://browserleaks.com/dns"),
@@ -5286,7 +5742,7 @@ MANUAL_CHECKS = (
          "Enabled 应为 No，Server 应为 0.0.0.0、Port 为 0。注意列表第一行是说明文字、被禁用的服务名字前面带星号，按名字操作时要去掉"),
         ("终端环境变量", "文章 2.5⑤",
          ('env | grep -iE "proxy|anthropic|claude"',),
-         "应无输出。原文这条写得太宽：只要当前目录名里带 claude（比如就站在 claude-account-guard 目录下），PWD 就会被命中，实测踩过。真要看代理就把它拆成 env | grep -i proxy"),
+         "应无输出。原文这条写得太宽：只要当前目录名里带 claude（比如就站在 cc-tackle 目录下），PWD 就会被命中，实测踩过。真要看代理就把它拆成 env | grep -i proxy"),
         ("shell 配置里的代理行", "文章 2.5⑤",
          ('grep -inE "proxy|ANTHROPIC" ~/.zshrc ~/.bashrc ~/.profile ~/.zshenv ~/.zprofile 2>/dev/null',),
          "应无输出"),
@@ -5556,6 +6012,8 @@ def _refresh_backup_manifest(backup: pathlib.Path, step: str) -> None:
     Unknown post state intentionally remains unknown after a crash inside a
     mutation.  Restore then refuses to overwrite potentially newer user data.
     """
+    if backup is None:
+        return                      # 这次没有任何写操作，没有备份可记
     backup, manifest = _load_v2_manifest(backup)
     for entry in manifest["entries"]:
         path = pathlib.Path(entry["path"])
@@ -5572,6 +6030,8 @@ def _refresh_backup_manifest(backup: pathlib.Path, step: str) -> None:
 
 def _mark_backup_in_progress(backup: pathlib.Path, step: str) -> None:
     """Mark a mutation before its first write; SIGKILL then fails closed."""
+    if backup is None:
+        return                      # 这次没有任何写操作，没有备份可记（见 main 的 will_write）
     backup, manifest = _load_v2_manifest(backup)
     manifest["pending_step"] = step
     manifest.setdefault("steps", []).append({"name": step + ":in-progress",
@@ -6002,12 +6462,22 @@ def apply_telemetry(mode: int) -> str:
     else:
         env["DISABLE_TELEMETRY"] = "1"
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-    data["env"] = env
+    want = dict(env)
+    if before == want:
+        # 复验要拿「目标状态」比，不能拿「改动前的状态」比。键本来就是 1 时这次写入
+        # 不产生任何变化，拿 before 比会把「已经是对的」判成「写入未生效」——
+        # 2026-10-15 实测就误报过这一次，而且调用点没兜住异常，流程停在 [3/6]，
+        # 后面几步全没跑。这里连文件都不改写，直接返回。
+        return "目标键本来就是这些值，无需改动（未改写 settings.json）"
+    data["env"] = want
     write_json(SETTINGS, data)
-    after = dict(read_json(SETTINGS, {}).get("env", {}))
-    if after == before:
-        raise RuntimeError("遥测键写入后复验未生效")
-    return f"已写入 {', '.join(k for k in env if k not in before)}"
+    after = dict(read_json(SETTINGS, {}).get("env", {}) or {})
+    if after != want:
+        raise RuntimeError(
+            f"遥测键写入后复验未生效：期望 {sorted(want)}，实际 {sorted(after)}"
+        )
+    changed = [k for k in want if before.get(k) != want.get(k)]
+    return f"已写入 {', '.join(changed)}"
 
 
 def apply_browser_wrapper() -> str:
@@ -6022,7 +6492,7 @@ def apply_browser_wrapper() -> str:
     wrapper = bindir / "claude-safe"
     wrapper.write_text(
         "#!/bin/sh\n"
-        "# claude-account-guard: 文章 2.6 —— 授权链接不交给默认浏览器\n"
+        "# cc-tackle: 文章 2.6 —— 授权链接不交给默认浏览器\n"
         "# 用 BROWSER=false 让 Claude Code 只打印链接，你再复制到专用浏览器资料里打开。\n"
         "BROWSER=false exec claude \"$@\"\n",
         encoding="utf-8",
@@ -6966,6 +7436,9 @@ def audit(*, persist: bool = False, expected_country: str | None = None,
     # Normal audits are read-only.  The explicit opt-in is used only when a
     # caller wants export history to be updated for the next comparison.
     expected_country, expected_exit_ip = declared_expected(expected_country, expected_exit_ip)
+    if persist:
+        # 只有允许写状态的调用才落盘：只读 --audit 一个字节都不写。
+        remember_declared_expected(expected_country, expected_exit_ip)
     ip = check_export_ip(persist=persist)  # 出口 IP 只查一次，一致性检查复用同一结果
     scope = claude_config_scope()
     expected = expected_exit_result(ip, expected_country, expected_exit_ip)
@@ -7395,9 +7868,19 @@ def main(argv: list[str] | None = None) -> int:
                     help="起一个本地页面，用你日常浏览器确认摄像头/麦克风权限（WebRTC 那一项靠它转正）")
     ap.add_argument("--check-locale", action="store_true",
                     help="起一个本地页面，用你日常浏览器把 Intl 区域设置回传回来")
+    ap.add_argument("--install-webrtc-limiter", action="store_true",
+                    help="下载 WebRTC Network Limiter 扩展包并打开商店页"
+                         "（安装那一下仍要你自己点，Chrome 不允许脚本代装）")
+    ap.add_argument("--verify-browser", action="store_true",
+                    help="配合 --audit：体检前脚本自己打开复核页，把 Intl 与媒体权限收回来（会写复核缓存）")
     ap.add_argument("--commands", action="store_true", help="只打印手工核对用的终端命令清单，不体检")
     ap.add_argument("--manual", action="store_true", help="只打印必须人工做的行动清单（带点击路径），不体检")
     args = ap.parse_args(argv)
+
+    if args.verify_browser and not args.audit:
+        print("拒绝组合：--verify-browser 只配合 --audit 使用；单独复核用 --check-locale 或 --check-media。",
+              file=sys.stderr)
+        return 2
 
     if args.restore_preview and not args.restore:
         print("--restore-preview 必须和 --restore 一起使用。", file=sys.stderr)
@@ -7428,13 +7911,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check_media:
 
-        verify_media_permission()
+        verify_media_permission(auto_open=True)
 
         return 0
 
     if args.check_locale:
 
-        verify_browser_locale()
+        verify_browser_locale(auto_open=True)
 
         return 0
 
@@ -7454,8 +7937,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    if args.install_webrtc_limiter:
+        # 只下载一个包 + 打开一个页面，不改本机配置，所以不需要 TTY，也不受
+        # 「Claude Code 里只放行只读」那条限制（安装那一下仍旧只能你自己点）。
+        return 0 if install_webrtc_limiter()["ok"] else 2
+
+    # --verify-browser 会打开一个浏览器页面并写复核缓存，所以它不算只读模式：
+    # 在 Claude Code 里仍旧只放行纯 --audit。
+    read_only_run = args.audit and not args.verify_browser
     under_claude = running_under_claude()
-    if under_claude and not args.audit:
+    if under_claude and not read_only_run:
         print("拒绝执行：当前脚本由 Claude Code 启动。加固步骤会改本机状态，请改用普通终端；这里只允许 --audit。", file=sys.stderr)
         return 2
     if not args.audit:
@@ -7472,6 +7963,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.audit and not sys.stdin.isatty():
         print("拒绝执行：需要真实 TTY 完成知情确认。", file=sys.stderr)
         return 2
+
+    if args.verify_browser:
+        # 顺序不能反：audit() 读的正是这两份复核缓存，先体检再复核等于白跑一次。
+        # --json 模式下 stdout 只能是那一个 JSON 文档（自检脚本靠它解析），
+        # 复核过程打的进度行必须让到 stderr，否则整份 JSON 解析不了。
+        sink = (contextlib.redirect_stdout(sys.stderr) if args.json
+                else contextlib.nullcontext())
+        with sink:
+            verify_browser_locale(auto_open=True)
+            verify_media_permission(auto_open=True)
+            print()
 
     try:
         # Full repair cannot persist audit state before CONFIRM; --save-audit is
@@ -7493,7 +7995,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
 
-    print("claude-account-guard —— 四层防线的本机体检")
+    print("CC tackle —— 四层防线的本机体检")
     print_audit(report)
     if args.audit:
         # 只读模式：体检完直接给总表
@@ -7511,6 +8013,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.report:
             # 只要一份 HTML，不要 JSON、不要状态：给同事或自己看一眼的那种用法。
             write_html_only(report, note="只有这一次体检，没有改动对照")
+        elif getattr(args, "verify_browser", False):
+            # 这次的两份浏览器复核缓存是脚本自己开的页面写下的，说「没写缓存」就是谎报。
+            print("\n只读审计没写报告与出口历史；浏览器复核结果已存进 "
+                  "~/.local/state/claude-guard/ 下的两份缓存。"
+                  "需要留档加 --save-audit（含 JSON），只要 HTML 加 --report。")
         else:
             print("\n只读审计未写入报告、出口历史或缓存；"
                   "需要留档加 --save-audit（含 JSON），只要 HTML 加 --report。")
@@ -7650,10 +8157,26 @@ def main(argv: list[str] | None = None) -> int:
             manual_boundaries.append("项目级垃圾清理需人工确认，不能保证原样恢复")
         if do_stale_worktrees:
             manual_boundaries.append("Git worktree prune 注册表不能原样自动恢复")
-        backup = create_backup(backup_paths + clash_files + other_files, sudo_targets,
-                               manual_boundaries=manual_boundaries)
-        _refresh_backup_manifest(backup, "backup-created")
-        print(f"\n[1/6] 备份完成：{backup}")
+        # 备份只为「即将发生的写入」而建。一个写操作都不会发生的时候（用户全选保持、
+        # 计划里也没有残留），建出来的空备份目录没有任何可回滚的东西，只会越堆越多。
+        # 真要写的时候，备份一步都不会省。
+        will_write = bool(
+            plan["proxy_residue"] or plan["rc_files"] or plan["npm_git"]
+            or plan["settings_base_url"] or plan.get("settings_env_proxy")
+            or do_clash_dns or other_files or do_browser_locale
+            or telemetry or do_storage or do_dead_permissions
+            or do_stale_worktrees or do_project_junk or do_wrapper
+            or do_ipv6 or do_loc
+        )
+        if will_write:
+            backup = create_backup(backup_paths + clash_files + other_files, sudo_targets,
+                                   manual_boundaries=manual_boundaries)
+            _refresh_backup_manifest(backup, "backup-created")
+            print(f"\n[1/6] 备份完成：{backup}")
+        else:
+            print("\n[1/6] 无需备份：这次没有任何要写入的改动")
+        backup_hint = (f"备份（回滚用）：{backup}" if backup
+                       else "本次没有写入任何改动，无需回滚")
 
         _mark_backup_in_progress(backup, "automatic-cleanup")
         if plan["proxy_residue"]:
@@ -7687,7 +8210,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if telemetry:
             _mark_backup_in_progress(backup, "telemetry")
-        print(f"[3/6] 遥测开关：{apply_telemetry(telemetry) if telemetry else '保持'}")
+        try:
+            print(f"[3/6] 遥测开关：{apply_telemetry(telemetry) if telemetry else '保持'}")
+        except Exception as error:
+            # 与「别家代理 DNS」同样的处理：一步失败不该让后面几步都不跑。
+            # 真没写进去的话，收尾那次复检会把这一行标回待处理。
+            print(f"       ⚠ 遥测开关写入失败（其余步骤继续）：{error}")
         if plan["settings_base_url"] or plan.get("settings_env_proxy"):
             _mark_backup_in_progress(backup, "settings")
             print(f"       端点/代理变量：{clear_anthropic_base_url()}")
@@ -7791,12 +8319,12 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "\n注意：本次加固已完成，但检测到受保护文件被连带改动：\n  "
                 + "\n  ".join(changed)
-                + f"\n这些改动不是脚本发起的，备份（回滚用）：{backup}",
+                + f"\n这些改动不是脚本发起的，{backup_hint}",
                 file=sys.stderr,
             )
             return 3
         _refresh_backup_manifest(backup, "complete")
-        print(f"\n完成。受保护文件未被动过。\n备份（回滚用）：{backup}")
+        print(f"\n完成。受保护文件未被动过。\n{backup_hint}")
 
         # 总表必须是改完之后的状态，不能拿加固前的报告充数——否则刚清掉的残留
         # 在表里还显示「待处理」，用户会以为没生效。重新体检一次。
@@ -7812,7 +8340,7 @@ def main(argv: list[str] | None = None) -> int:
             print_before_after(report, fresh)
             write_html_twin(report, fresh)
         except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
-            raise RuntimeError(f"复检失败：{error}；已执行改动的回滚路径：{backup}") from error
+            raise RuntimeError(f"复检失败：{error}；{backup_hint}") from error
         return 0
     except KeyboardInterrupt:
         # 中途 Ctrl-C：之前几步可能已经写完，必须告诉用户备份在哪，
