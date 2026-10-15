@@ -253,3 +253,20 @@ A3（遥测开关写入）已在上面列出，它同时属于这一类：会连
 `check_webrtc` 也重写了一次。旧实现依赖 node 侧 playwright 模块，这台机器上模块不存在，所以这一项永远测不出结果。新实现把浏览器当命令行工具用（`--dump-dom`），并实测了三种组合：完整版 Chrome 新旧 headless 都会挂死不返回；headless shell 配 `--virtual-time-budget` 能返回但虚拟时钟把等待提前触发、ICE 来不及跑完，稳定给出 0 个候选；配 `--timeout` 则在 load 时就 dump，异步结果写不进 DOM。结论是命令行这条路不可靠，于是把口径定成「能测就报，测不到就明说」，并把 0 候选明确标成结论不可用而不是没有泄漏。
 
 操作教训：改代码不要用 `sed`（曾把 f-string 改出 `SyntaxError` 并弄坏整个文件）；macOS 没有 `timeout` 命令。
+
+## 代理后端分派（2026-10-15 补）
+
+26 项里真正依赖代理软件的只有 A6（DNS 泄漏）与 A12（绝不直连）；其余各项与代理软件无关。
+新增 `A28_proxy_backend`（表格里那一行「代理后端」）做识别与能力分层：
+
+| 函数 | 干什么 |
+| --- | --- |
+| `check_proxy_backend()` / `_proxy_backend_report()` | 认出 mihomo / sing-box / Surge / v2ray / 系统代理 / VPN / 不认识，并给出凭据 |
+| `_capabilities()` | 这家能手读到什么、能不能改、改完能不能复验 |
+| `proxy_facts_for()` + `read_singbox_facts()` / `read_surge_facts()` / `read_v2ray_facts()` | 各家的 DNS 与分流读成同一套事实 |
+| `judge_proxy_facts()` | 判「Claude 会不会直连 / 会不会自动换节点」「解析器是不是国内的」 |
+| `backend_row()` / `backend_routing_row()` / `backend_dns_row()` | 三行文案 |
+| `check_traffic_capture()` | 对任何后端都成立：流量有没有真的进隧道（路由 + utun 有无 IPv4 + SOCKS5 握手） |
+| `clear_other_proxy_dns()` + `reload_backend()` | 别家的 DNS 修复（要 `--fix-unverified`）与按官方方式重载 |
+
+细节与真机验证范围见 `references/proxy-backends.md`。

@@ -155,6 +155,18 @@ CLASH_SOCK_CANDIDATES = (
     "/var/run/clash-verge-service/users/{uid}/verge-mihomo.sock",
     "/tmp/verge/verge-mihomo.sock",
 )
+# Mihomo Party 的 socket 名字里带着它自己的 pid（/tmp/mihomo-party-<uid>-<pid>.sock），
+# 写不成固定路径，只能按 glob 找。写进上面那张表会在 format(uid=...) 时炸 KeyError ——
+# 2026-10-15 真炸过，5 个用例一起报错。
+CLASH_SOCK_GLOBS = ("/tmp/mihomo-party-*.sock",)
+# 别家的 mihomo 发行版端口各不相同，写下来免得漏认：
+#   ClashX / ClashX Pro   127.0.0.1:8080（可在菜单里改）
+#   Stash                 127.0.0.1:9090（官方声明兼容 Clash 控制接口）
+#   mihomo 原版默认        127.0.0.1:9090
+MIHOMO_TCP_PORTS = (9090, 8080, 9097)
+# FlClash 用的是自己的 JSON-RPC socket，不是 Clash API —— 端口在监听着，
+# 但按 Clash API 去问会 404。认出来是为了说清「这家脚本只能读配置」。
+FLCLASH_SOCK_GLOB = "/tmp/FlClashSocket_*.sock"
 # Clash Verge 出厂就带这个 secret，没改过的话它适用于所有本机部署；
 # 改过就用环境变量 CLASH_SECRET 覆盖，别把某个人的 secret 写进代码。
 CLASH_SECRET = os.environ.get("CLASH_SECRET", "set-your-secret")
@@ -181,6 +193,11 @@ def clash_sock_paths() -> list:
             if value:
                 cands.append(pathlib.Path(value))
     cands += [pathlib.Path(p.format(uid=os.getuid())) for p in CLASH_SOCK_CANDIDATES]
+    for pattern in CLASH_SOCK_GLOBS:
+        try:
+            cands += sorted(pathlib.Path(pattern).parent.glob(pathlib.Path(pattern).name))
+        except OSError:
+            continue
     out = []
     for c in cands:
         if c not in out:
@@ -329,10 +346,1043 @@ def clash_config() -> pathlib.Path:
     """Clash Verge 生成的那份运行配置（订阅 + 增强文件合成后的产物）。"""
     return clash_dir() / "clash-verge.yaml"
 
+# ───────────────────────── 代理后端识别 ─────────────────────────
+# 2026-10-15 补。体检里原有 87 行是 Clash 专有的：26 项里「绝不直连」与「DNS 泄漏」
+# 直接读 mihomo 的 socket 与 clash-verge.yaml。用别的代理软件的人打开报告只会看到
+# 两行「未测到」，分不清是「脚本不认识你这家」还是「网络真有问题」。
+#
+# 这一层做三件事：认出跑的是哪一家 → 说清这家能查到什么、查不到什么 →
+# 只对「改完能复验」的后端动手（不能复验的降级成报告 + 精确步骤）。
+# 不认识的软件明说「脚本不认识它的配置格式」，不静默留白。
+
+PROXY_BACKEND_LABELS = {
+    "mihomo": "mihomo 内核（Clash Verge / ClashX / Mihomo Party / FlClash 等）",
+    "singbox": "sing-box",
+    "surge": "Surge",
+    "v2ray": "v2ray / Xray",
+    "system": "只有系统代理，没有规则引擎",
+    "vpn": "VPN 隧道",
+    "other": "认得出在跑，但脚本不认识它的配置格式",
+    "none": "没有发现代理",
+}
+
+# 进程名（小写、取 basename 后子串匹配）。顺序即探测优先级。
+PROXY_PROCESS_HINTS = (
+    ("mihomo", ("verge-mihomo", "mihomo", "clash-meta", "clash-verge", "clashx", "clash", "flclash")),
+    ("singbox", ("sing-box",)),
+    ("surge", ("surge",)),
+    ("v2ray", ("xray", "v2ray", "v2box")),
+    ("other", ("shadowsocksx-ng", "shadowsocksx", "shadowsocks-libev", "outline",
+               "stash", "loon", "quantumult", "trojan", "naive", "hysteria", "tun2socks")),
+)
+
+# 配置文件候选（相对家目录的写相对路径，绝对路径原样）。
+# 放在这里是为了「这台机器上跑的是谁」有据可查——每条都要能在证据里说出来源。
+MIHOMO_CONFIG_CANDIDATES = (
+    "Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml",
+    ".config/clash/config.yaml",
+    ".config/mihomo/config.yaml",
+    ".config/clash.meta/config.yaml",
+    "Library/Application Support/com.west2online.ClashX/config.yaml",
+)
+SINGBOX_CONFIG_CANDIDATES = (
+    "Library/Application Support/sing-box/config.json",
+    "Library/Application Support/io.nekohasekai.sfam/config.json",
+    "/opt/homebrew/etc/sing-box/config.json",
+    "/usr/local/etc/sing-box/config.json",
+    ".config/sing-box/config.json",
+)
+SURGE_PROFILE_DIRS = ("Library/Application Support/Surge/Profiles",)
+V2RAY_CONFIG_CANDIDATES = (
+    "/opt/homebrew/etc/xray/config.json",
+    "/usr/local/etc/xray/config.json",
+    "/opt/homebrew/etc/v2ray/config.json",
+    "/usr/local/etc/v2ray/config.json",
+    ".config/xray/config.json",
+    ".config/v2ray/config.json",
+    "Library/Application Support/V2RayX/config.json",
+)
+
+# 控制接口的形态。secret 一律从本机配置里读，不从命令行传（命令行会进 ps）。
+CONTROLLER_UNIX = "unix"
+CONTROLLER_HTTP = "http"
+
+
+def _resolve_candidate(path_text: str) -> pathlib.Path:
+    """候选路径：以 / 开头当绝对路径，否则相对家目录。"""
+    if str(path_text).startswith("/"):
+        return pathlib.Path(path_text)
+    return HOME / path_text
+
+
+def _first_existing(paths) -> pathlib.Path | None:
+    for p in paths:
+        try:
+            if pathlib.Path(p).is_file():
+                return pathlib.Path(p)
+        except OSError:
+            continue
+    return None
+
+
+def _running_process_names() -> list:
+    """当前在跑的进程名（小写 basename）。读不到就返回空表——
+    「读不到进程表」和「没有进程」是两件事，调用方要看 proc_ok 区分。"""
+    code, out = run(["ps", "-axo", "comm="], timeout=15)
+    if code != 0:
+        return []
+    names = []
+    for line in out.splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        base = name.rsplit("/", 1)[-1].strip().lower()
+        if base:
+            names.append(base)
+    return names
+
+
+def _match_processes(procs, hints) -> list:
+    hits = []
+    for hint in hints:
+        for name in procs:
+            if hint in name and name not in hits:
+                hits.append(name)
+    return hits
+
+
+def _read_text_limited(path, limit: int = 2_000_000) -> str:
+    try:
+        data = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return data[:limit]
+
+
+def _controller_from_unix(path, secret: str) -> dict:
+    return {"kind": CONTROLLER_UNIX, "path": str(path), "secret": secret or ""}
+
+
+def _controller_from_http(host: str, port: int, secret: str, auth: str) -> dict:
+    return {"kind": CONTROLLER_HTTP, "host": host or "127.0.0.1", "port": int(port),
+            "secret": secret or "", "auth": auth}
+
+
+def api_call(controller, method: str, path: str, body: bytes | None = None,
+             timeout: float = 8.0) -> tuple:
+    """对任意后端的控制接口发一次请求。
+
+    两种形态：unix socket（mihomo 默认）与 http（ClashX 的 external-controller、
+    sing-box 的 clash_api、Surge 的 http-api）。鉴权头按后端不同：
+    mihomo 与 sing-box 用 Authorization: Bearer，Surge 用 X-Key。
+    secret 只在内存里拼，不进 argv、不进日志。
+    """
+    if not controller:
+        raise ValueError("没有可用的控制接口")
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError("控制接口路径必须以 / 开头")
+    secret = str(controller.get("secret") or "")
+    if any(ord(ch) < 0x20 for ch in secret):
+        raise ValueError("控制接口密钥含非法控制字符，拒绝发送")
+    payload = body or b""
+    if controller.get("kind") == CONTROLLER_UNIX:
+        import http.client
+        import socket
+        target = pathlib.Path(str(controller.get("path") or ""))
+        request = (f"{method.upper()} {path} HTTP/1.1\r\n"
+                   "Host: localhost\r\n"
+                   + (f"Authorization: Bearer {secret}\r\n" if secret else "")
+                   + "Connection: close\r\n"
+                   f"Content-Length: {len(payload)}\r\n\r\n").encode() + payload
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(str(target))
+            sock.sendall(request)
+            try:
+                response = http.client.HTTPResponse(sock)
+                response.begin()
+                status = response.status
+                response_body = response.read()
+            except (http.client.HTTPException, OSError) as error:
+                raise RuntimeError("控制接口响应无效或不完整") from error
+        finally:
+            sock.close()
+        return status, response_body.decode("utf-8", "replace")
+    import http.client
+    conn = http.client.HTTPConnection(str(controller.get("host") or "127.0.0.1"),
+                                      int(controller.get("port") or 0), timeout=timeout)
+    try:
+        headers = {}
+        if secret:
+            if controller.get("auth") == "x-key":
+                headers["X-Key"] = secret
+            else:
+                headers["Authorization"] = "Bearer " + secret
+        headers["Content-Length"] = str(len(payload))
+        conn.request(method.upper(), path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
+def controller_reachable(controller) -> bool:
+    """只读探活：问一句 /version。连不上就是连不上，不猜测。"""
+    if not controller:
+        return False
+    for path in ("/version", "/configs"):
+        try:
+            code, body = api_call(controller, "GET", path, timeout=3)
+        except (OSError, ValueError, TimeoutError, RuntimeError):
+            continue
+        if code and 200 <= code < 300:
+            return True
+    return False
+
+
+def _capabilities(backend: str, controller_ok: bool, has_config: bool) -> dict:
+    """这家后端脚本能做什么。
+
+    verify_after_write 是这里唯一重要的字段：写操作只有它成立才允许自动执行。
+    改完读不回来，就等于「改了什么不知道、改坏了也不知道」。
+    """
+    caps = {
+        "read_dns": False, "read_routing": False, "pin_node": False,
+        "fix_dns": False, "verify_after_write": False, "fix_mode": "report",
+    }
+    if backend == "mihomo":
+        caps.update(read_dns=has_config, fix_dns=has_config, read_routing=controller_ok,
+                    pin_node=controller_ok, verify_after_write=has_config,
+                    fix_mode="auto")
+    elif backend == "singbox":
+        # 配置是 JSON，能读能写能复读；但改完要不要重启才生效不由我们决定，
+        # 所以 pin_node 走 clash_api（可复验），改 DNS 走文件（要用户重启）。
+        caps.update(read_dns=has_config, read_routing=controller_ok, pin_node=controller_ok,
+                    fix_dns=has_config, verify_after_write=False, fix_mode="file")
+    elif backend == "surge":
+        # Surge 的配置归 App 管，改文件要它在 UI 里重载；能复验的是策略组切换。
+        caps.update(read_dns=has_config, read_routing=controller_ok, pin_node=controller_ok,
+                    fix_dns=False, verify_after_write=False, fix_mode="report")
+    elif backend == "v2ray":
+        # 没有控制接口时只能静态读配置；改文件要重启进程才生效。
+        caps.update(read_dns=has_config, read_routing=has_config,
+                    fix_dns=has_config, verify_after_write=False, fix_mode="file")
+    return caps
+
+
+def _proxy_backend_report() -> dict:
+    """识别一次、判读一次。体检与两行判定共用这一份结果，避免两处各说各话。"""
+    info = check_proxy_backend()
+    info["facts"] = proxy_facts_for(info)
+    info["capture"] = check_traffic_capture()
+    return info
+
+
+def check_proxy_backend() -> dict:
+    """认出这台机器上的代理后端，并说清脚本对它了解到什么程度。
+
+    探测顺序是有讲究的：先看能不能真连上控制接口（那是运行时事实），再看进程，
+    最后才看磁盘上的配置文件。只看到配置文件就说「你在用 X」是不准的——卸载了
+    但配置还在的机器到处都是。
+    """
+    out = {
+        "backend": "none", "label": PROXY_BACKEND_LABELS["none"], "evidence": [],
+        "controller": None, "controller_ok": False, "config": {}, "capabilities": {},
+        "other_backends": [], "notes": [], "proc_ok": True,
+    }
+    procs = _running_process_names()
+    if not procs:
+        out["proc_ok"] = False
+    matched = {}
+    for backend, hints in PROXY_PROCESS_HINTS:
+        hits = _match_processes(procs, hints)
+        if hits:
+            matched[backend] = hits
+
+    # 1) mihomo：先试控制接口（包括服务模式搬走的那个 socket）
+    sock = clash_socket()
+    if sock is not None and _path_exists(sock) and _probe_clash_socket(sock):
+        cfg = _first_existing([_resolve_candidate(p) for p in MIHOMO_CONFIG_CANDIDATES])
+        out.update(backend="mihomo", label=PROXY_BACKEND_LABELS["mihomo"], controller_ok=True)
+        out["controller"] = _controller_from_unix(sock, CLASH_SECRET)
+        out["evidence"].append({"kind": "socket", "value": str(sock)})
+        out["config"] = {"path": str(cfg) if cfg else "", "format": "yaml"} if cfg else {}
+    elif "mihomo" in matched:
+        cfg = _first_existing([_resolve_candidate(p) for p in MIHOMO_CONFIG_CANDIDATES])
+        # ClashX 这类用 TCP 的 external-controller；从配置里读地址与 secret。
+        ctrl = _mihomo_tcp_controller(cfg)
+        out.update(backend="mihomo", label=PROXY_BACKEND_LABELS["mihomo"])
+        out["evidence"].append({"kind": "process", "value": "、".join(matched["mihomo"])})
+        if ctrl:
+            out["controller"] = ctrl
+            out["controller_ok"] = controller_reachable(ctrl)
+            if out["controller_ok"]:
+                out["evidence"].append({"kind": "controller", "value": f"{ctrl['host']}:{ctrl['port']}"})
+        out["config"] = {"path": str(cfg) if cfg else "", "format": "yaml"} if cfg else {}
+
+    # 2) sing-box
+    elif "singbox" in matched or _first_existing([_resolve_candidate(p) for p in SINGBOX_CONFIG_CANDIDATES]):
+        cfg = _first_existing([_resolve_candidate(p) for p in SINGBOX_CONFIG_CANDIDATES])
+        out.update(backend="singbox", label=PROXY_BACKEND_LABELS["singbox"])
+        if matched.get("singbox"):
+            out["evidence"].append({"kind": "process", "value": "、".join(matched["singbox"])})
+        ctrl = _singbox_controller(cfg)
+        if ctrl:
+            out["controller"] = ctrl
+            out["controller_ok"] = controller_reachable(ctrl)
+            if out["controller_ok"]:
+                out["evidence"].append({"kind": "controller", "value": f"{ctrl['host']}:{ctrl['port']}"})
+        out["config"] = {"path": str(cfg) if cfg else "", "format": "json"} if cfg else {}
+
+    # 3) Surge
+    elif "surge" in matched or _surge_profiles():
+        out.update(backend="surge", label=PROXY_BACKEND_LABELS["surge"])
+        if matched.get("surge"):
+            out["evidence"].append({"kind": "process", "value": "、".join(matched["surge"])})
+        profile = _surge_active_profile()
+        ctrl = _surge_controller(profile)
+        if ctrl:
+            out["controller"] = ctrl
+            out["controller_ok"] = controller_reachable(ctrl)
+            if out["controller_ok"]:
+                out["evidence"].append({"kind": "controller", "value": f"{ctrl['host']}:{ctrl['port']}"})
+        out["config"] = {"path": str(profile) if profile else "", "format": "conf"} if profile else {}
+
+    # 4) v2ray / xray
+    elif "v2ray" in matched or _first_existing([_resolve_candidate(p) for p in V2RAY_CONFIG_CANDIDATES]):
+        cfg = _first_existing([_resolve_candidate(p) for p in V2RAY_CONFIG_CANDIDATES])
+        out.update(backend="v2ray", label=PROXY_BACKEND_LABELS["v2ray"])
+        if matched.get("v2ray"):
+            out["evidence"].append({"kind": "process", "value": "、".join(matched["v2ray"])})
+        out["config"] = {"path": str(cfg) if cfg else "", "format": "json"} if cfg else {}
+
+    # 5) 认得出在跑、但脚本不认识它的配置格式
+    elif "other" in matched:
+        out.update(backend="other", label=PROXY_BACKEND_LABELS["other"])
+        out["evidence"].append({"kind": "process", "value": "、".join(matched["other"])})
+
+    # 6) 没有代理进程：看是不是只有系统代理，或者挂着 VPN 隧道
+    else:
+        enabled = system_proxy_enabled()
+        if enabled:
+            out.update(backend="system", label=PROXY_BACKEND_LABELS["system"])
+            out["evidence"].append({"kind": "system-proxy", "value": "、".join(enabled)})
+        else:
+            vpn = vpn_tunnels()
+            if vpn:
+                out.update(backend="vpn", label=PROXY_BACKEND_LABELS["vpn"])
+                out["evidence"].append({"kind": "tunnel", "value": "、".join(vpn)})
+
+    out["other_backends"] = sorted(b for b in matched if b != out["backend"])
+    out["capabilities"] = _capabilities(
+        out["backend"], out["controller_ok"], bool(out["config"].get("path")))
+    out["notes"] = _backend_notes(out)
+    return out
+
+
+def _route_interface(ip: str = "1.1.1.1") -> str:
+    """去这个地址走哪个网卡。这是判断「流量有没有被接管」最硬的一条信号——
+    scutil --proxy 四个开关全 0 的时候，流量照样可能被 utun 接管。"""
+    code, out = run(["route", "-n", "get", ip], timeout=10)
+    if code != 0:
+        return ""
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("interface:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _utun_ipv4() -> list:
+    """带 inet4 的 utun 接口。系统自带的 utun 只有链路本地 v6，代理的才有 v4 —— 
+    这是区分「系统的」和「代理的」唯一可靠办法（flags 和 status 都判不出来）。"""
+    code, out = run(["ifconfig"], timeout=10)
+    if code != 0:
+        return []
+    found = []
+    current = ""
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            current = line.split(":", 1)[0].strip()
+            continue
+        s = line.strip()
+        if s.startswith("inet ") and current.startswith("utun"):
+            found.append({"name": current, "addr": s.split()[1]})
+    return found
+
+
+def _tunnel_routes() -> list:
+    """路由表里指向 utun 的条目。代理插的是一串覆盖全网的具体路由
+    （1、2/7、4/6……128.0/1），不是改 default。"""
+    code, out = run(["netstat", "-rn", "-f", "inet"], timeout=15)
+    if code != 0:
+        return []
+    entries = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        if parts[-1].startswith("utun") or (len(parts) >= 4 and parts[3].startswith("utun")):
+            entries.append({"dest": parts[0], "iface": parts[3] if len(parts) > 3 else ""})
+    return entries
+
+
+def _local_listen_ports() -> list:
+    """本机在监听的回环端口（只用当前用户能看到的）。"""
+    code, out = run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], timeout=25)
+    if code != 0 or not out.strip():
+        return []
+    ports = []
+    for line in out.splitlines()[1:]:
+        m = re.search(r"(?:127\.0\.0\.1|\*|\[::1\]):(\d+)\s*\(LISTEN\)", line)
+        if m:
+            port = int(m.group(1))
+            if port not in ports:
+                ports.append(port)
+    return ports
+
+
+def socks5_alive(port: int, timeout: float = 2.0) -> bool:
+    """端口开着不等于它是代理：本机实测过一对反例（60114 收 SOCKS 握手回 400）。
+
+    只发最小握手（VER=5, NMETHODS=1, NOAUTH），看回来的第一字节是不是 0x05。
+    """
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout) as sock:
+            sock.sendall(b"\x05\x01\x00")
+            data = sock.recv(2)
+    except OSError:
+        return False
+    return len(data) == 2 and data[0] == 0x05
+
+
+def check_traffic_capture() -> dict:
+    """流量到底有没有被接管。对任何后端都成立——这也正是「不认识的后端」唯一
+    还能说点实话的地方：认不出它的配置，但能看出流量有没有进隧道。"""
+    out = {"route_iface": "", "tun_ipv4": [], "tunnel_routes": [], "listen_ports": [],
+           "socks_ports": [], "captured": False, "notes": []}
+    iface = _route_interface()
+    out["route_iface"] = iface
+    out["tun_ipv4"] = _utun_ipv4()
+    out["tunnel_routes"] = _tunnel_routes()
+    tun_names = {u["name"] for u in out["tun_ipv4"]}
+    if iface.startswith("utun") and iface in tun_names:
+        addr = next((u["addr"] for u in out["tun_ipv4"] if u["name"] == iface), "")
+        out["captured"] = True
+        out["notes"].append(f"去 1.1.1.1 走 {iface}（{addr}），流量确实进了隧道")
+    elif iface.startswith("utun"):
+        out["notes"].append(f"去 1.1.1.1 走 {iface}，但这个接口没有 IPv4 地址，"
+                            "看着像系统自带的隧道而不是代理")
+    elif iface:
+        out["notes"].append(f"去 1.1.1.1 走 {iface}，没有进隧道")
+    if out["tunnel_routes"]:
+        dests = [e["dest"] for e in out["tunnel_routes"]]
+        out["notes"].append(f"路由表里有 {len(dests)} 条指向隧道的具体路由（{dests[:3]}…）")
+    ports = _local_listen_ports()
+    out["listen_ports"] = ports
+    # 只探那些「像代理」的端口，避免把每个监听端口都摸一遍
+    candidates = [p for p in ports if p in (1080, 1081, 1086, 7890, 7891, 7897, 8889, 10808, 20171)]
+    for port in candidates[:8]:
+        if socks5_alive(port):
+            out["socks_ports"].append(port)
+    if out["socks_ports"]:
+        out["notes"].append("本机有活着的 SOCKS5 端口：" + "、".join(str(x) for x in out["socks_ports"]))
+    if not out["captured"] and out["socks_ports"]:
+        out["notes"].append("没有走隧道，但有一个真能握手的本地代理端口——"
+                            "这种部署靠应用自己设代理，规则与 DNS 都不一定跟着走")
+    return out
+
+
+def _backend_notes(info: dict) -> list:
+    """给这一家人话，说清脚本对它了解到哪儿、哪儿是边界。"""
+    backend = info["backend"]
+    notes = []
+    if backend == "mihomo":
+        notes.append("Clash API " + ("可用" if info["controller_ok"] else "连不上，分流这一项只能看配置文件"))
+    elif backend == "singbox":
+        if info["controller_ok"]:
+            notes.append("clash_api 可用，能读分组、能切节点")
+        elif info["controller"]:
+            notes.append("配置里写了 clash_api，但连不上（服务可能没在跑）")
+        else:
+            notes.append("没有开 clash_api —— 分流与 DNS 只能静态读配置文件，看到的是配置而不是运行时")
+    elif backend == "surge":
+        notes.append("HTTP API " + ("可用" if info["controller_ok"] else "连不上或没开 http-api"))
+    elif backend == "v2ray":
+        notes.append("默认没有运行时接口，只能静态读 config.json")
+    elif backend == "system":
+        notes.append("系统代理没有分流概念：所有流量一个出口，也就没有「规则写错漏出去」这回事")
+    elif backend == "vpn":
+        notes.append("隧道类工具不做域名分流；DNS 由隧道推送还是本机决定，要单独看")
+    elif backend == "other":
+        names = "、".join(e["value"] for e in info["evidence"] if e["kind"] == "process")
+        notes.append(f"在跑的是 {names}，脚本不认识它的配置格式，不能替你判断分流与 DNS")
+    return notes
+
+
+def _process_command_lines() -> list:
+    """完整命令行。用来核对「正在跑的那个进程，用的是不是我们读的那份配置」——
+    静态读配置最大的疑点就在这儿，能对上才敢据此报绿。"""
+    code, out = run(["ps", "-axo", "command="], timeout=15)
+    if code != 0:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def running_config_for(backend: str) -> str:
+    """从进程命令行里找 -c / --config / -f 指定的配置文件。找不到返回空串。"""
+    flags = {
+        "singbox": ("-c", "--config", "-D", "--directory"),
+        "v2ray": ("-config", "--config", "-c"),
+        "mihomo": ("-f", "--config"),
+    }.get(backend, ())
+    if not flags:
+        return ""
+    for line in _process_command_lines():
+        parts = line.split()
+        if not parts:
+            continue
+        exe = parts[0].rsplit("/", 1)[-1].lower()
+        hint = {"singbox": "sing-box", "v2ray": ("xray", "v2ray"), "mihomo": ("mihomo", "clash")}[backend]
+        names = (hint,) if isinstance(hint, str) else hint
+        if not any(n in exe for n in names):
+            continue
+        for i, token in enumerate(parts[:-1]):
+            if token in flags:
+                return parts[i + 1]
+        for token in parts[1:]:
+            for flag in flags:
+                if token.startswith(flag + "="):
+                    return token.split("=", 1)[1]
+    return ""
+
+
+def proxy_facts_for(info: dict) -> dict:
+    """按后端把配置读成同一套事实。mihomo 走原有的两条独立路径，这里返回空。"""
+    backend = info.get("backend")
+    cfg_path = (info.get("config") or {}).get("path") or ""
+    if backend == "singbox":
+        facts = read_singbox_facts(_singbox_config(cfg_path))
+    elif backend == "surge":
+        facts = read_surge_facts(_read_text_limited(cfg_path) if cfg_path else "")
+    elif backend == "v2ray":
+        text = _read_text_limited(cfg_path) if cfg_path else ""
+        cfg = {}
+        if text.strip():
+            try:
+                loaded = json.loads(text)
+                cfg = loaded if isinstance(loaded, dict) else {}
+            except json.JSONDecodeError:
+                cfg = {}
+        facts = read_v2ray_facts(cfg)
+    else:
+        return {}
+    judged = judge_proxy_facts(info, facts)
+    declared = running_config_for(backend)
+    same = False
+    if declared and cfg_path:
+        try:
+            same = pathlib.Path(declared).resolve() == pathlib.Path(cfg_path).resolve()
+        except OSError:
+            same = False
+    judged["config_is_running"] = same
+    judged["declared_config"] = declared
+    judged["runtime_verified"] = bool(info.get("controller_ok")) or same
+    if not judged["runtime_verified"]:
+        judged["verify_hint"] = (
+            "正在跑的进程命令行里没写配置文件路径，读到的只是磁盘上这份配置，"
+            "不能据此报绿；给它开 clash_api（能读运行时），或让进程用 -c 指定配置路径"
+        ) if backend in ("singbox", "v2ray") else "没有运行时证据，不能据此报绿"
+    return judged
+
+
+def system_proxy_enabled() -> list:
+    """系统代理是否启用（四个开关）。只报开着的项。"""
+    code, out = run(["scutil", "--proxy"], timeout=15)
+    if code != 0:
+        return []
+    enabled = []
+    labels = {
+        "HTTPEnable": "HTTP", "HTTPSEnable": "HTTPS",
+        "SOCKSEnable": "SOCKS", "ProxyAutoConfigEnable": "PAC",
+    }
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key in labels and value.strip() == "1":
+            enabled.append(labels[key])
+    return enabled
+
+
+def vpn_tunnels() -> list:
+    """在用的 VPN 隧道名（scutil --nc list 里状态为 Connected 的）。"""
+    code, out = run(["scutil", "--nc", "list"], timeout=15)
+    if code != 0:
+        return []
+    names = []
+    for line in out.splitlines():
+        if "Connected" not in line:
+            continue
+        if '"' in line:
+            name = line.split('"')[1]
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _mihomo_tcp_controller(cfg_path) -> dict | None:
+    """ClashX 这类走 TCP 的 external-controller。地址与 secret 都是配置里的字段。"""
+    text = _read_text_limited(cfg_path) if cfg_path else ""
+    host, port, secret = "", 0, ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("external-controller:"):
+            value = line.split(":", 1)[1].strip().strip("\"'")
+            # 允许 ":9090" 这种只写端口的写法
+            if value.startswith(":"):
+                host, port = "127.0.0.1", _int_or_zero(value[1:])
+            elif ":" in value:
+                h, _, ps = value.rpartition(":")
+                host, port = (h or "127.0.0.1"), _int_or_zero(ps)
+        elif line.startswith("secret:"):
+            secret = line.split(":", 1)[1].strip().strip("\"'")
+    if not port:
+        return None
+    return _controller_from_http(host, port, secret, "bearer")
+
+
+def _int_or_zero(text) -> int:
+    try:
+        return int(str(text).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _singbox_config(cfg_path) -> dict:
+    """读 sing-box 的 config.json。读不动就返回空 dict，由调用方报「未检测」。"""
+    text = _read_text_limited(cfg_path) if cfg_path else ""
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _singbox_controller(cfg_path) -> dict | None:
+    """sing-box 的 clash_api：experimental.clash_api.external_controller。"""
+    data = _singbox_config(cfg_path)
+    api = ((data.get("experimental") or {}).get("clash_api") or {})
+    if not api:
+        return None
+    addr = str(api.get("external_controller") or "").strip()
+    if not addr:
+        # 官方文档原话：external_controller 为空时 Clash API 是关闭的。
+        # 这里绝不能「默认 9090」——那会去连一个根本没开的端口，再把连不上
+        # 说成「服务没在跑」，两种情况完全不是一回事。
+        return None
+    host, port = "127.0.0.1", 9090
+    if addr.startswith(":"):
+        port = _int_or_zero(addr[1:]) or 9090
+    elif ":" in addr:
+        h, _, ps = addr.rpartition(":")
+        host, port = (h or "127.0.0.1"), (_int_or_zero(ps) or 9090)
+    return _controller_from_http(host, port, str(api.get("secret") or ""), "bearer")
+
+
+def _surge_profiles() -> list:
+    out = []
+    for rel in SURGE_PROFILE_DIRS:
+        d = _resolve_candidate(rel)
+        try:
+            if d.is_dir():
+                out += sorted(x for x in d.iterdir() if x.suffix == ".conf")
+        except OSError:
+            continue
+    return out
+
+
+def _surge_active_profile():
+    """Surge 当前用的那份 profile。
+
+    优先读 App 自己记的名字（Preferences 里的 plist），读不到就退回最近修改的那份，
+    并在证据里写明是「按修改时间推定的」——推定的东西不能当事实说。
+    """
+    profiles = _surge_profiles()
+    if not profiles:
+        return None
+    try:
+        import plistlib
+        plist = HOME / "Library/Preferences/com.nssurge.surge-mac.plist"
+        if plist.is_file():
+            data = plistlib.loads(plist.read_bytes())
+            for key in ("currentProfile", "CurrentProfile", "activeProfile"):
+                name = str(data.get(key) or "")
+                if name:
+                    for prof in profiles:
+                        if prof.stem == name or prof.name == name:
+                            return prof
+    except Exception:
+        pass
+    try:
+        return max(profiles, key=lambda x: x.stat().st_mtime)
+    except OSError:
+        return profiles[0]
+
+
+def _surge_controller(profile) -> dict | None:
+    """Surge 的 HTTP API：配置里有 `http-api = <key>@<host>:<port>` 才开。"""
+    text = _read_text_limited(profile) if profile else ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip().lower() != "http-api":
+            continue
+        value = value.strip().strip("\"'")
+        secret, _, addr = value.rpartition("@")
+        if not addr:
+            secret, addr = "", value
+        host, port = "127.0.0.1", 6171
+        if addr.startswith(":"):
+            port = _int_or_zero(addr[1:]) or 6171
+        elif ":" in addr:
+            h, _, ps = addr.rpartition(":")
+            host, port = (h or "127.0.0.1"), (_int_or_zero(ps) or 6171)
+        if host in ("0.0.0.0", "::"):
+            host = "127.0.0.1"
+        return _controller_from_http(host, port, secret, "x-key")
+    return None
+
+
+# ─────────── 各家的 DNS 与分流：读成同一套事实 ───────────
+# 判据不按软件各写一套，先归一成同样的几件事，最后由一个函数统一措辞。
+# 归一后要能回答四问：
+#   1) 谁在替这台机器解析国外域名？（CN_RESOLVER_MARKERS 认得出国内厂商就算）
+#   2) 解析请求本身走哪条路出去？（Clash 是 respect-rules，sing-box 是每个 server 的 detour）
+#   3) Claude 那几个域名最后落到哪个出口？那个出口会不会自己换节点？
+#   4) 兜底那一条是不是直连？
+
+def _resolver_address(entry) -> str:
+    """解析器条目取地址。sing-box 新格式是对象，老格式是字符串。"""
+    if isinstance(entry, dict):
+        for key in ("server", "address", "addr"):
+            if entry.get(key):
+                return str(entry[key])
+        return ""
+    return str(entry or "")
+
+
+def _resolver_detour(entry) -> str:
+    """解析请求自己走哪个出站。空字符串表示没写（＝按规则走，可能是直发）。"""
+    if isinstance(entry, dict):
+        return str(entry.get("detour") or "")
+    return ""
+
+
+def read_singbox_facts(cfg: dict) -> dict:
+    """从 sing-box 配置里读出 DNS 与分流事实。静态读，不代表运行时状态。"""
+    facts = {
+        "found": bool(cfg), "dns_servers": [], "dns_cn": [], "dns_no_detour": [],
+        "dns_rules": [], "final": "", "outbounds": [], "rule_outbounds": {},
+        "claude_rules": [], "tun": False, "auto_switch": [], "direct_tags": [],
+    }
+    if not cfg:
+        return facts
+    dns = cfg.get("dns") or {}
+    for entry in (dns.get("servers") or []):
+        addr = _resolver_address(entry)
+        if not addr:
+            continue
+        facts["dns_servers"].append(addr)
+        if _resolver_is_cn(addr):
+            facts["dns_cn"].append(addr)
+            if not _resolver_detour(entry):
+                facts["dns_no_detour"].append(addr)
+    facts["dns_rules"] = dns.get("rules") or []
+    route = cfg.get("route") or {}
+    facts["final"] = str(route.get("final") or "")
+    for ob in (cfg.get("outbounds") or []):
+        if not isinstance(ob, dict):
+            continue
+        tag = str(ob.get("tag") or "")
+        otype = str(ob.get("type") or "")
+        members = ob.get("outbounds") or []
+        facts["outbounds"].append({"tag": tag, "type": otype, "members": len(members)})
+        if otype in ("urltest", "url_test"):
+            facts["auto_switch"].append(tag)
+        if otype in ("direct", "block"):
+            facts["direct_tags"].append(tag)
+    for rule in (route.get("rules") or []):
+        if not isinstance(rule, dict):
+            continue
+        out_tag = str(rule.get("outbound") or rule.get("action") or "")
+        for field in ("domain_suffix", "domain", "domain_keyword", "domain_regex"):
+            for value in (rule.get(field) or []):
+                facts["rule_outbounds"].setdefault(str(value).lower(), out_tag)
+    for hint in CLAUDE_DOMAIN_HINTS:
+        if hint in facts["rule_outbounds"]:
+            tag = facts["rule_outbounds"][hint]
+            # policy 是各家统一的键名（Surge/v2ray 读取器也用这个）；sing-box 里
+            # 对应的是规则的 outbound。两个键都留着，免得下游按名字取错。
+            facts["claude_rules"].append({"match": hint, "outbound": tag, "policy": tag})
+    for ib in (cfg.get("inbounds") or []):
+        if isinstance(ib, dict) and str(ib.get("type")) == "tun":
+            facts["tun"] = True
+    return facts
+
+
+def read_surge_facts(text: str) -> dict:
+    """从 Surge 的 .conf 里读出 DNS 与分流事实。
+
+    Surge 的配置是分节文本：`[General]` 里 dns-server、`[Proxy Group]` 是策略组、
+    `[Rule]` 是按顺序匹配的规则、`FINAL` 是兜底。这里只读，不改。
+    """
+    facts = {"found": bool(text), "dns_servers": [], "dns_cn": [], "groups": [],
+             "claude_rules": [], "final": "", "auto_switch": [], "direct_policies": []}
+    if not text:
+        return facts
+    section = ""
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("//"):
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            section = s.strip("[]").strip().lower()
+            continue
+        if section.startswith("general"):
+            key, _, value = s.partition("=")
+            if key.strip().lower() in ("dns-server", "encrypted-dns-server"):
+                if key.strip().lower() == "encrypted-dns-server":
+                    continue
+                for item in value.split(","):
+                    addr = item.strip()
+                    if addr:
+                        facts["dns_servers"].append(addr)
+        elif section.startswith("proxy group") or section.startswith("policy group"):
+            name, _, rest = s.partition("=")
+            parts = [x.strip() for x in rest.split(",") if x.strip()]
+            gtype = parts[0].lower() if parts else ""
+            facts["groups"].append({"name": name.strip(), "type": gtype, "members": parts[1:]})
+            if gtype in AUTO_SWITCH_TYPES:
+                facts["auto_switch"].append(name.strip())
+        elif section.startswith("rule"):
+            parts = [x.strip() for x in s.split(",") if x.strip()]
+            if not parts:
+                continue
+            if parts[0].upper() == "FINAL":
+                facts["final"] = parts[1] if len(parts) > 1 else ""
+                continue
+            tail = [x for x in parts[2:] if x.lower() not in ("no-resolve", "force-remote-dns",
+                                                              "extended-matching", "dns-failed")]
+            policy = tail[0] if tail else ""
+            facts["claude_rules"].append({"type": parts[0], "payload": parts[1] if len(parts) > 1 else "",
+                                          "policy": policy})
+    facts["dns_cn"] = [x for x in facts["dns_servers"] if _resolver_is_cn(x)]
+    for g in facts["groups"]:
+        if g["type"] in ("direct", "reject"):
+            facts["direct_policies"].append(g["name"])
+    return facts
+
+
+def read_v2ray_facts(cfg: dict) -> dict:
+    """从 v2ray / Xray 的 config.json 里读出 DNS 与路由事实。
+
+    没有控制接口时这是唯一能读的东西：读到的是配置，不是运行时。
+    路由是顺序匹配、命中即停；一条都没命中时走 outbounds 的第一个。
+    """
+    facts = {"found": bool(cfg), "dns_servers": [], "dns_cn": [], "rules": [],
+             "outbounds": [], "claude_rules": [], "final": "", "auto_switch": [],
+             "direct_tags": []}
+    if not cfg:
+        return facts
+    dns = cfg.get("dns") or {}
+    for entry in (dns.get("servers") or []):
+        addr = _resolver_address(entry)
+        if addr:
+            facts["dns_servers"].append(addr)
+    facts["dns_cn"] = [x for x in facts["dns_servers"] if _resolver_is_cn(x)]
+    for ob in (cfg.get("outbounds") or []):
+        if not isinstance(ob, dict):
+            continue
+        tag = str(ob.get("tag") or "")
+        proto = str(ob.get("protocol") or "")
+        facts["outbounds"].append({"tag": tag, "type": proto, "members": 0})
+        if proto.lower() in ("freedom", "blackhole"):
+            facts["direct_tags"].append(tag)
+    for bal in ((cfg.get("routing") or {}).get("balancers") or []):
+        if isinstance(bal, dict) and bal.get("tag"):
+            facts["auto_switch"].append(str(bal["tag"]))
+    for rule in ((cfg.get("routing") or {}).get("rules") or []):
+        if not isinstance(rule, dict):
+            continue
+        out_tag = str(rule.get("outboundTag") or "")
+        for field in ("domain", "ip"):
+            for value in (rule.get(field) or []):
+                entry = {"type": field, "payload": str(value), "policy": out_tag}
+                facts["rules"].append(entry)
+                low = str(value).lower().lstrip("full:").lstrip("domain:")
+                for hint in CLAUDE_DOMAIN_HINTS:
+                    if hint in low:
+                        facts["claude_rules"].append({"type": field, "payload": str(value),
+                                                      "policy": out_tag})
+    if facts["outbounds"]:
+        facts["final"] = facts["outbounds"][0]["tag"]
+    return facts
+
+
+def _kind_of(facts: dict, tag: str) -> dict:
+    """某个出站/策略是什么性质：直连、会自动换、还是钉死/可选。"""
+    if not tag:
+        return {"tag": "", "kind": "unknown", "detail": "没有取到出口名"}
+    upper = str(tag).upper()
+    if upper in ("DIRECT", "REJECT"):
+        return {"tag": tag, "kind": "direct", "members": 0}
+    for ob in (facts.get("outbounds") or []):
+        if ob.get("tag") == tag:
+            otype = str(ob.get("type") or "").lower()
+            members = int(ob.get("members") or 0)
+            if otype in [t.lower() for t in AUTO_SWITCH_TYPES]:
+                return {"tag": tag, "kind": "auto", "members": members, "type": otype}
+            if otype in [t.lower() for t in DIRECT_TYPES]:
+                return {"tag": tag, "kind": "direct", "members": members, "type": otype}
+            if otype in ("selector", "select"):
+                return {"tag": tag, "kind": "selector", "members": members, "type": otype}
+            return {"tag": tag, "kind": "node", "members": members, "type": otype}
+    for g in (facts.get("groups") or []):
+        if g.get("name") == tag:
+            gtype = str(g.get("type") or "").lower()
+            members = len(g.get("members") or [])
+            if gtype in AUTO_SWITCH_TYPES:
+                return {"tag": tag, "kind": "auto", "members": members, "type": gtype}
+            if gtype in ("direct", "reject"):
+                return {"tag": tag, "kind": "direct", "members": members, "type": gtype}
+            if gtype == "select":
+                return {"tag": tag, "kind": "selector", "members": members, "type": gtype}
+            return {"tag": tag, "kind": "node", "members": members, "type": gtype}
+    return {"tag": tag, "kind": "unknown", "members": 0,
+            "detail": f"配置里找不到名为 {tag} 的出站或策略组，只能确认名字"}
+
+
+def judge_proxy_facts(info: dict, facts: dict) -> dict:
+    """把某家后端的事实判成「DNS 有没有问题、Claude 会不会直连或自动换」。
+
+    只在机制清楚的地方下结论：
+      * 「会自己换节点」看的是组类型（urltest/fallback/load-balance 是自动，select 不是），
+        这条对谁家都成立；
+      * 「解析请求直发」只有 mihomo 的 respect-rules 与 sing-box 的 detour 有明确语义，
+        Surge / v2ray 的解析路径读不到运行时证据，就只报事实、不判泄漏。
+    """
+    out = {
+        "backend": info.get("backend"), "config": (info.get("config") or {}).get("path", ""),
+        "dns": {"evaluated": False, "servers": [], "cn": [], "unrouted_cn": [],
+                "reasons": [], "limits": [], "fixable": False},
+        "routing": {"evaluated": False, "claude_outbound": "", "kind": "", "auto_switch": [],
+                    "direct": False, "auto_for_claude": False, "reasons": [], "limits": []},
+    }
+    if not facts.get("found"):
+        out["dns"]["limits"].append("读不到这个后端的配置文件，DNS 与分流都没法判")
+        out["routing"]["limits"].append("读不到这个后端的配置文件，分流没法判")
+        return out
+    out["dns"]["evaluated"] = True
+    out["routing"]["evaluated"] = True
+    out["dns"]["servers"] = list(facts.get("dns_servers") or [])
+    out["dns"]["cn"] = list(facts.get("dns_cn") or [])
+    out["dns"]["fixable"] = bool(out["dns"]["cn"])
+    backend = info.get("backend")
+    if out["dns"]["cn"]:
+        if backend == "singbox":
+            unrouted = [x for x in (facts.get("dns_no_detour") or [])]
+            out["dns"]["unrouted_cn"] = unrouted
+            if unrouted:
+                out["dns"]["reasons"].append(
+                    "国内解析器（" + "、".join(unrouted[:2]) + "）没有配 detour，"
+                    "解析请求按规则直发，不经过代理")
+            else:
+                out["dns"]["reasons"].append(
+                    "配置里有国内解析器（" + "、".join(out["dns"]["cn"][:2])
+                    + "），但它们都指定了 detour；是否真走代理要看那个出站")
+        elif backend in ("surge", "v2ray"):
+            out["dns"]["reasons"].append(
+                "国外域名会交给国内解析器（" + "、".join(out["dns"]["cn"][:2]) + "）")
+            out["dns"]["limits"].append(
+                "这个后端的解析请求走哪条线路，脚本读不到运行时证据；"
+                "要确认得看 browserleaks.com/dns")
+    else:
+        out["dns"]["reasons"].append("解析器里没有国内服务器")
+    if backend == "mihomo":
+        out["dns"]["limits"].append("mihomo 的判据在 DNS 那一行里单独报（respect-rules、dns-hijack）")
+
+    # ── 分流 ──
+    eff = ""
+    if facts.get("claude_rules"):
+        eff = str(facts["claude_rules"][-1].get("policy") or "")
+        out["routing"]["claude_outbound"] = eff
+        out["routing"]["matched"] = str(facts["claude_rules"][-1].get("payload") or "")
+    else:
+        eff = str(facts.get("final") or "")
+        out["routing"]["claude_outbound"] = eff
+        out["routing"]["matched"] = ""
+    kind = _kind_of(facts, eff)
+    out["routing"]["kind"] = kind.get("kind")
+    if kind["kind"] == "direct":
+        out["routing"]["direct"] = True
+        out["routing"]["reasons"].append(f"Claude 流量最后落到直连出口（{eff}）")
+    elif kind["kind"] == "auto":
+        out["routing"]["auto_switch"] = [eff]
+        out["routing"]["auto_for_claude"] = True
+        out["routing"]["reasons"].append(
+            f"Claude 流量走的是会自动换节点的组（{eff}，{kind.get('type')}）")
+    elif kind["kind"] == "selector":
+        members = int(kind.get("members") or 0)
+        if members > 1:
+            out["routing"]["reasons"].append(
+                f"Claude 走 {eff}（select 组，{members} 个成员）：不会自己换节点，但可以在界面里手动切")
+        else:
+            out["routing"]["reasons"].append(f"Claude 走 {eff}，只有 1 个成员，钉死在一个节点上")
+    elif kind["kind"] == "node":
+        out["routing"]["reasons"].append(f"Claude 走 {eff}，是单一出站，不会自动换")
+    else:
+        out["routing"]["limits"].append(kind.get("detail") or f"出口 {eff} 的性质判不出来")
+    if not facts.get("claude_rules"):
+        out["routing"]["limits"].append(
+            "配置里没有专门给 Claude 域名的规则，它跟着兜底走"
+            + (f"（兜底 {eff}）" if eff else ""))
+    if facts.get("auto_switch"):
+        out["routing"]["auto_switch"] = sorted(set(out["routing"]["auto_switch"]) | set(facts["auto_switch"]))
+        out["routing"]["limits"].append(
+            "这个后端里有会自动换节点的组：" + "、".join(sorted(facts["auto_switch"])[:3])
+            + "；Claude 是否经过它们取决于上面的出口")
+    return out
+
+
+def _outbound_kind(facts: dict, tag: str) -> dict:
+    for ob in facts.get("outbounds") or []:
+        if ob["tag"] == tag:
+            return ob
+    return {}
+
 # 国内解析器。出现在 Clash 的主 nameserver 列表里，就意味着「解析国外域名的请求交给
 # 国内服务器处理」；而 Clash 自己的 DNS 查询默认不跟规则走（respect-rules 缺省为 false），
 # 是从真实 IP 直发的。两个条件叠在一起，结果是国外域名的解析动作暴露给了国内解析器。
 # 放在 nameserver-policy 的 geosite:cn,private 底下则是正常的——国内域名本来就该走国内。
+# Claude 流量的域名特征。既认域名本身，也认 Anthropic 的网段——
+# statsigapi.net 名字里既没有 anthropic 也没有 claude，但确实是喂给 Claude 的。
+CLAUDE_DOMAIN_HINTS = (
+    "anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com",
+    "statsigapi.net", "160.79.104",
+)
+# 判定「这个出站会自己换节点」的类型名（各家叫法不同，归一到这里）
+AUTO_SWITCH_TYPES = ("urltest", "url_test", "url-test", "fallback", "load-balance", "loadbalance")
+# 判定「这个是直连」的类型名
+DIRECT_TYPES = ("direct", "freedom", "block", "reject", "DIRECT", "REJECT")
+
 CN_RESOLVER_IPS = (
     "223.5.5.5", "223.6.6.6", "119.29.29.29", "119.28.28.28",
     "114.114.114.114", "114.114.115.115", "180.76.76.76",
@@ -2593,6 +3643,120 @@ def clear_browser_locale(rep: dict) -> str:
     )
 
 
+def _backend_labels(pb: dict) -> str:
+    return str(pb.get("label") or pb.get("backend") or "未知后端")
+
+
+def _process_evidence(pb: dict) -> str:
+    names = [e.get("value") for e in (pb.get("evidence") or []) if e.get("kind") == "process"]
+    return "、".join(str(x) for x in names if x)
+
+
+def backend_row(pb: dict) -> tuple:
+    """「代理后端」这一行：认出是谁、脚本对它了解到什么程度。"""
+    backend = pb.get("backend") or ""
+    label = _backend_labels(pb)
+    caps = pb.get("capabilities") or {}
+    notes = "；".join(pb.get("notes") or [])
+    capture = pb.get("capture") or {}
+    cap_note = ("；".join(capture.get("notes") or []))
+    if backend == "none":
+        if capture.get("captured"):
+            return (S_NA, "没发现代理进程、系统代理也没开，但 " + cap_note
+                          + " —— 有东西在接管流量，脚本没认出它是谁")
+        return (S_NA, "没有发现代理进程，系统代理也没开；后面两行问的是代理的分流与 DNS，"
+                      "没有代理就没有可判的对象")
+    if backend == "other":
+        return (S_NA, f"在跑的是 {_process_evidence(pb) or label}，"
+                      "脚本不认识它的配置格式：分流与 DNS 读不到，只能靠它自己的界面和检测站"
+                      + ("；" + cap_note if cap_note else ""))
+    if backend == "system":
+        others = "；".join(pb.get("notes") or [])
+        return (S_OK, f"{label}（{others}）")
+    if backend == "vpn":
+        return (S_NA, f"{label}：{notes or '隧道类工具不做域名分流'}")
+    # mihomo / singbox / surge / v2ray
+    detail = label
+    if pb.get("controller_ok"):
+        detail += "，控制接口可用"
+    elif pb.get("controller"):
+        detail += "，控制接口连不上"
+    if not caps.get("verify_after_write"):
+        detail += "；改配置脚本无法就地复验（改完要它自己重载）"
+    if notes:
+        detail += "；" + notes
+    if cap_note:
+        detail += "；" + cap_note
+    return (S_OK if pb.get("controller_ok") else S_NA, detail)
+
+
+def backend_routing_row(pb: dict):
+    """非 mihomo 后端时「绝不直连」怎么写。返回 None 表示照旧走 Clash 的判据。"""
+    backend = pb.get("backend") or ""
+    if backend == "mihomo":
+        return None
+    if backend == "none":
+        return (S_NA, "没有发现代理，这一项没有可判的对象")
+    if backend == "system":
+        return (S_OK, "只有系统代理，没有分流规则：所有流量一个出口，不存在「规则没写对漏出去」，"
+                      "也没有兜底直连这回事；要确认出口看上面那两行")
+    if backend == "vpn":
+        return (S_NA, "隧道类工具不做域名分流，这一项不适用；出口看上面两行")
+    if backend == "other":
+        return (S_NA, f"在跑的是 {_process_evidence(pb)}，脚本不认识它的配置格式，"
+                      "读不到分流规则；这一项只能你自己在它的界面里确认")
+    facts = pb.get("facts") or {}
+    rt = facts.get("routing") or {}
+    label = _backend_labels(pb)
+    if not rt.get("evaluated"):
+        return (S_NA, f"{label}：" + "；".join(rt.get("limits") or ["读不到配置，分流判不了"]))
+    out = facts.get("routing", {}).get("claude_outbound") or "(未取到)"
+    if rt.get("direct") or rt.get("auto_for_claude"):
+        return (S_BAD, "；".join(rt.get("reasons") or []) + "。脚本不替别家改分流（改错就是断网），要你自己改")
+    body = "；".join(rt.get("reasons") or [])
+    limits = "；".join(rt.get("limits") or [])
+    if facts.get("runtime_verified"):
+        return (S_OK, f"{label}，{body}" + (f"（{limits}）" if limits else ""))
+    return (S_NA, f"{label}，配置层面：{body}"
+                  + (f"；{limits}" if limits else "")
+                  + "。"
+                  + (facts.get("verify_hint") or "没有运行时证据，不能据此报绿"))
+
+
+def backend_dns_row(pb: dict):
+    """非 mihomo 后端时「DNS 泄漏」怎么写。返回 None 表示照旧走 Clash 的判据。"""
+    backend = pb.get("backend") or ""
+    if backend == "mihomo":
+        return None
+    if backend == "none":
+        return (S_NA, "没有发现代理，这一项没有可判的对象")
+    if backend in ("system", "vpn"):
+        return (S_NA, "这个后端没有代理侧的 DNS 配置可读；DNS 由系统解析器决定，"
+                      "要确认有没有泄漏只能看 browserleaks.com/dns")
+    if backend == "other":
+        return (S_NA, f"在跑的是 {_process_evidence(pb)}，脚本不认识它的配置格式，读不到 DNS 设置")
+    facts = pb.get("facts") or {}
+    dns = facts.get("dns") or {}
+    label = _backend_labels(pb)
+    if not dns.get("evaluated"):
+        return (S_NA, f"{label}：" + "；".join(dns.get("limits") or ["读不到配置，DNS 判不了"]))
+    if dns.get("cn"):
+        who = "、".join(dns["cn"][:2])
+        if dns.get("fixable"):
+            tail = ("；确认后可改成境外解析器（要显式加 --fix-unverified，改完要重启这个软件）"
+                    if backend != "surge"
+                    else "；Surge 的配置归 App 管，要在界面里改")
+            return (S_FIX, "；".join(dns.get("reasons") or []) + tail)
+        return (S_FIX, "；".join(dns.get("reasons") or []) + "；要你自己在它的界面里改成境外解析器")
+    limits = "；".join(dns.get("limits") or [])
+    if facts.get("runtime_verified"):
+        return (S_OK, f"{label}，解析器 " + "、".join((dns.get("servers") or [])[:2])
+                      + "，没有国内服务器" + (f"（{limits}）" if limits else ""))
+    return (S_NA, f"{label}，配置里没有国内解析器"
+                  + (f"（{limits}）" if limits else "")
+                  + "。" + (facts.get("verify_hint") or "没有运行时证据，不能据此报绿"))
+
+
 def build_summary(report: dict) -> list:
     """把体检报告压成「哪些解决了、哪些没有」的行。
 
@@ -2616,6 +3780,7 @@ def build_summary(report: dict) -> list:
     tl = report.get("A21_timezone_layers") or {}
     bl = report.get("A27_browser_locale") or {}
     kc = report.get("E1_keychain") or {}
+    pb = report.get("A28_proxy_backend") or {}
     rows = []
     scope = report.get("scope_manifest") or {}
     custom_config_scope = bool(scope.get("custom"))
@@ -2697,8 +3862,12 @@ def build_summary(report: dict) -> list:
         add("系统代理残留", S_OK, "四个开关全为 0，网络服务也没有存值")
 
     cdc = dn.get("clash") or {}
+    dns_row = None if missing("A28_proxy_backend") else backend_dns_row(pb)
     if missing("A6_dns"):
         add("DNS 泄漏", S_NA, "未检测")
+    elif dns_row is not None and (dns_row[0] != S_NA or not cdc.get("found")):
+        # 非 mihomo 后端按它自己的事实判；但 mihomo 的 DNS 事实也照样报（配置里可能真有国内解析器）
+        add("DNS 泄漏", dns_row[0], dns_row[1])
     elif dn.get("probe_ok") is False:
         add("DNS 泄漏", S_NA, "DNS 探测失败或输出不完整，未判定为干净：" + "; ".join(dn.get("probe_errors") or []))
     elif (dn.get("real_ip_hosts") or []):
@@ -2865,8 +4034,15 @@ def build_summary(report: dict) -> list:
         add("时区两道闸", S_NA, f"按位置自动设定={gate_text(g1)}，定位服务设定时区={gate_text(g2)}")
 
     # ── 代理与线路 ──
+    if missing("A28_proxy_backend"):
+        add("代理后端", S_NA, "未检测")
+    else:
+        add("代理后端", *backend_row(pb))
+    row = None if missing("A28_proxy_backend") else backend_routing_row(pb)
     fc = cg.get("fail_closed") or {}
-    if not cg.get("reachable"):
+    if row is not None:
+        add("绝不直连", row[0], row[1])
+    elif not cg.get("reachable"):
         tried = "、".join(cg.get("sock_tried") or [])
         add("绝不直连", S_NA,
             f"Clash 控制接口不可达，这一项没测到（试过：{tried}）" if tried
@@ -5033,6 +6209,216 @@ def _active_merge_enhancement():
     return None
 
 
+def reload_backend(info: dict, config_path) -> str:
+    """让改完的配置生效。**只对官方明确支持重载的后端动手。**
+
+      * sing-box：官方唯一的重载手段是 SIGHUP（cmd_run.go 里注册了它），
+        收到后会先校验配置再重建实例；校验不过就跳过，不会把服务搞死。
+      * v2ray / Xray：**绝不能发 SIGHUP** —— 它们只注册了 SIGINT 与 SIGTERM，
+        SIGHUP 会走默认动作直接杀掉进程（main/run.go:105-107）。
+      * Surge：走 HTTP API 的 POST /v1/profiles/reload。
+      * mihomo：走 PUT /configs，由 clear_clash_dns_leak 负责。
+
+    找不到进程、或进程用的不是我们改的那份配置时，什么都不做并如实说明。
+    """
+    backend = (info or {}).get("backend")
+    path = pathlib.Path(str(config_path)) if config_path else None
+    declared = running_config_for(backend) if backend else ""
+    if declared and path is not None:
+        try:
+            if pathlib.Path(declared).resolve() != path.resolve():
+                return f"正在跑的进程用的是 {declared}，不是刚改的这份，没有替你重载——请自己重启"
+        except OSError:
+            pass
+    if backend == "singbox":
+        code, out = run(["pgrep", "-f", "sing-box"], timeout=10)
+        pids = [x.strip() for x in out.split() if x.strip().isdigit()]
+        if not pids:
+            return "没找到在跑的 sing-box 进程，改完的配置下次启动才生效"
+        sent = []
+        for pid in pids:
+            if run(["kill", "-HUP", pid], timeout=10)[0] == 0:
+                sent.append(pid)
+        if not sent:
+            return "给 sing-box 发 SIGHUP 失败，请自己重启它"
+        return (f"已给 sing-box（pid {'、'.join(sent)}）发 SIGHUP 让它重载；"
+                "配置校验不过它自己会跳过，重启后请再跑一次体检确认")
+    if backend == "surge":
+        controller = (info or {}).get("controller")
+        if not controller:
+            return "Surge 的 HTTP API 没开，改完的配置要在界面里重新载入"
+        try:
+            code, body = api_call(controller, "POST", "/v1/profiles/reload", body=b"{}")
+        except (OSError, ValueError, TimeoutError, RuntimeError) as error:
+            return f"调 Surge 重载失败（{error}），请在界面里重新载入"
+        return ("已让 Surge 重新载入配置（HTTP %s）" % code) if 200 <= code < 300 \
+            else f"Surge 重载返回 {code}，请在界面里确认"
+    if backend in ("v2ray",):
+        return ("v2ray / Xray 没有重载接口，而且给它们发 SIGHUP 会直接杀掉进程，"
+                "所以脚本不碰你的进程——请自己重启它")
+    return "这个后端没有脚本认识的重载方式，请自己重启它"
+
+
+def _write_text_atomic(path: pathlib.Path, text: str) -> None:
+    """同目录临时件写好后 rename，保留原权限。中途失败不留半个文件。"""
+    path = pathlib.Path(path)
+    tmp = path.with_name(path.name + ".guard-tmp")
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o644
+    tmp.write_text(text, encoding="utf-8")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+FOREIGN_DNS_IPS = ("1.1.1.1", "8.8.8.8")
+
+
+def _foreign_resolver(index: int) -> str:
+    return FOREIGN_DNS_IPS[index % len(FOREIGN_DNS_IPS)]
+
+
+def _looks_like_url(addr: str) -> bool:
+    return str(addr).lower().startswith(("http", "tls", "quic", "h3"))
+
+
+def _unfixed_cn_resolvers(backend: str, path) -> list:
+    """按修复时那套跳过规则，看还剩哪些「本该换掉」的国内解析器。
+
+    带 domains / expectIPs 的分流式解析器修复时是故意跳过的（改它们会改变
+    分流语义），所以复读核对必须用同一个视角，否则会把它们报成没改干净。
+    """
+    if backend not in ("singbox", "v2ray"):
+        return []
+    try:
+        cfg = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(cfg, dict):
+        return []
+    servers = (cfg.get("dns") or {}).get("servers") or []
+    out = []
+    for entry in servers:
+        if isinstance(entry, dict) and (entry.get("domains") or entry.get("expectIPs")):
+            continue
+        addr = _resolver_address(entry)
+        if addr and _resolver_is_cn(addr):
+            out.append(addr)
+    return out
+
+
+def clear_other_proxy_dns(info: dict, facts: dict) -> str:
+    """把别家后端配置里的国内解析器换成境外解析器。
+
+    这条路只在 ``--fix-unverified`` 下走，原因写在这里免得日后被当成疏漏：
+    配置我们能读、能改、能复读核对，但**「正在跑的那个进程有没有重新加载」验不了**——
+    sing-box / v2ray 要重启进程，Surge 要在界面里重载 profile，各不相同。所以改完
+    必须由用户自己重启那个软件，脚本把这一步说清楚，不假装已经生效。
+
+    只动「解析器地址」这一件事：带 domains/expectIPs 的分流式解析器、以及代理侧
+    的分流规则，一律不碰——那些改错就是断网或漏流量。
+    """
+    backend = (info or {}).get("backend")
+    path_text = (facts or {}).get("config") or ((info or {}).get("config") or {}).get("path") or ""
+    if not path_text:
+        raise RuntimeError("不知道配置文件在哪，拒绝修改")
+    path = pathlib.Path(path_text)
+    if not path.is_file():
+        raise RuntimeError(f"配置文件不存在：{path}")
+    ext = path.suffix.lower()
+    changed = []
+
+    if backend in ("singbox", "v2ray"):
+        try:
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"读不出 {path.name}：{error}") from error
+        if not isinstance(cfg, dict):
+            raise RuntimeError(f"{path.name} 顶层不是对象，拒绝修改")
+        dns = cfg.get("dns")
+        if not isinstance(dns, dict):
+            raise RuntimeError(f"{path.name} 里没有 dns 块，拒绝凭空造一个")
+        servers = dns.get("servers")
+        if not isinstance(servers, list):
+            raise RuntimeError(f"{path.name} 的 dns.servers 不是列表，拒绝修改")
+        for i, entry in enumerate(servers):
+            if isinstance(entry, dict) and (entry.get("domains") or entry.get("expectIPs")):
+                continue  # 分流用的解析器，语义特殊，不碰
+            addr = _resolver_address(entry)
+            if not addr or not _resolver_is_cn(addr):
+                continue
+            repl = _foreign_resolver(len(changed))
+            if isinstance(entry, dict):
+                if "server" in entry:
+                    entry["server"] = repl
+                elif "address" in entry:
+                    entry["address"] = repl
+                else:
+                    continue
+            else:
+                servers[i] = ("https://" + repl + "/dns-query") if _looks_like_url(addr) else repl
+            changed.append(addr)
+        if not changed:
+            return "配置里没有国内解析器，无需改动"
+        _write_text_atomic(path, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+
+    elif backend == "surge":
+        text = path.read_text(encoding="utf-8", errors="replace")
+        out_lines = []
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            if "=" not in stripped or not stripped.lower().startswith("dns-server"):
+                out_lines.append(line)
+                continue
+            key, _, value = stripped.partition("=")
+            items = [x.strip() for x in value.split(",")]
+            new_items = []
+            for item in items:
+                if item and _resolver_is_cn(item):
+                    new_items.append(_foreign_resolver(len(changed)))
+                    changed.append(item)
+                else:
+                    new_items.append(item)
+            indent = line[: len(line) - len(line.lstrip())]
+            end = "\n" if line.endswith("\n") else ""
+            out_lines.append(f"{indent}{key.strip()} = " + ", ".join(new_items) + end)
+        if not changed:
+            return "配置里没有国内解析器，无需改动"
+        _write_text_atomic(path, "".join(out_lines))
+    else:
+        raise RuntimeError(f"脚本不认识 {backend} 的配置格式，拒绝修改")
+
+    # 复读核对。注意这里要按「我们会不会动它」的同一套规则去看还剩谁：
+    # 带 domains 的分流解析器是被故意跳过的，拿「还有没有国内解析器」去判，
+    # 会把它们误报成没改干净（2026-10-15 的用例抓到的就是这个）。
+    if backend == "surge":
+        left = [x for x in (read_surge_facts(path.read_text(encoding="utf-8", errors="replace"))
+                            .get("dns_cn") or []) if x]
+    else:
+        left = _unfixed_cn_resolvers(backend, path)
+    if left:
+        raise RuntimeError(f"复读核对没通过，还有该换的国内解析器：{left[:3]}；请从备份恢复")
+    names = "、".join(changed[:3])
+    reload_note = reload_backend(info, path)
+    return (f"已把 {len(changed)} 个国内解析器（{names}）换成 {'、'.join(FOREIGN_DNS_IPS)}；"
+            f"改的是 {path.name}。{reload_note}")
+
+
+def other_proxy_dns_plan(report: dict) -> dict:
+    """别家后端的 DNS 修复计划。mihomo 走原有的 clear_clash_dns_leak。"""
+    pb = report.get("A28_proxy_backend") or {}
+    backend = pb.get("backend") or ""
+    facts = pb.get("facts") or {}
+    dns = facts.get("dns") or {}
+    if backend in ("singbox", "v2ray", "surge") and (dns.get("cn") or []):
+        return {"needed": True, "backend": backend, "path": facts.get("config") or "",
+                "targets": list(dns.get("cn") or []),
+                "verify": "restart", "fix_mode": (pb.get("capabilities") or {}).get("fix_mode", "")}
+    return {"needed": False, "backend": backend, "path": "", "targets": [], "verify": "",
+            "fix_mode": ""}
+
+
 def clear_clash_dns_leak(rep: dict) -> str:
     """A6 把 Clash 的主解析器从国内换成境外，并打开 respect-rules。
 
@@ -5597,6 +6983,7 @@ def audit(*, persist: bool = False, expected_country: str | None = None,
         "A10_third_party": check_third_party(),
         "A11_client_integrity": check_client_integrity(),
         "A12_clash_groups": check_clash_groups(),
+        "A28_proxy_backend": _proxy_backend_report(),
         "A13_multi_account": check_multi_account(),
         "A15_consistency": check_consistency(ip),
         "A3_telemetry": check_telemetry(),
@@ -5713,6 +7100,27 @@ def print_audit(r: dict) -> None:
                 print(f"  WebRTC  ：未发现公网地址泄漏（共探测到 {len(w['local_ips'])} 个地址）")
         else:
             print(f"  WebRTC  ：未测（{w['note']}）")
+    pb = r.get("A28_proxy_backend") or {}
+    if pb:
+        print(f"  代理后端：{pb.get('label')}")
+        for ev in (pb.get("evidence") or []):
+            print(f"    · 依据 {ev.get('kind')}：{ev.get('value')}")
+        caps = pb.get("capabilities") or {}
+        skills = [
+            "能读 DNS" if caps.get("read_dns") else "读不到 DNS",
+            "能读分流" if caps.get("read_routing") else "读不到分流",
+            "能改 DNS" if caps.get("fix_dns") else "不改 DNS",
+        ]
+        skills.append("改完可复验" if caps.get("verify_after_write") else "改完无法就地复验")
+        print("    · 能力：" + "；".join(skills))
+        for note in (pb.get("notes") or []):
+            print(f"      {note}")
+        for note in ((pb.get("facts") or {}).get("dns") or {}).get("limits") or []:
+            print(f"      DNS 边界：{note}")
+        for note in ((pb.get("facts") or {}).get("routing") or {}).get("limits") or []:
+            print(f"      分流边界：{note}")
+        for note in ((pb.get("capture") or {}).get("notes") or []):
+            print(f"    · 接管：{note}")
     g = r["A12_clash_groups"]
     if g["reachable"]:
         print(f"  Clash   ：mode={g['mode']}  tun={g['tun'].get('enable')}  strict-route={g['tun'].get('strict-route')}")
@@ -5932,7 +7340,15 @@ def auto_clean_plan(report: dict) -> dict:
     elif bl.get("target_blocked"):
         summary.append("预期出口不符，已跳过按实测国家修改 Chrome Intl")
 
+    other_dns = other_proxy_dns_plan(report)
+    if other_dns["needed"]:
+        summary.append(
+            f"别家代理 DNS：{PROXY_BACKEND_LABELS.get(other_dns['backend'], other_dns['backend'])} "
+            f"配置里有国内解析器（{'、'.join(other_dns['targets'][:2])}）——改它要显式加 "
+            f"--fix-unverified，且改完要重启那个软件才生效"
+        )
     return {
+        "other_proxy_dns": other_dns,
         "proxy_residue": report["A1_proxy_residue"]["residue"],
         "rc_files": rc,
         "npm_git": npm_git,
@@ -5954,6 +7370,9 @@ def auto_clean_plan(report: dict) -> dict:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="按四层防线做 Claude 本机体检与加固")
     ap.add_argument("--audit", action="store_true", help="只读体检，不做任何修改")
+    ap.add_argument("--fix-unverified", action="store_true",
+                    help="允许修改脚本无法就地复验的别家代理配置（sing-box / v2ray / Surge 的 DNS）；"
+                         "会先备份，改完要你自己重启那个软件才生效")
     ap.add_argument("--report", action="store_true",
                     help="结束时落一份 HTML 报告（只读模式下也能用，不写 JSON 与状态）")
     ap.add_argument("--save-audit", action="store_true",
@@ -6129,6 +7548,13 @@ def main(argv: list[str] | None = None) -> int:
         do_clash_dns = bool(plan.get("clash_dns")) and ask_yes(
             "修改 Clash DNS（会写配置并重载内核）？"
         )
+        other_dns = plan.get("other_proxy_dns") or {}
+        do_other_dns = bool(other_dns.get("needed")) and bool(args.fix_unverified)
+        if other_dns.get("needed") and not args.fix_unverified:
+            print(f"       别家代理 DNS：{PROXY_BACKEND_LABELS.get(other_dns.get('backend'), '')} "
+                  f"配置里有国内解析器（{'、'.join((other_dns.get('targets') or [])[:2])}）；"
+                  f"改它要显式加 --fix-unverified，改完还要重启那个软件——"
+                  f"这次没动它，命令：python3 scripts/account_guard.py --fix-unverified")
         do_browser_locale = bool(plan.get("browser_locale")) and ask_yes(
             "修改 Chrome Intl 应用语言（会改 Chrome 偏好并需重启）？"
         )
@@ -6169,6 +7595,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  5. 关闭 IPv6：{'是' if do_ipv6 else '否'}")
         print(f"  6. 关闭定位服务「设定时区」：{'是' if do_loc else '否'}")
         print(f"  7. Clash DNS：{'是' if do_clash_dns else '否'}；Chrome Intl：{'是' if do_browser_locale else '否'}")
+        if other_dns.get("needed"):
+            print(f"  7b. 别家代理 DNS（{PROXY_BACKEND_LABELS.get(other_dns.get('backend'), '')}）："
+                  f"{'是（改完要重启它）' if do_other_dns else '否（要显式加 --fix-unverified）'}")
         print(f"  8. 不可原样回滚清理：旧版本/缓存={'是' if do_storage else '否'}；失效权限={'是' if do_dead_permissions else '否'}；worktree 注册={'是' if do_stale_worktrees else '否'}")
         print("  绝不改动：session、project、history、skill、plugin、hook、command、agent、MCP 配置等受保护数据。")
         if input("完全理解后输入 CONFIRM 开始；其他输入取消：").strip() != "CONFIRM":
@@ -6194,6 +7623,11 @@ def main(argv: list[str] | None = None) -> int:
             merge_file = _active_merge_enhancement()
             if merge_file is not None:
                 clash_files.append(merge_file)
+        other_files = []
+        if do_other_dns:
+            candidate = pathlib.Path(str(other_dns.get("path") or ""))
+            if str(other_dns.get("path") or "") and candidate.is_file():
+                other_files.append(candidate)
         selected = {"browser_locale": do_browser_locale,
                     "dead_permissions": do_dead_permissions,
                     "project_junk": do_project_junk,
@@ -6216,7 +7650,7 @@ def main(argv: list[str] | None = None) -> int:
             manual_boundaries.append("项目级垃圾清理需人工确认，不能保证原样恢复")
         if do_stale_worktrees:
             manual_boundaries.append("Git worktree prune 注册表不能原样自动恢复")
-        backup = create_backup(backup_paths + clash_files, sudo_targets,
+        backup = create_backup(backup_paths + clash_files + other_files, sudo_targets,
                                manual_boundaries=manual_boundaries)
         _refresh_backup_manifest(backup, "backup-created")
         print(f"\n[1/6] 备份完成：{backup}")
@@ -6237,6 +7671,15 @@ def main(argv: list[str] | None = None) -> int:
             _mark_backup_in_progress(backup, "clash-dns")
             print(f"       Clash DNS：{clear_clash_dns_leak(report)}")
             _refresh_backup_manifest(backup, "clash-dns")
+        if do_other_dns:
+            _mark_backup_in_progress(backup, "other-proxy-dns")
+            try:
+                print("       别家代理 DNS：" + clear_other_proxy_dns(
+                    report.get("A28_proxy_backend") or {},
+                    (report.get("A28_proxy_backend") or {}).get("facts") or {}))
+            except Exception as error:
+                print(f"       ⚠ 别家代理 DNS 清理失败（其余步骤继续）：{error}")
+            _refresh_backup_manifest(backup, "other-proxy-dns")
         if do_browser_locale:
             _mark_backup_in_progress(backup, "browser-locale")
             print(f"       浏览器 Intl：{clear_browser_locale(report['A27_browser_locale'])}")

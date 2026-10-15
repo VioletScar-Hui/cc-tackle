@@ -5705,6 +5705,595 @@ class TestFixButtonsFollowRowStatus(unittest.TestCase):
         self.assertIn("系统级可清理量", rs.ui_actions())
 
 
+class TestReportGroupsCoverEveryRow(unittest.TestCase):
+    """HTML 页面按组分通过率，漏掉的行在按项列表里还在、但不进任何一组——
+    看起来就会比实际干净。这条用 build_summary 的实际行名逐个核对。"""
+
+    def test_groups_cover_every_summary_row(self):
+        names = sorted(r[0] for r in g.build_summary({}))
+        grouped = sorted(n for _group, members in rh.GROUPS for n in members)
+        self.assertEqual(names, grouped)
+
+    def test_no_row_is_listed_twice(self):
+        grouped = [n for _group, members in rh.GROUPS for n in members]
+        self.assertEqual(len(grouped), len(set(grouped)))
+
+
+class TestProxyBackendDetection(unittest.TestCase):
+    """代理后端识别：认出是谁、以及脚本对它能做到什么。
+
+    这一层存在的理由：26 项里有 2 项原本直接读 mihomo 的 socket 与 clash-verge.yaml，
+    用别家代理的人只会看到「未测到」，分不清是脚本不认识还是网络真有问题。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="guard-backend-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for name, value in (("HOME", pathlib.Path(self.tmp)),):
+            patcher = mock.patch.object(g, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _patch(self, **kwargs):
+        for name, value in kwargs.items():
+            patcher = mock.patch.object(g, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _write(self, rel, text):
+        path = pathlib.Path(self.tmp) / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_mihomo_from_socket(self):
+        self._write("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/"
+                    "clash-verge.yaml", "mode: rule\ndns:\n  enable: true\n")
+        self._patch(clash_socket=lambda: pathlib.Path("/tmp/verge/verge-mihomo.sock"),
+                    _path_exists=lambda p: True,
+                    _probe_clash_socket=lambda p: True,
+                    _running_process_names=lambda: ["verge-mihomo"])
+        info = g.check_proxy_backend()
+        self.assertEqual(info["backend"], "mihomo")
+        self.assertTrue(info["controller_ok"])
+        self.assertEqual(info["controller"]["kind"], g.CONTROLLER_UNIX)
+        self.assertTrue(info["capabilities"]["verify_after_write"])
+
+    def test_clashx_tcp_controller_is_parsed(self):
+        """ClashX 走 TCP（8080），不是 unix socket —— 只认 socket 的写法会漏掉它。"""
+        self._write(".config/clash/config.yaml",
+                    "external-controller: 127.0.0.1:8080\nsecret: mysecret\n")
+        self._patch(clash_socket=lambda: None,
+                    _running_process_names=lambda: ["clashx"],
+                    controller_reachable=lambda c: False)
+        info = g.check_proxy_backend()
+        self.assertEqual(info["backend"], "mihomo")
+        self.assertEqual(info["controller"]["port"], 8080)
+        self.assertEqual(info["controller"]["secret"], "mysecret")
+        self.assertIn("process", [e["kind"] for e in info["evidence"]])
+
+    def test_port_only_external_controller_gets_loopback_host(self):
+        self._write(".config/mihomo/config.yaml", "external-controller: :9090\n")
+        self._patch(clash_socket=lambda: None, _running_process_names=lambda: ["mihomo"],
+                    controller_reachable=lambda c: False)
+        info = g.check_proxy_backend()
+        self.assertEqual(info["backend"], "mihomo")
+        self.assertEqual(info["controller"]["host"], "127.0.0.1")
+        self.assertEqual(info["controller"]["port"], 9090)
+
+    def test_singbox_without_external_controller_has_no_controller(self):
+        """官方文档：external_controller 为空时 Clash API 是关闭的。
+        这里绝不能默认 9090 —— 那会把「没开」说成「连不上」，两回事。"""
+        path = self._write("Library/Application Support/sing-box/config.json",
+                           json.dumps({"experimental": {"clash_api": {"external_controller": ""}}}))
+        self.assertIsNone(g._singbox_controller(path))
+
+    def test_singbox_controller_reads_address_and_secret(self):
+        path = self._write("Library/Application Support/sing-box/config.json", json.dumps({
+            "experimental": {"clash_api": {"external_controller": "127.0.0.1:19090",
+                                           "secret": "s3cret"}}}))
+        ctrl = g._singbox_controller(path)
+        self.assertEqual((ctrl["host"], ctrl["port"], ctrl["secret"]), ("127.0.0.1", 19090, "s3cret"))
+        self.assertEqual(ctrl["auth"], "bearer")
+
+    def test_surge_http_api_line(self):
+        path = self._write("Library/Application Support/Surge/Profiles/Work.conf",
+                           "[General]\nhttp-api = mykey@127.0.0.1:6171\n")
+        ctrl = g._surge_controller(path)
+        self.assertEqual(ctrl["secret"], "mykey")
+        self.assertEqual(ctrl["port"], 6171)
+        self.assertEqual(ctrl["auth"], "x-key")
+
+    def test_surge_wildcard_host_becomes_loopback(self):
+        path = self._write("Library/Application Support/Surge/Profiles/W.conf",
+                           "http-api = k@0.0.0.0:6171\n")
+        self.assertEqual(g._surge_controller(path)["host"], "127.0.0.1")
+
+    def test_surge_without_http_api_has_no_controller(self):
+        path = self._write("Library/Application Support/Surge/Profiles/W.conf", "[General]\n")
+        self.assertIsNone(g._surge_controller(path))
+
+    def test_unknown_process_lands_in_other(self):
+        self._patch(clash_socket=lambda: None, _running_process_names=lambda: ["shadowsocksx-ng"])
+        info = g.check_proxy_backend()
+        self.assertEqual(info["backend"], "other")
+        self.assertEqual(info["capabilities"]["read_dns"], False)
+
+    def test_flclash_is_recognized_as_mihomo_process(self):
+        """FlClash 内核是 mihomo，但控制接口是它自己的 JSON-RPC，不是 Clash API。
+        认得出进程、但没有控制接口 —— 这正是事实。"""
+        self._patch(clash_socket=lambda: None, _running_process_names=lambda: ["flclash"])
+        info = g.check_proxy_backend()
+        self.assertEqual(info["backend"], "mihomo")
+        self.assertFalse(info["controller_ok"])
+
+    def test_system_proxy_only(self):
+        self._patch(clash_socket=lambda: None, _running_process_names=lambda: [],
+                    system_proxy_enabled=lambda: ["HTTP"])
+        info = g.check_proxy_backend()
+        self.assertEqual(info["backend"], "system")
+        self.assertIn("system-proxy", [e["kind"] for e in info["evidence"]])
+
+    def test_vpn_when_only_a_tunnel(self):
+        self._patch(clash_socket=lambda: None, _running_process_names=lambda: [],
+                    system_proxy_enabled=lambda: [], vpn_tunnels=lambda: ["WireGuard"])
+        self.assertEqual(g.check_proxy_backend()["backend"], "vpn")
+
+    def test_nothing_running(self):
+        self._patch(clash_socket=lambda: None, _running_process_names=lambda: [],
+                    system_proxy_enabled=lambda: [], vpn_tunnels=lambda: [])
+        self.assertEqual(g.check_proxy_backend()["backend"], "none")
+
+
+class TestSingboxFacts(unittest.TestCase):
+    """sing-box 的 DNS 与 route 读成事实。元素形态有三种，都要认。"""
+
+    def test_new_object_and_legacy_string_servers(self):
+        cfg = {"dns": {"servers": ["223.5.5.5", {"type": "udp", "server": "8.8.8.8"}]}}
+        facts = g.read_singbox_facts(cfg)
+        self.assertEqual(facts["dns_servers"], ["223.5.5.5", "8.8.8.8"])
+        self.assertEqual(facts["dns_cn"], ["223.5.5.5"])
+
+    def test_detour_makes_a_cn_resolver_routed(self):
+        cfg = {"dns": {"servers": [{"type": "udp", "server": "223.5.5.5", "detour": "proxy"}]}}
+        facts = g.read_singbox_facts(cfg)
+        self.assertEqual(facts["dns_no_detour"], [])
+        self.assertEqual(facts["dns_cn"], ["223.5.5.5"])
+
+    def test_claude_rule_carries_policy_key(self):
+        cfg = {"route": {"rules": [{"domain_suffix": ["claude.ai"], "outbound": "proxy"}]}}
+        facts = g.read_singbox_facts(cfg)
+        self.assertEqual(facts["claude_rules"][0]["policy"], "proxy")
+
+    def test_urltest_outbound_is_auto_switching(self):
+        cfg = {"outbounds": [{"type": "urltest", "tag": "auto", "outbounds": ["a", "b"]}]}
+        self.assertIn("auto", g.read_singbox_facts(cfg)["auto_switch"])
+
+    def test_tun_inbound_detected(self):
+        cfg = {"inbounds": [{"type": "tun", "tag": "tun-in"}]}
+        self.assertTrue(g.read_singbox_facts(cfg)["tun"])
+
+
+class TestSurgeFacts(unittest.TestCase):
+    def _conf(self):
+        return "\n".join([
+            "[General]",
+            "dns-server = 223.5.5.5, 8.8.8.8",
+            "http-api = k@127.0.0.1:6171",
+            "[Proxy Group]",
+            "Proxy = select, NodeA",
+            "Auto = url-test, NodeA, NodeB",
+            "[Rule]",
+            "DOMAIN-SUFFIX,claude.ai,Proxy",
+            "IP-CIDR,160.79.104.0/21,Proxy,no-resolve",
+            "FINAL,Auto",
+        ])
+
+    def test_dns_and_groups(self):
+        facts = g.read_surge_facts(self._conf())
+        self.assertEqual(facts["dns_servers"], ["223.5.5.5", "8.8.8.8"])
+        self.assertEqual(facts["dns_cn"], ["223.5.5.5"])
+        self.assertEqual(facts["auto_switch"], ["Auto"])
+        self.assertEqual(facts["final"], "Auto")
+
+    def test_no_resolve_modifier_is_not_taken_as_policy(self):
+        """IP-CIDR 那行的策略后面还跟着 no-resolve，直接取最后一个字段会取错。"""
+        rules = g.read_surge_facts(self._conf())["claude_rules"]
+        self.assertTrue(any(r["policy"] == "Proxy" for r in rules))
+
+    def test_comments_are_ignored(self):
+        facts = g.read_surge_facts("# dns-server = 1.2.3.4\n[General]\ndns-server = 8.8.8.8\n")
+        self.assertEqual(facts["dns_servers"], ["8.8.8.8"])
+
+
+class TestV2rayFacts(unittest.TestCase):
+    def test_dns_servers_strings_and_objects(self):
+        cfg = {"dns": {"servers": ["223.5.5.5", {"address": "8.8.8.8", "domains": ["geosite:cn"]}]}}
+        facts = g.read_v2ray_facts(cfg)
+        self.assertEqual(facts["dns_servers"], ["223.5.5.5", "8.8.8.8"])
+        self.assertEqual(facts["dns_cn"], ["223.5.5.5"])
+
+    def test_routing_rule_outbound_and_freedom(self):
+        cfg = {"outbounds": [{"protocol": "freedom", "tag": "direct"},
+                             {"protocol": "vless", "tag": "proxy"}],
+               "routing": {"rules": [{"domain": ["claude.ai"], "outboundTag": "proxy"}]}}
+        facts = g.read_v2ray_facts(cfg)
+        self.assertEqual(facts["claude_rules"][0]["policy"], "proxy")
+        self.assertEqual(facts["direct_tags"], ["direct"])
+        self.assertEqual(facts["final"], "direct")  # 没有规则命中时走第一个出站
+
+    def test_balancer_is_auto_switching(self):
+        cfg = {"routing": {"balancers": [{"tag": "bal"}]}}
+        self.assertEqual(g.read_v2ray_facts(cfg)["auto_switch"], ["bal"])
+
+
+class TestProxyFactsJudgement(unittest.TestCase):
+    def _info(self, backend="singbox", controller_ok=False):
+        return {"backend": backend, "config": {"path": "/x/config"}, "controller_ok": controller_ok,
+                "capabilities": g._capabilities(backend, controller_ok, True)}
+
+    def test_singbox_cn_resolver_without_detour_is_a_reason(self):
+        judged = g.judge_proxy_facts(self._info(), g.read_singbox_facts(
+            {"dns": {"servers": [{"type": "udp", "server": "223.5.5.5"}]}}))
+        self.assertTrue(judged["dns"]["evaluated"])
+        self.assertIn("223.5.5.5", judged["dns"]["unrouted_cn"])
+        self.assertIn("直发", "".join(judged["dns"]["reasons"]))
+
+    def test_surge_does_not_claim_a_leak_it_cannot_see(self):
+        """Surge 的解析请求走哪条线路读不到运行时证据，所以只报事实 + 说清边界。"""
+        judged = g.judge_proxy_facts(self._info("surge"), g.read_surge_facts(
+            "[General]\ndns-server = 223.5.5.5\n"))
+        self.assertIn("223.5.5.5", judged["dns"]["reasons"][0])
+        self.assertTrue(any("browserleaks" in x for x in judged["dns"]["limits"]))
+
+    def test_claude_to_direct_outbound_is_flagged(self):
+        cfg = {"outbounds": [{"type": "direct", "tag": "direct"}],
+               "route": {"rules": [{"domain_suffix": ["claude.ai"], "outbound": "direct"}],
+                         "final": "direct"}}
+        judged = g.judge_proxy_facts(self._info(), g.read_singbox_facts(cfg))
+        self.assertTrue(judged["routing"]["direct"])
+        self.assertTrue(any("直连" in x for x in judged["routing"]["reasons"]))
+
+    def test_claude_to_urltest_is_auto_switching(self):
+        cfg = {"outbounds": [{"type": "urltest", "tag": "auto", "outbounds": ["a"]}],
+               "route": {"rules": [{"domain_suffix": ["anthropic.com"], "outbound": "auto"}]}}
+        judged = g.judge_proxy_facts(self._info(), g.read_singbox_facts(cfg))
+        self.assertTrue(judged["routing"]["auto_for_claude"])
+        self.assertFalse(judged["routing"]["direct"])
+
+    def test_claude_to_single_member_selector_is_pinned(self):
+        cfg = {"outbounds": [{"type": "selector", "tag": "proxy", "outbounds": ["a"]}],
+               "route": {"rules": [{"domain_suffix": ["claude.ai"], "outbound": "proxy"}]}}
+        judged = g.judge_proxy_facts(self._info(), g.read_singbox_facts(cfg))
+        self.assertEqual(judged["routing"]["kind"], "selector")
+        self.assertIn("钉死", "".join(judged["routing"]["reasons"]))
+
+    def test_missing_claude_rules_say_it_follows_the_fallback(self):
+        cfg = {"outbounds": [{"type": "selector", "tag": "proxy", "outbounds": ["a", "b"]}],
+               "route": {"final": "proxy"}}
+        judged = g.judge_proxy_facts(self._info(), g.read_singbox_facts(cfg))
+        self.assertTrue(any("兜底" in x for x in judged["routing"]["limits"]))
+
+    def test_unknown_outbound_name_is_reported_not_guessed(self):
+        cfg = {"outbounds": [{"type": "direct", "tag": "direct"}], "route": {"final": "ghost"}}
+        judged = g.judge_proxy_facts(self._info(), g.read_singbox_facts(cfg))
+        self.assertEqual(judged["routing"]["kind"], "unknown")
+        self.assertTrue(any("找不到" in x for x in judged["routing"]["limits"]))
+
+    def test_unreadable_config_is_not_evaluated(self):
+        judged = g.judge_proxy_facts(self._info(), {"found": False})
+        self.assertFalse(judged["dns"]["evaluated"])
+        self.assertFalse(judged["routing"]["evaluated"])
+
+
+class TestTrafficCapture(unittest.TestCase):
+    """「有没有真的被接管」对任何后端都成立 —— 认不出配置时这是唯一还能说的实话。"""
+
+    def _patch(self, route_iface="utun1024", ifconfig="", netstat="", ports=()):
+        patches = {
+            "_route_interface": lambda ip="1.1.1.1": route_iface,
+            "_utun_ipv4": (lambda: [{"name": "utun1024", "addr": "198.18.0.1"}]
+                           if "utun1024" in ifconfig else []),
+            "_tunnel_routes": lambda: ([{"dest": "1", "iface": "utun1024"}] if netstat else []),
+            "_local_listen_ports": lambda: list(ports),
+        }
+        for name, value in patches.items():
+            patcher = mock.patch.object(g, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_tunnel_capture_needs_ipv4_on_the_utun(self):
+        self._patch(ifconfig="utun1024", netstat="yes")
+        cap = g.check_traffic_capture()
+        self.assertTrue(cap["captured"])
+        self.assertIn("确实进了隧道", "".join(cap["notes"]))
+
+    def test_system_utun_without_ipv4_is_not_counted(self):
+        """系统自带的 utun 只有链路本地 v6，不能当成代理接管。"""
+        self._patch(route_iface="utun0", ifconfig="")
+        cap = g.check_traffic_capture()
+        self.assertFalse(cap["captured"])
+        self.assertIn("系统自带", "".join(cap["notes"]))
+
+    def test_plain_interface_is_not_captured(self):
+        self._patch(route_iface="en0")
+        self.assertFalse(g.check_traffic_capture()["captured"])
+
+    def test_socks_port_detection(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        self.addCleanup(server.close)
+
+        def serve():
+            try:
+                conn, _ = server.accept()
+                conn.recv(3)
+                conn.sendall(b"\x05\x00")
+                conn.close()
+            except OSError:
+                pass
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(g.socks5_alive(port))
+        self.assertFalse(g.socks5_alive(port + 1) if port < 65000 else False)
+
+    def test_http_port_is_not_mistaken_for_socks(self):
+        """本机实测过反例：端口开着，但收到 SOCKS 握手回的是 HTTP 400。"""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        self.addCleanup(server.close)
+
+        def serve():
+            try:
+                conn, _ = server.accept()
+                conn.recv(3)
+                conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                conn.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        self.assertFalse(g.socks5_alive(port))
+
+
+class TestOtherProxyDnsFix(unittest.TestCase):
+    """别家后端的 DNS 修复：只换解析器地址，别的键一个都不许动。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="guard-otherdns-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = mock.patch.object(g, "HOME", pathlib.Path(self.tmp))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _info(self, backend, path):
+        return {"backend": backend, "config": {"path": str(path)},
+                "capabilities": g._capabilities(backend, False, True)}
+
+    def test_singbox_keeps_every_other_key(self):
+        path = pathlib.Path(self.tmp) / "config.json"
+        path.write_text(json.dumps({
+            "log": {"level": "warn"},
+            "dns": {"servers": [{"type": "udp", "tag": "ali", "server": "223.5.5.5"},
+                                {"type": "udp", "tag": "goog", "server": "8.8.8.8", "detour": "proxy"}]},
+            "inbounds": [{"type": "mixed", "tag": "in"}],
+            "experimental": {"clash_api": {"external_controller": "127.0.0.1:19090"}},
+        }, indent=2), encoding="utf-8")
+        info = self._info("singbox", path)
+        facts = g.proxy_facts_for(info)
+        with mock.patch.object(g, "reload_backend", lambda i, p: "（测试里不重载）"):
+            message = g.clear_other_proxy_dns(info, facts)
+        after = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(after["dns"]["servers"][0]["server"], "1.1.1.1")
+        self.assertEqual(after["dns"]["servers"][0]["tag"], "ali")  # tag 不能被改掉
+        self.assertEqual(after["dns"]["servers"][1]["server"], "8.8.8.8")
+        self.assertEqual(after["log"], {"level": "warn"})
+        self.assertEqual(after["experimental"]["clash_api"]["external_controller"], "127.0.0.1:19090")
+        self.assertIn("已把 1 个国内解析器", message)
+
+    def test_v2ray_split_dns_entry_is_left_alone(self):
+        """带 domains 的解析器是分流用的，语义特殊，不碰。"""
+        path = pathlib.Path(self.tmp) / "config.json"
+        path.write_text(json.dumps({
+            "dns": {"servers": [{"address": "223.5.5.5", "domains": ["geosite:cn"]},
+                                "119.29.29.29"]},
+            "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+        }, indent=2), encoding="utf-8")
+        info = self._info("v2ray", path)
+        with mock.patch.object(g, "reload_backend", lambda i, p: "（测试里不重载）"):
+            g.clear_other_proxy_dns(info, g.proxy_facts_for(info))
+        after = json.loads(path.read_text(encoding="utf-8"))["dns"]["servers"]
+        self.assertEqual(after[0]["address"], "223.5.5.5")   # 带 domains，没动
+        self.assertEqual(after[1], "1.1.1.1")                # 没带 domains，换了
+
+    def test_surge_line_edit_keeps_other_lines(self):
+        path = pathlib.Path(self.tmp) / "Work.conf"
+        path.write_text("# 我的配置\n[General]\ndns-server = 223.5.5.5, 8.8.8.8\n"
+                        "encrypted-dns-server = https://1.1.1.1/dns-query\n"
+                        "[Rule]\nDOMAIN-SUFFIX,claude.ai,Proxy\n", encoding="utf-8")
+        info = self._info("surge", path)
+        with mock.patch.object(g, "reload_backend", lambda i, p: "（测试里不重载）"):
+            g.clear_other_proxy_dns(info, g.proxy_facts_for(info))
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("dns-server = 1.1.1.1, 8.8.8.8", text)
+        self.assertIn("# 我的配置", text)
+        self.assertIn("DOMAIN-SUFFIX,claude.ai,Proxy", text)
+
+    def test_refuses_when_there_is_no_dns_block(self):
+        path = pathlib.Path(self.tmp) / "config.json"
+        path.write_text(json.dumps({"log": {"level": "warn"}}), encoding="utf-8")
+        info = self._info("singbox", path)
+        with self.assertRaises(RuntimeError):
+            g.clear_other_proxy_dns(info, {"config": str(path)})
+
+    def test_refuses_unknown_backend(self):
+        path = pathlib.Path(self.tmp) / "x.conf"
+        path.write_text("whatever", encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            g.clear_other_proxy_dns({"backend": "other", "config": {"path": str(path)}},
+                                    {"config": str(path)})
+
+    def test_clean_config_is_a_noop(self):
+        path = pathlib.Path(self.tmp) / "config.json"
+        path.write_text(json.dumps({"dns": {"servers": [{"type": "udp", "server": "1.1.1.1"}]}}),
+                        encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+        info = self._info("singbox", path)
+        facts = g.proxy_facts_for(info)
+        with mock.patch.object(g, "run", side_effect=AssertionError("不该调用 run")) as fake:
+            message = g.clear_other_proxy_dns(info, facts)
+        self.assertIn("无需改动", message)
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertFalse(fake.called)
+
+
+class TestReloadBackend(unittest.TestCase):
+    """重载是这里最危险的一步：xray/v2ray 收到 SIGHUP 会被直接杀掉。"""
+
+    def test_singbox_gets_sighup_when_it_runs_that_config(self):
+        calls = []
+
+        def fake_run(cmd, timeout=20, env=None):
+            calls.append(cmd)
+            if cmd[:2] == ["pgrep", "-f"]:
+                return 0, "4242\n"
+            return 0, ""
+
+        with mock.patch.object(g, "run", fake_run), \
+             mock.patch.object(g, "running_config_for", lambda b: "/tmp/c/config.json"):
+            note = g.reload_backend({"backend": "singbox"}, "/tmp/c/config.json")
+        self.assertIn("SIGHUP", note)
+        self.assertIn(["kill", "-HUP", "4242"], calls)
+
+    def test_singbox_is_not_touched_when_it_runs_another_config(self):
+        calls = []
+        with mock.patch.object(g, "run", lambda cmd, timeout=20, env=None: (calls.append(cmd), (0, ""))[1]), \
+             mock.patch.object(g, "running_config_for", lambda b: "/somewhere/else/config.json"):
+            note = g.reload_backend({"backend": "singbox"}, "/tmp/c/config.json")
+        self.assertIn("不是刚改的这份", note)
+        self.assertEqual([c for c in calls if c[:1] == ["kill"]], [])
+
+    def test_v2ray_never_gets_sighup(self):
+        calls = []
+        with mock.patch.object(g, "run", lambda cmd, timeout=20, env=None: (calls.append(cmd), (0, ""))[1]), \
+             mock.patch.object(g, "running_config_for", lambda b: ""):
+            note = g.reload_backend({"backend": "v2ray"}, "/tmp/x/config.json")
+        self.assertIn("杀掉进程", note)
+        self.assertEqual(calls, [])
+
+    def test_surge_uses_the_reload_endpoint(self):
+        calls = []
+
+        def fake_api(controller, method, path, body=None, timeout=8.0):
+            calls.append((method, path))
+            return 200, "{}"
+
+        with mock.patch.object(g, "api_call", fake_api), \
+             mock.patch.object(g, "running_config_for", lambda b: ""):
+            note = g.reload_backend(
+                {"backend": "surge", "controller": {"kind": "http", "host": "127.0.0.1",
+                                                    "port": 6171, "secret": "k", "auth": "x-key"}},
+                "/tmp/surge/Work.conf")
+        self.assertEqual(calls, [("POST", "/v1/profiles/reload")])
+        self.assertIn("重新载入", note)
+
+
+class TestProxyBackendRows(unittest.TestCase):
+    """三行文案：代理后端 / 绝不直连 / DNS 泄漏，在别家后端下各自该说什么。"""
+
+    def _singbox_report(self, **over):
+        facts = {"dns": {"evaluated": True, "servers": ["223.5.5.5"], "cn": ["223.5.5.5"],
+                         "unrouted_cn": ["223.5.5.5"], "reasons": ["国内解析器没有配 detour"],
+                         "limits": [], "fixable": True},
+                 "routing": {"evaluated": True, "claude_outbound": "proxy", "kind": "selector",
+                             "auto_switch": [], "direct": False, "auto_for_claude": False,
+                             "matched": "claude.ai",
+                             "reasons": ["Claude 走 proxy，只有 1 个成员，钉死在一个节点上"],
+                             "limits": []},
+                 "config": "/x/config.json", "runtime_verified": False,
+                 "verify_hint": "正在跑的进程命令行里没写配置文件路径"}
+        facts.update(over)
+        return {"backend": "singbox", "label": "sing-box", "evidence": [{"kind": "process", "value": "sing-box"}],
+                "controller_ok": False, "controller": None, "config": {"path": "/x/config.json"},
+                "capabilities": g._capabilities("singbox", False, True), "facts": facts,
+                "capture": {"captured": True, "notes": ["去 1.1.1.1 走 utun1024（198.18.0.1），流量确实进了隧道"]},
+                "notes": ["没有开 clash_api —— 分流与 DNS 只能静态读配置文件"]}
+
+    def test_backend_row_names_the_backend(self):
+        status, detail = g.backend_row(self._singbox_report())
+        self.assertIn("sing-box", detail)
+        self.assertIn("进了隧道", detail)
+
+    def test_backend_row_says_when_it_cannot_tell(self):
+        status, detail = g.backend_row({"backend": "none", "label": "没有发现代理",
+                                        "capture": {"captured": True,
+                                                    "notes": ["去 1.1.1.1 走 utun1024（198.18.0.1），流量确实进了隧道"]}})
+        self.assertEqual(status, g.S_NA)
+        self.assertIn("没认出", detail)
+
+    def test_backend_row_for_unknown_process(self):
+        status, detail = g.backend_row({"backend": "other", "label": "认得出在跑",
+                                        "evidence": [{"kind": "process", "value": "shadowsocksx-ng"}]})
+        self.assertIn("shadowsocksx-ng", detail)
+        self.assertIn("不认识", detail)
+
+    def test_routing_row_flags_a_direct_fallback(self):
+        pb = self._singbox_report()
+        pb["facts"]["routing"].update(direct=True, reasons=["Claude 流量最后落到直连出口（direct）"])
+        status, detail = g.backend_routing_row(pb)
+        self.assertEqual(status, g.S_BAD)
+        self.assertIn("直连", detail)
+
+    def test_routing_row_is_grey_without_runtime_evidence(self):
+        status, detail = g.backend_routing_row(self._singbox_report())
+        self.assertEqual(status, g.S_NA)
+        self.assertIn("配置层面", detail)
+
+    def test_routing_row_green_when_runtime_is_verified(self):
+        pb = self._singbox_report(runtime_verified=True)
+        status, detail = g.backend_routing_row(pb)
+        self.assertEqual(status, g.S_OK)
+        self.assertIn("钉死", detail)
+
+    def test_routing_row_returns_none_for_mihomo(self):
+        self.assertIsNone(g.backend_routing_row({"backend": "mihomo"}))
+        self.assertIsNone(g.backend_dns_row({"backend": "mihomo"}))
+
+    def test_dns_row_offers_the_fix_for_other_backends(self):
+        status, detail = g.backend_dns_row(self._singbox_report())
+        self.assertEqual(status, g.S_FIX)
+        self.assertIn("--fix-unverified", detail)
+
+    def test_dns_row_for_surge_points_at_the_ui(self):
+        pb = self._singbox_report()
+        pb["backend"] = "surge"
+        pb["label"] = "Surge"
+        pb["facts"]["dns"]["fixable"] = False
+        status, detail = g.backend_dns_row(pb)
+        self.assertEqual(status, g.S_FIX)
+        self.assertIn("界面", detail)
+
+    def test_summary_gains_the_backend_row(self):
+        report = {"A28_proxy_backend": self._singbox_report()}
+        rows = dict((name, (status, detail)) for name, status, detail in g.build_summary(report))
+        self.assertIn("代理后端", rows)
+        status, detail = rows["绝不直连"]
+        self.assertIn("配置层面", detail)
+
+    def test_missing_backend_report_keeps_the_old_rows(self):
+        """旧报告里没有 A28 时，两行必须回落到原来的 Clash 判据，不能被新代码带偏。"""
+        rows = g.build_summary({"A12_clash_groups": {"reachable": False, "sock_tried": ["/tmp/x.sock"]}})
+        detail = dict((n, d) for n, _s, d in rows)
+        self.assertIn("未检测", detail["代理后端"])
+        self.assertIn("Clash 控制接口不可达", detail["绝不直连"])
+        self.assertIn("未检测", detail["DNS 泄漏"])
+
+
 if __name__ == "__main__":
     # 这个块必须待在文件最末尾。2026-10-10 发现它一度停在中间（第 2403 行），
     # 于是它后面定义的 6 个类、40 个用例从来没被执行过——`unittest.main()` 在第 2403
