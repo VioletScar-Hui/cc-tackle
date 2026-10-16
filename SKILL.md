@@ -62,7 +62,7 @@ python3 scripts/account_guard.py
 
 ## 运行顺序
 
-想先看全貌（只读，约 1.5 分钟），在本 skill 目录下跑 `python3 scripts/selfcheck.py`。它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表，并把体检那 28 项逐条展开；脚本按自己的位置定位，从任何工作目录调用都行，项目根没在 `CLAUDE_GUARD_PROJECT_ROOTS` 里指定时会自动用本 skill 所在的 git 仓并在末尾打出选中的是哪个。它跑体检时会带上 `--verify-browser`，也就是把浏览器 Intl 与 WebRTC 两个复核页一起弹出来并等回传，所以一次就能把这 27 项全部测到、不留「未测到」。`--fast` 跳过单元测试，`--no-audit` 跳过体检，`--no-browser` 不弹复核页（那两项会退回「未测到」）。它**不生成 HTML 报告**：报告是加固收尾那一份带前后对照的（想要只读快照用 `account_guard.py --audit --report`）。在 Claude Code 里跑 selfcheck 时脚本会自动降级成纯只读审计并在末尾说明。
+想先看全貌（只读，约 1.5 分钟），在本 skill 目录下跑 `python3 scripts/selfcheck.py`。它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表，并把体检那 28 项逐条展开；脚本按自己的位置定位，从任何工作目录调用都行，项目根没在 `CLAUDE_GUARD_PROJECT_ROOTS` 里指定时会自动用本 skill 所在的 git 仓并在末尾打出选中的是哪个。它跑体检时会带上 `--verify-browser`，也就是把浏览器 Intl 与 WebRTC 两个复核页一起弹出来并等回传，所以一次就能把这 28 项全部测到、不留「未测到」。`--fast` 跳过单元测试，`--no-audit` 跳过体检，`--no-browser` 不弹复核页（那两项会退回「未测到」）。它**不生成 HTML 报告**：报告是加固收尾那一份带前后对照的（想要只读快照用 `account_guard.py --audit --report`）。在 Claude Code 里跑 selfcheck 时脚本会自动降级成纯只读审计并在末尾说明。
 
 1. 如果当前执行者就是 Claude Code，只跑只读审计，并提醒用户换普通终端再执行加固（加固会改本机状态，不适合由正在使用它的进程发起）。
 
