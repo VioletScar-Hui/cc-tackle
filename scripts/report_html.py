@@ -334,33 +334,55 @@ def _kind(status: str) -> str:
     return {"✓": "ok", "!": "warn", "✗": "bad"}.get((status or "").strip(), "na")
 
 
-def _score(rows) -> dict:
-    """分数 = 通过 1 分、待处理 0.5 分、未通过 0 分；「这次没测到」不计入分母。
+# 计分口径：27 个基础项合计 100 分，每个 100/27 分；加分项通过再往上加。
+BASE_ITEMS = 27
+BASE_MAX = 100
+BONUS_ROW = "登录方式"
+BONUS_POINTS = 5
+MAX_SCORE = BASE_MAX + BONUS_POINTS
 
-    和 cleanip 那种「未测项不计入」是一个意思：测不到就说测不到，不拉低分数，
-    也不假装通过——它在页面上单独列一行。
+
+def _score(rows) -> dict:
+    """加分制：27 个基础项合计 100 分，加分项（登录方式）另外加。
+
+    基础分：每项满分 100/27，通过拿满、待处理拿一半、未通过 0 分。「这次没测到」
+    分子分母都不进——测不到就说测不到，不拉低分数，也不假装通过（它在页面上单独
+    列一行）；只剩已测到的项时按 100 分制折算，所以全通过就是 100 分。
+
+    加分项：登录方式通过时额外加 BONUS_POINTS 分，不计入那 27 项，总分最高 105。
     """
     w = {"ok": 1.0, "warn": 0.5, "bad": 0.0}
-    counted = [r for r in rows if _kind(r[1]) in w]
     counts = {"ok": 0, "warn": 0, "bad": 0, "na": 0}
     for r in rows:
         counts[_kind(r[1])] += 1
+    bonus = 0
+    base = []
+    for r in rows:
+        if r[0] == BONUS_ROW:
+            if _kind(r[1]) == "ok":
+                bonus = BONUS_POINTS
+            continue
+        base.append(r)
+    counted = [r for r in base if _kind(r[1]) in w]
     if not counted:
-        return {"score": None, "grade": "—", "counts": counts, "ring": "#94a3b8"}
-    score = round(100 * sum(w[_kind(r[1])] for r in counted) / len(counted))
-    if score >= 100:
+        return {"score": None, "total": None, "bonus": bonus, "per_item": BASE_MAX / BASE_ITEMS,
+                "grade": "—", "counts": counts, "ring": "#94a3b8"}
+    score = round(BASE_MAX * sum(w[_kind(r[1])] for r in counted) / len(counted))
+    total = score + bonus
+    if total >= 100:
         grade, ring = "A+", "#35a952"
-    elif score >= 90:
+    elif total >= 90:
         grade, ring = "A", "#35a952"
-    elif score >= 80:
+    elif total >= 80:
         grade, ring = "B", "#7bc043"
-    elif score >= 70:
+    elif total >= 70:
         grade, ring = "C", "#f59e0b"
-    elif score >= 50:
+    elif total >= 50:
         grade, ring = "D", "#f97316"
     else:
         grade, ring = "F", "#ef4444"
-    return {"score": score, "grade": grade, "counts": counts, "ring": ring}
+    return {"score": score, "total": total, "bonus": bonus, "per_item": BASE_MAX / BASE_ITEMS,
+            "grade": grade, "counts": counts, "ring": ring}
 
 
 def _facts(rep: dict) -> list:
@@ -540,12 +562,15 @@ def render(report: dict, before: dict = None, report_path=None,
         if counts[k] or k != "na"
     )
     delta = ""
-    if before_sc and before_sc["score"] is not None and sc["score"] is not None:
-        d = sc["score"] - before_sc["score"]
+    if before_sc and before_sc["total"] is not None and sc["total"] is not None:
+        d = sc["total"] - before_sc["total"]
         arrow = "↑" if d > 0 else ("↓" if d < 0 else "＝")
         cls = "up" if d > 0 else ("down" if d < 0 else "")
-        delta = (f"<div class='delta'>修复前 <b>{before_sc['score']}</b> → 修复后 "
-                 f"<b>{sc['score']}</b> <span class='{cls}'>{arrow} {abs(d)}</span></div>")
+        delta = (f"<div class='delta'>修复前 <b>{before_sc['total']}</b> → 修复后 "
+                 f"<b>{sc['total']}</b> <span class='{cls}'>{arrow} {abs(d)}</span></div>")
+    if sc["bonus"]:
+        delta += (f"<div class='delta'><span class='up'>加分项「{_esc(BONUS_ROW)}」已通过"
+                  f" +{sc['bonus']}</span></div>")
     facts = "".join(f"<div class='fact'><div class='k'>{_esc(k)}</div>"
                     f"<div class='v'>{_esc(v)}</div></div>" for k, v in _facts(report))
 
@@ -631,7 +656,8 @@ def render(report: dict, before: dict = None, report_path=None,
     meta = [f"<span class='pill'>报告 JSON：{_esc(report_path or '（未保存）')}</span>",
             f"<span class='pill'>生成于 {_esc(stamp)}</span>",
             "<span class='pill'>本页不加载任何外部资源</span>"]
-    score_txt = "—" if sc["score"] is None else sc["score"]
+    score_txt = "—" if sc["total"] is None else sc["total"]
+    ring_pct = 0 if sc["total"] is None else min(100, sc["total"])
 
     # 修复按钮只在本地服务模式下出现（静态文件执行不了命令，出了按钮只会骗人）。
     if live:
@@ -655,14 +681,14 @@ def render(report: dict, before: dict = None, report_path=None,
 
 <div class="hero">
   <h1>Claude 环境体检报告</h1>
-  <div class="sub">CC tackle · {len(rows)} 项检查 · 未测到的项不计入分数</div>
+  <div class="sub">CC tackle · {len(rows)} 项检查（{BASE_ITEMS} 项计分，{_esc(BONUS_ROW)}为加分项）· 未测到的项不计入分数</div>
   <div class="hero-grid">
-    <div class="ring" style="--p:{score_txt if sc['score'] is not None else 0};--ring:{sc['ring']}">
-      <div class="ring-in"><div style="text-align:center"><b>{score_txt}</b><br><small>/ 100</small></div></div>
+    <div class="ring" style="--p:{ring_pct};--ring:{sc['ring']}">
+      <div class="ring-in"><div style="text-align:center"><b>{score_txt}</b><br><small>/ {MAX_SCORE}</small></div></div>
     </div>
     <div class="grade">{sc['grade']}<small>综合评分</small></div>
     <div>
-      <div class="hero-note">通过 1 分、待处理 0.5 分、未通过 0 分；「没测到」不进分母。</div>
+      <div class="hero-note">{BASE_ITEMS} 项基础分合计 {BASE_MAX} 分：通过拿满、待处理拿一半、未通过 0 分；「没测到」不进分母。{_esc(BONUS_ROW)}是加分项，通过再加 {BONUS_POINTS} 分，满分 {MAX_SCORE}。</div>
       {delta}
     </div>
   </div>

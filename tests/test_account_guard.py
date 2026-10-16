@@ -5616,6 +5616,58 @@ class TestHtmlReport(unittest.TestCase):
         sc = rh._score([("a", g.S_NA, "")])
         self.assertIsNone(sc["score"])
 
+    def test_base_is_27_items_worth_100(self):
+        """加分制：27 个基础项合计 100 分，登录方式不算在里面。"""
+        self.assertEqual(rh.BASE_ITEMS, 27)
+        self.assertEqual(rh.BASE_MAX, 100)
+        self.assertAlmostEqual(rh._score([])["per_item"] * rh.BASE_ITEMS, 100)
+
+    def test_every_summary_row_is_either_base_or_bonus(self):
+        """表里每一行都要有归属：要么进 27 项计分，要么是那个加分项。
+
+        以后再加检查项，这条会先红——逼着做的人明确新项算基础分还是加分。
+        """
+        names = [r[0] for r in g.build_summary({})]
+        self.assertEqual(len(names), rh.BASE_ITEMS + 1)
+        self.assertEqual(names.count(rh.BONUS_ROW), 1)
+
+    def test_bonus_row_is_scored_on_top_of_the_base(self):
+        rows = [("a", g.S_OK, ""), ("b", g.S_OK, ""), (rh.BONUS_ROW, g.S_OK, "")]
+        sc = rh._score(rows)
+        self.assertEqual(sc["score"], 100)                 # 基础项全过
+        self.assertEqual(sc["bonus"], rh.BONUS_POINTS)
+        self.assertEqual(sc["total"], 100 + rh.BONUS_POINTS)
+        self.assertEqual(sc["grade"], "A+")
+
+    def test_bonus_row_stays_out_of_the_base_denominator(self):
+        # 登录方式若被算进基础分母，这一组会得 50 而不是 100
+        self.assertEqual(rh._score([("a", g.S_OK, ""), (rh.BONUS_ROW, g.S_OK, "")])["score"], 100)
+
+    def test_bonus_row_earns_nothing_unless_it_passes(self):
+        for status in (g.S_FIX, g.S_BAD, g.S_NA):
+            sc = rh._score([("a", g.S_OK, ""), (rh.BONUS_ROW, status, "")])
+            self.assertEqual(sc["bonus"], 0, status)
+            self.assertEqual(sc["total"], 100, status)
+
+    def test_base_and_bonus_add_up_to_the_total(self):
+        sc = rh._score([("a", g.S_OK, ""), ("b", g.S_FIX, ""), (rh.BONUS_ROW, g.S_OK, "")])
+        self.assertEqual(sc["score"], 75)
+        self.assertEqual(sc["bonus"], rh.BONUS_POINTS)
+        self.assertEqual(sc["total"], 75 + rh.BONUS_POINTS)
+
+    def test_page_shows_the_bonus_note_and_the_new_max(self):
+        rows = [("出口 IP 与归属", g.S_OK, ""), (rh.BONUS_ROW, g.S_OK, "")]
+        with mock.patch.object(g, "build_summary", return_value=rows):
+            h = rh.render({"timestamp": "2026-01-01 00:00:00"})
+        self.assertIn(f"/ {rh.MAX_SCORE}", h)
+        self.assertIn("加分项", h)
+        self.assertIn(f"+{rh.BONUS_POINTS}", h)
+
+    def test_without_the_bonus_row_the_page_never_claims_extra_points(self):
+        with mock.patch.object(g, "build_summary", return_value=[("a", g.S_OK, "")]):
+            h = rh.render({"timestamp": "2026-01-01 00:00:00"})
+        self.assertNotIn("已通过 +", h)
+
     def test_before_after_shows_delta_and_the_whole_comparison(self):
         before = [("绝不直连", g.S_BAD, "不成立"), ("出口 IP 与归属", g.S_OK, "好")]
         after = [("绝不直连", g.S_OK, "成立"), ("出口 IP 与归属", g.S_OK, "好")]
