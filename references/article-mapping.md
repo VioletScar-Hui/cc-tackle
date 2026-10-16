@@ -41,6 +41,7 @@ https://x.com/AYi_AInotes/status/2106639522586829094
 | A25 | 系统级占用里能清的部分（旧版本 + 可再生缓存） | 2.6、§5 | `check_claude_storage` |
 | A26 | 项目级 settings 里的失效权限与危险授权 | §5 | `check_claude_settings` |
 | A27 | 浏览器 Intl 区域设置 | 不在文章里，来自 ippure.com/claude.html 的检测项（权重 10） | `check_browser_locale` / `clear_browser_locale` / `is_cn_locale` |
+| A29 | CLI 用的是哪种凭据：长期 token / 网页授权登录 / 没登录 | 用户口径 2026-10-15（不在文章里） | `check_cli_login` / `long_lived_token_sources` |
 
 出口固定性（2026-10-10 补）。文章 §2.5① 的原话是「国家固定，城市别每次变」，§9 清单第 2 条是「出口国家、城市和上次一致」——这两句都只能靠**和上一次比**才看得出来，而脚本原来每次只报「现在是谁」，等于把文章排在最前面的那条信号漏掉了。补法是每次体检把出口记进 `~/.local/state/claude-guard/export-ip.json`，下次读出来比：
 
@@ -151,7 +152,7 @@ A3（遥测开关写入）已在上面列出，它同时属于这一类：会连
 
 | 编号 | 子目标 | 文章出处 | 脚本里的位置 |
 | :--- | :--- | :--- | :--- |
-| E1 | 钥匙串 `Claude Code-credentials` | 2.6 | `check_keychain`（svce 与 acct 分开报） |
+| E1 | 钥匙串条目（桌面版 `Claude Safe Storage`；CLI 凭据另看 A29） | 2.6 | `check_keychain`（svce 与 acct 分开报） |
 | E2 | 应用支持目录历史会话 | 2.6 |
 | E3 | 备份 `~/.claude` | 2.6 |
 | E4 | `~/.claude` 可再生部分清理 | 2.6 |
@@ -181,7 +182,7 @@ A3（遥测开关写入）已在上面列出，它同时属于这一类：会连
 
 ## 人工行动清单（`--manual`）
 
-文章里有二十三项本机没有接口、脚本替不了，只能人去做。它们不进自动流程，但也不该在交付里消失，所以集中成 `MANUAL_ACTIONS`，用 `python3 scripts/account_guard.py --manual` 打印。分六组：
+文章里有二十三项本机没有接口、脚本替不了，只能人去做（第八组是按用户口径补的，不在文章里），合计二十四项。它们不进自动流程，但也不该在交付里消失，所以集中成 `MANUAL_ACTIONS`，用 `python3 scripts/account_guard.py --manual` 打印。分八组：
 
 | 组 | 内容 | 为什么脚本做不了 |
 | :--- | :--- | :--- |
@@ -192,6 +193,7 @@ A3（遥测开关写入）已在上面列出，它同时属于这一类：会连
 | 五、使用行为 | 别把地理位置写进提示、别像脚本、只用官方客户端 | 前两条看的是你写进 prompt 的内容；第三条 A10 能查本机，人工清单负责讲清为什么 |
 | 六、被封之后 | 先分辨是限额还是封号、申诉只写事实、退款与取消续费、别在同一台没清理过的电脑上秒开新号 | 都发生在网页端和账号侧 |
 | 七、出口这个节点本身 | 买完节点自己验类型与独享、自建 VPS 避开国内大厂海外区 | 纯净度和共享人数只有检测站能给，ASN 类型脚本能报、这两项报不了 |
+| 八、登录方式 | 不要在 Claude Code 里做网页授权登录，改用 `claude setup-token` 拿长期凭据 | 认证动作本身只能人做；脚本能事后告诉你现在用的是哪种凭据（A29） |
 
 每项都带 `〔文章 §X〕` 出处、可照做的点击路径，以及一句「为什么」，验收标准是每一步都能直接照着走，不出现「适当配置一下」这类空话。
 
@@ -256,7 +258,7 @@ A3（遥测开关写入）已在上面列出，它同时属于这一类：会连
 
 ## 代理后端分派（2026-10-15 补）
 
-26 项里真正依赖代理软件的只有 A6（DNS 泄漏）与 A12（绝不直连）；其余各项与代理软件无关。
+28 项里真正依赖代理软件的只有 A6（DNS 泄漏）与 A12（绝不直连）；其余各项与代理软件无关。
 新增 `A28_proxy_backend`（表格里那一行「代理后端」）做识别与能力分层：
 
 | 函数 | 干什么 |
@@ -270,3 +272,19 @@ A3（遥测开关写入）已在上面列出，它同时属于这一类：会连
 | `clear_other_proxy_dns()` + `reload_backend()` | 别家的 DNS 修复（要 `--fix-unverified`）与按官方方式重载 |
 
 细节与真机验证范围见 `references/proxy-backends.md`。
+
+## 登录方式（2026-10-15 补）
+
+用户口径：**不要在 Claude Code 里做网页授权登录**——认证那一刻的出口和这条登录事件绑在一起，而网页登录还会随掉线、丢包反复要求重登，每重登一次就是一条新的登录记录。稳的做法是只认证一次。
+
+新增 `A29_cli_login`（表格里那一行「登录方式」）：
+
+| 函数 | 干什么 |
+| --- | --- |
+| `check_cli_login()` | 跑 `claude auth status`（带 `DISABLE_AUTOUPDATER=1`）并解析 JSON，判出四态 |
+| `long_lived_token_sources()` | 找 `CLAUDE_CODE_OAUTH_TOKEN` 写在哪儿：环境变量 / `settings.json` 的 `env` / `.zshrc` 等；**只记位置不读值** |
+| `build_summary` 的「登录方式」行 | token → 绿；网页登录或未登录 → 待处理（都指向 `claude setup-token`）；读不出来 → 没测到 |
+
+四态判据：`tokenSources` 非空即算长期 token（此时不看 `auth status`）；否则 `loggedIn=true` 报交互式登录、`loggedIn=false` 报未登录、JSON 解析失败报未测到。token 本体不进报告、不进终端输出，有用例钉着。
+
+实测（2026-10-15 本机）：`claude auth status` 报 `{"loggedIn": false, "authMethod": "none", "apiProvider": "firstParty"}`，退出码 1；钥匙串里只有桌面版那条 `Claude Safe Storage`（`Claude Code-credentials` 在 2.1.296 的二进制里搜不到、本机也没有该条目），所以这一项**不靠钥匙串推断**，直接问 CLI。

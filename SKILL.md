@@ -3,8 +3,8 @@ name: cc-tackle
 metadata:
   version: "1.0.4"
 description: >-
-  检测并按用户选择修复 Claude Code 的本机环境——出口 IP 与 ASN 归属、用户指定的预期国家/IP、系统代理与 shell/npm/git 残留、Clash 的 DNS 解析器与 WebRTC 泄漏、IPv6、时区分层与两道闸、`settings.json` 里的中转端点、钥匙串条目、第三方客户端痕迹、CLI 完整性与多账号痕迹。默认审计只读且不落盘；加固先展示完整计划，确认后备份优先、失败即停、每项写入后复验；恢复必须使用显式备份目录并逐项验证。
-  Use when 用户说「Claude 环境自检 / 保号体检 / 登录 Claude 前先检查环境 / 系统代理残留又出现了 / DNS 泄漏 / WebRTC 泄漏 / 出口 IP 是机房还是住宅 / 时区对不对 / settings.json 有没有中转残留 / 换订阅后 Claude 线路还通不通」，或换环境、换代理订阅、被封后重开之前要做环境排查时。
+  检测并按用户选择修复 Claude Code 的本机环境——出口 IP 与 ASN 归属、用户指定的预期国家/IP、系统代理与 shell/npm/git 残留、Clash 的 DNS 解析器与 WebRTC 泄漏、IPv6、时区分层与两道闸、`settings.json` 里的中转端点、钥匙串条目、第三方客户端痕迹、CLI 完整性、多账号痕迹与 CLI 登录凭据（长期 token 还是网页授权登录）。默认审计只读且不落盘；加固先展示完整计划，确认后备份优先、失败即停、每项写入后复验；恢复必须使用显式备份目录并逐项验证。
+  Use when 用户说「Claude 环境自检 / 保号体检 / 登录 Claude 前先检查环境 / 系统代理残留又出现了 / DNS 泄漏 / WebRTC 泄漏 / 出口 IP 是机房还是住宅 / 时区对不对 / settings.json 有没有中转残留 / 换订阅后 Claude 线路还通不通 / 换机器后 Claude Code 又要求重新登录」，或换环境、换代理订阅、被封后重开之前要做环境排查时。
   不用于：账号申诉、付款退款与 claude.ai 网页端设置（人工流程，本 skill 不涉及）；业务仓代码修复；本机网络链路或内核故障排查。
 ---
 
@@ -62,7 +62,7 @@ python3 scripts/account_guard.py
 
 ## 运行顺序
 
-想先看全貌（只读，约 1.5 分钟），在本 skill 目录下跑 `python3 scripts/selfcheck.py`。它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表，并把体检那 27 项逐条展开；脚本按自己的位置定位，从任何工作目录调用都行，项目根没在 `CLAUDE_GUARD_PROJECT_ROOTS` 里指定时会自动用本 skill 所在的 git 仓并在末尾打出选中的是哪个。它跑体检时会带上 `--verify-browser`，也就是把浏览器 Intl 与 WebRTC 两个复核页一起弹出来并等回传，所以一次就能把这 27 项全部测到、不留「未测到」。`--fast` 跳过单元测试，`--no-audit` 跳过体检，`--no-browser` 不弹复核页（那两项会退回「未测到」）。它**不生成 HTML 报告**：报告是加固收尾那一份带前后对照的（想要只读快照用 `account_guard.py --audit --report`）。在 Claude Code 里跑 selfcheck 时脚本会自动降级成纯只读审计并在末尾说明。
+想先看全貌（只读，约 1.5 分钟），在本 skill 目录下跑 `python3 scripts/selfcheck.py`。它把「技能文件齐全（含 SKILL.md 的 `name` 与目录名是否逐字符相等）→ 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四开关 → 完整体检」串成七项，跑完出两张表，并把体检那 28 项逐条展开；脚本按自己的位置定位，从任何工作目录调用都行，项目根没在 `CLAUDE_GUARD_PROJECT_ROOTS` 里指定时会自动用本 skill 所在的 git 仓并在末尾打出选中的是哪个。它跑体检时会带上 `--verify-browser`，也就是把浏览器 Intl 与 WebRTC 两个复核页一起弹出来并等回传，所以一次就能把这 27 项全部测到、不留「未测到」。`--fast` 跳过单元测试，`--no-audit` 跳过体检，`--no-browser` 不弹复核页（那两项会退回「未测到」）。它**不生成 HTML 报告**：报告是加固收尾那一份带前后对照的（想要只读快照用 `account_guard.py --audit --report`）。在 Claude Code 里跑 selfcheck 时脚本会自动降级成纯只读审计并在末尾说明。
 
 1. 如果当前执行者就是 Claude Code，只跑只读审计，并提醒用户换普通终端再执行加固（加固会改本机状态，不适合由正在使用它的进程发起）。
 
@@ -189,7 +189,7 @@ CLAUDE_GUARD_PROJECT_ROOTS="$HOME/code" python3 scripts/account_guard.py --audit
 
 **四、「设定时区」不是官方支持的改动路径。** 脚本会先读出 `/var/db/locationd/clients.plist` 里的候选条目，逐个尝试后**重新读取整份 plist** 复验 `Authorized` 是否真的翻成 False，验不到就判定未生效并让用户走 UI。不会做「写不进去却报成功」这种事。
 
-**五、查钥匙串要看清 `svce` 与 `acct`，它们不是一回事。** `svce="Claude Safe Storage"` / `acct="Claude Key"` 是 Claude **Desktop** 的加密存储；Claude **Code CLI** 的登录凭据是 `svce="Claude Code-credentials"`。早期把两者混为一谈，看到 Safe Storage 就以为 CLI 有凭据，结论是错的。另外 `security dump-keychain` 会把每个条目列两遍（一遍十六进制属性号、一遍具名属性），只认 `"svce"` 会漏掉一半条目——实测 `Claude Safe Storage` 正好只出现在十六进制那遍里。解析必须两种写法都吃，并且 `svce` 与 `acct` 只能在同一条目块内配对，不能全局抓。
+**五、查钥匙串要看清 `svce` 与 `acct`，它们不是一回事。** `svce="Claude Safe Storage"` / `acct="Claude Key"` 是 Claude **Desktop** 的加密存储；CLI 的登录凭据另存（macOS 上走钥匙串），跟这条不是一回事——**别拿钥匙串条目推断 CLI 登没登录**，那件事看下面的「登录方式」（直接读 `claude auth status`）。另外 `security dump-keychain` 会把每个条目列两遍（一遍十六进制属性号、一遍具名属性），只认 `"svce"` 会漏掉一半条目——实测 `Claude Safe Storage` 正好只出现在十六进制那遍里。解析必须两种写法都吃，并且 `svce` 与 `acct` 只能在同一条目块内配对，不能全局抓。
 
 ## 范围
 
@@ -453,7 +453,16 @@ du -sh ~/.local/share/claude/versions/
 security dump-keychain 2>/dev/null | grep -E '"(svce|acct)"' | sort -u
 ```
 
-要分开看：`svce='Claude Safe Storage'` 配 `acct='Claude Key'` 是桌面版的加密存储；CLI 的凭据是 `svce='Claude Code-credentials'`。两者不是一回事。
+要分开看：`svce='Claude Safe Storage'` 配 `acct='Claude Key'` 是桌面版的加密存储，跟 CLI 的登录凭据不是一回事——CLI 登没登录别从这里推断，看下面那条。
+**登录方式**（用户口径 2026-10-15）
+
+```bash
+claude auth status        # 只读，返回 loggedIn / authMethod / apiProvider
+```
+
+读两处：`claude auth status` 报的登录态，以及 `CLAUDE_CODE_OAUTH_TOKEN` 有没有被写在环境变量、`~/.claude/settings.json` 的 `env` 或 shell 配置里（**只记位置，绝不读值**）。四态：有长期 token 报绿；是网页授权登录、或压根没登录，都报待处理并指向 `claude setup-token`；`claude auth status` 读不出来报「没测到」，不猜。
+
+为什么单列一项：在 Claude Code 里做网页授权登录，等于把这条登录事件钉在当前出口上；而网页登录还会随掉线、丢包反复要求重登，每重登一次就是一条新的登录记录。只认证一次的办法见人工清单第八组。
 
 **遥测三键**（文章 §5）
 
