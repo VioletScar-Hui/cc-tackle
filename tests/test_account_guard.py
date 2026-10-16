@@ -7261,6 +7261,109 @@ class TestBrowserVerifyAutoOpen(unittest.TestCase):
         self.assertIs(rows["WebRTC 泄漏"], g.S_NA)
 
 
+class TestCliLogin(unittest.TestCase):
+    """登录方式：不要在 Claude Code 里做网页授权登录（用户口径 2026-10-15）。
+
+    这条是「防风险操作」而不是环境残留——脚本改不了它，只能如实报出现在用的是
+    哪种凭据，并把 setup-token 的做法指出来。
+    """
+
+    def _env(self, **extra):
+        base = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_GUARD_")}
+        base.pop(g.CLI_LOGIN_TOKEN_ENV, None)
+        base.update(extra)
+        return base
+
+    def _row(self, report):
+        return dict((n, (s, d, )) for n, s, d in g.build_summary(report))["登录方式"]
+
+    def test_env_token_counts_as_long_lived(self):
+        env = self._env(**{g.CLI_LOGIN_TOKEN_ENV: "sk-ant-oat01-not-a-real-token"})
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(g.long_lived_token_sources(), ["环境变量"])
+            with mock.patch.object(g, "run", return_value=(1, '{"loggedIn": false}')):
+                r = g.check_cli_login("/usr/bin/claude")
+            status, detail = self._row({"A29_cli_login": r})
+        self.assertIs(status, g.S_OK)
+        self.assertIn("长期 token", detail)
+        # token 本体不进报告、不进那一行——报告会被贴进聊天、存成 JSON
+        self.assertNotIn("sk-ant-oat01", json.dumps(r, ensure_ascii=False))
+        self.assertNotIn("sk-ant-oat01", detail)
+
+    def test_settings_env_token_counts_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = pathlib.Path(tmp) / "settings.json"
+            settings.write_text(json.dumps({"env": {g.CLI_LOGIN_TOKEN_ENV: "x"}}), encoding="utf-8")
+            with mock.patch.dict(os.environ, self._env(), clear=True), \
+                 mock.patch.object(g, "HOME", pathlib.Path(tmp)), \
+                 mock.patch.object(g, "SETTINGS", settings):
+                self.assertEqual(g.long_lived_token_sources(), ["settings.json 的 env"])
+
+    def test_shell_rc_token_counts_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            (home / ".zshrc").write_text(f'export {g.CLI_LOGIN_TOKEN_ENV}="x"\n', encoding="utf-8")
+            with mock.patch.dict(os.environ, self._env(), clear=True), \
+                 mock.patch.object(g, "HOME", home), \
+                 mock.patch.object(g, "SETTINGS", home / "missing.json"):
+                self.assertEqual(g.long_lived_token_sources(), [".zshrc"])
+
+    def test_interactive_login_is_flagged(self):
+        payload = json.dumps({"loggedIn": True, "authMethod": "oauth"})
+        with mock.patch.dict(os.environ, self._env(), clear=True), \
+             mock.patch.object(g, "HOME", pathlib.Path("/nonexistent-guard-home")), \
+             mock.patch.object(g, "SETTINGS", pathlib.Path("/nonexistent-guard-home/s.json")), \
+             mock.patch.object(g, "run", return_value=(0, payload)):
+            r = g.check_cli_login("/usr/bin/claude")
+        self.assertEqual(r["state"], "interactive")
+        status, detail = self._row({"A29_cli_login": r})
+        self.assertIs(status, g.S_FIX)
+        self.assertIn("setup-token", detail)
+
+    def test_signed_out_is_flagged_with_the_same_advice(self):
+        payload = json.dumps({"loggedIn": False, "authMethod": "none"})
+        with mock.patch.dict(os.environ, self._env(), clear=True), \
+             mock.patch.object(g, "HOME", pathlib.Path("/nonexistent-guard-home")), \
+             mock.patch.object(g, "SETTINGS", pathlib.Path("/nonexistent-guard-home/s.json")), \
+             mock.patch.object(g, "run", return_value=(1, payload)):
+            r = g.check_cli_login("/usr/bin/claude")
+        self.assertEqual(r["state"], "none")
+        status, detail = self._row({"A29_cli_login": r})
+        self.assertIs(status, g.S_FIX)
+        self.assertIn("setup-token", detail)
+
+    def test_unreadable_output_is_not_guessed(self):
+        with mock.patch.object(g, "run", return_value=(1, "boom")):
+            r = g.check_cli_login("/usr/bin/claude")
+        self.assertEqual(r["state"], "unknown")
+        self.assertIn("读不懂", r["error"])
+        status, _ = self._row({"A29_cli_login": r})
+        self.assertIs(status, g.S_NA)
+
+    def test_missing_cli_is_not_guessed(self):
+        # 空字符串是假值，会回落到 shutil.which——那样这台开发机上有 claude，
+        # 用例就变成在测真 CLI。要真模拟「没装」，必须把 which 也钉住。
+        with mock.patch.object(g.shutil, "which", return_value=None), \
+             mock.patch.object(g, "run") as spy:
+            r = g.check_cli_login()
+        self.assertEqual(r["state"], "unknown")
+        self.assertIn("没找到", r["error"])
+        spy.assert_not_called()
+
+    def test_row_is_not_measured_without_the_report_key(self):
+        status, detail = self._row({})
+        self.assertIs(status, g.S_NA)
+        self.assertEqual(detail, "未检测")
+
+    def test_manual_checklist_carries_the_setup_token_recipe(self):
+        groups = dict((name, items) for name, items in g.MANUAL_ACTIONS)
+        target = [name for name in groups if name.startswith("八、")]
+        self.assertEqual(len(target), 1, "人工清单里少了「八、登录方式」那一组")
+        flat = " ".join(" ".join(steps) for _, _, steps, _ in groups[target[0]])
+        self.assertIn("claude setup-token", flat)
+        self.assertIn(g.CLI_LOGIN_TOKEN_ENV, flat)
+
+
 if __name__ == "__main__":
     # 这个块必须待在文件最末尾。2026-10-10 发现它一度停在中间（第 2403 行），
     # 于是它后面定义的 6 个类、40 个用例从来没被执行过——`unittest.main()` 在第 2403

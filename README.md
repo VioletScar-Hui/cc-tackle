@@ -167,7 +167,7 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 | 网络身份 | 出口 IP 与归属、ASN 类型、出口一致性、DNS、WebRTC、IPv6、Claude 域名路由 |
 | 代理链路 | 系统代理、shell 配置、npm/git 全局代理、代理后端的模式与 DNS |
 | 账号环境 | 时区层级、浏览器 Intl、浏览器资料复用、多账号痕迹、钥匙串条目 |
-| Claude Code | `settings.json` 端点与凭据、遥测开关、第三方客户端、CLI 签名完整性 |
+| Claude Code | `settings.json` 端点与凭据、遥测开关、第三方客户端、CLI 签名完整性、CLI 登录凭据 |
 | 环境卫生 | 项目级 `.claude`、失效权限、过期工作树登记、可回收系统体积 |
 
 浏览器缓存型结果要同时满足三件事才出结论：不超过 24 小时、`profileScope` 与显式设置的 `CLAUDE_GUARD_BROWSER_PROFILE` 一致、以及缓存里的 `openedBy` 是 `script`（复核页由脚本自己拉起，而不是别人手工打开）。这个资料名由用户声明，脚本能证明的是「哪个资料打开了这个页面」，不能独立证明它就是你的日常账号，所以页面上会把依据写成「浏览器实测（脚本打开的复核页，资料 Profile 1）」而不是一句「通过」。
@@ -182,6 +182,20 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 “未测到”表示没有足够证据完成该项检查，不等于通过，也不等于失败。
 
 <a id="side-effects"></a>
+
+### 登录方式：不要在 Claude Code 里登录
+
+报告里「登录方式」那一行读的是 `claude auth status`，告诉你这台机器现在用的是哪种凭据：长期 token、网页授权登录，还是根本没登录。
+
+为什么值得单列一项：在 Claude Code 里做网页授权登录，等于把这条登录事件钉在当前出口上；而网页登录还会随掉线、丢包反复要求重登，每重登一次就是一条新的登录记录。更稳的做法是只认证一次：
+
+```bash
+claude setup-token        # 按提示完成这一次认证，拿到长期有效的 token
+```
+
+把拿到的 token 放进 `CLAUDE_CODE_OAUTH_TOKEN`（写进 shell 配置，或写进 `~/.claude/settings.json` 的 `env`），之后 CLI 直接用这份凭据，不再走网页登录。第一次认证最好在一个干净环境里做（官方 App 也一样），之后只有掉线、换机、token 到期时才再跑一次。
+
+这一项只读状态：脚本不读 token 的值，报告里只出现「它写在哪个文件/哪个变量里」。
 
 ## 清理与副作用
 

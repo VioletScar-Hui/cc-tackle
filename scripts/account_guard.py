@@ -3612,6 +3612,79 @@ def check_telemetry() -> dict:
     return out
 
 
+CLI_LOGIN_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+LOGIN_TOKEN_RC_FILES = (".zshrc", ".zprofile", ".bashrc", ".bash_profile", ".profile")
+
+
+def long_lived_token_sources() -> list:
+    """哪些地方写了长期 token。
+
+    只报位置，绝不读值——token 本体不进报告、不进日志、不进终端输出。
+    """
+    places = []
+    if os.environ.get(CLI_LOGIN_TOKEN_ENV):
+        places.append("环境变量")
+    try:
+        if SETTINGS.is_file():
+            data = json.loads(SETTINGS.read_text())
+            env = data.get("env") if isinstance(data, dict) else None
+            if isinstance(env, dict) and env.get(CLI_LOGIN_TOKEN_ENV):
+                places.append("settings.json 的 env")
+    except (OSError, ValueError):
+        pass
+    pattern = re.compile(rf"^\s*(?:export\s+)?{CLI_LOGIN_TOKEN_ENV}=", re.M)
+    for name in LOGIN_TOKEN_RC_FILES:
+        path = HOME / name
+        try:
+            if path.is_file() and pattern.search(path.read_text()):
+                places.append(name)
+        except OSError:
+            continue
+    return places
+
+
+def check_cli_login(cli_path=None) -> dict:
+    """CLI 现在用的哪种凭据：长期 token、网页授权登录，还是根本没登录。
+
+    用户口径（2026-10-15）：不要在 Claude Code 里做网页授权登录——认证那一刻的出口
+    和登录事件绑在一起；网页登录还会因为掉线、丢包反复触发重登，每重登一次就是一条
+    新的登录事件。安全做法是第一次认证时跑 `claude setup-token` 拿长期 token。
+    """
+    out = {
+        "checkedAt": now_stamp(),
+        "tokenSources": long_lived_token_sources(),
+        "auth": None,
+        "raw": "",
+        "error": None,
+    }
+    cli = cli_path or shutil.which("claude")
+    if not cli:
+        out["state"] = "unknown"
+        out["error"] = "没找到 claude 命令"
+        return out
+    code, text = run([cli, "auth", "status"], timeout=15, env={"DISABLE_AUTOUPDATER": "1"})
+    out["raw"] = (text or "").strip()[:400]
+    start, end = out["raw"].find("{"), out["raw"].rfind("}")
+    data = None
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(out["raw"][start:end + 1])
+            data = parsed if isinstance(parsed, dict) else None
+        except ValueError:
+            data = None
+    out["auth"] = data
+    if out["tokenSources"]:
+        out["state"] = "token"
+    elif data is not None and data.get("loggedIn"):
+        out["state"] = "interactive"
+    elif data is not None:
+        out["state"] = "none"
+    else:
+        out["state"] = "unknown"
+        out["error"] = f"读不懂 claude auth status 的输出（退出码 {code}）"
+    return out
+
+
 # ────────────────────────── 结果总表 ──────────────────────────
 
 S_OK = "✓"
@@ -4738,6 +4811,27 @@ def build_summary(report: dict) -> list:
     else:
         add("CLI 完整性", S_NA, "没找到 claude 命令")
 
+    # ── 登录方式（用户口径：不要在 Claude Code 里做网页授权登录）──
+    if missing("A29_cli_login"):
+        add("登录方式", S_NA, "未检测")
+    else:
+        lgn = report.get("A29_cli_login") or {}
+        state = lgn.get("state")
+        srcs = "、".join(lgn.get("tokenSources") or [])
+        if state == "token":
+            add("登录方式", S_OK,
+                f"用长期 token（{srcs}里写着 CLAUDE_CODE_OAUTH_TOKEN），CLI 不依赖网页登录")
+        elif state == "interactive":
+            add("登录方式", S_FIX,
+                "现有登录态来自网页授权（claude auth status 报 loggedIn=true）；掉线或丢包就要重登，"
+                "每重登一次就是一条新的登录事件。改用长期 token：终端跑 claude setup-token（人工清单第八组）")
+        elif state == "none":
+            add("登录方式", S_FIX,
+                "还没有长期 token，CLI 当前也没登录（authMethod=none）。要用 CLI 时别在 Claude Code 里登录，"
+                "先跑 claude setup-token 拿长期 token 写进 CLAUDE_CODE_OAUTH_TOKEN（人工清单第八组）")
+        else:
+            add("登录方式", S_NA, "读不到 claude auth status，这一项没测到")
+
     if missing("E1_keychain"):
         add("钥匙串条目", S_NA, "未检测")
     elif kc.get("readable") and kc.get("items"):
@@ -5674,6 +5768,15 @@ MANUAL_ACTIONS = (
           "要自建就选搬瓦工、DMIT、Vultr 这类独立主机商"),
          "文章原话「IP 显示在美国，hostname 和 ASN 却还带着国内大厂」——这类出口比普通机房 IP 更扎眼，ASN 那一栏直接把来源写在脸上。另外自建 VPS 无论选谁都是 Hosting，风险高于住宅 IP"),
     )),
+    ("八、登录方式（一次认证，别反复登）", (
+        ("不要在 Claude Code 里做网页授权登录，改用 setup-token", "用户口径 2026-10-15",
+         ("Claude Code 里不要执行登录、也不要走 claude auth login 的网页授权：认证那一刻的出口和这条登录事件绑在一起",
+          "第一次买完（Google Play / App Store / 官网都行）就在一个干净环境里把账号认一次，装官方 App，安卓手机上装也行",
+          "在终端跑 claude setup-token，按提示完成这一次认证，拿到长期有效的 token（实测口径是一年）",
+          "把 token 放进 CLAUDE_CODE_OAUTH_TOKEN——写进 shell 配置，或写进 ~/.claude/settings.json 的 env",
+          "之后 CLI 直接用这份凭据，不再走网页登录；只有掉线、换机、token 到期时才再跑一次 setup-token"),
+         "网页端那种认证完还要频繁重登、连丢个包都要重登的方式最危险：每重登一次就是一条新的登录事件，而在 Claude Code 里登录等于把这条事件钉在当前出口上。本 skill 的「登录方式」那一行会读 claude auth status，告诉你这台机器现在用的是哪种"),
+    )),
 )
 
 
@@ -5798,7 +5901,7 @@ MANUAL_CHECKS = (
          "versions 目录每份 200 MB 上下，安装器会自行清理旧版本；想腾空间可手动删非当前版本"),
         ("钥匙串条目", "文章 2.6",
          ('security dump-keychain 2>/dev/null | grep -E \'"(svce|acct)"\' | sort -u',),
-         "要分开看：svce='Claude Safe Storage' + acct='Claude Key' 是桌面版的加密存储；CLI 的凭据是 svce='Claude Code-credentials'"),
+         "要分开看：svce='Claude Safe Storage' + acct='Claude Key' 是桌面版的加密存储，跟 CLI 的登录凭据不是一回事。CLI 算不算登录看「登录方式」那一行（读 claude auth status）——本机实测这条钥匙串条目和「CLI 有凭据」没有对应关系，别拿它推断"),
         ("遥测三键", "文章 §5",
          ('python3 -c "import json;print(json.load(open(\'$HOME/.claude/settings.json\')).get(\'env\',{}))"',),
          "想关就在这里加 DISABLE_TELEMETRY 与 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 为 1；有副作用，Remote Control 可能失效"),
@@ -7457,6 +7560,7 @@ def audit(*, persist: bool = False, expected_country: str | None = None,
         "A11_client_integrity": check_client_integrity(),
         "A12_clash_groups": check_clash_groups(),
         "A28_proxy_backend": _proxy_backend_report(),
+        "A29_cli_login": check_cli_login(),
         "A13_multi_account": check_multi_account(),
         "A15_consistency": check_consistency(ip),
         "A3_telemetry": check_telemetry(),
