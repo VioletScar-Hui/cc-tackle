@@ -345,29 +345,33 @@ MAX_SCORE = BASE_MAX + BONUS_POINTS
 def _score(rows) -> dict:
     """加分制：27 个基础项合计 100 分，加分项（登录方式）另外加。
 
-    基础分：每项满分 100/27，通过拿满、待处理拿一半、未通过 0 分。「这次没测到」
-    分子分母都不进——测不到就说测不到，不拉低分数，也不假装通过（它在页面上单独
-    列一行）；只剩已测到的项时按 100 分制折算，所以全通过就是 100 分。
+    基础分：每项满分 100/27。通过拿满、待处理拿一半、未通过 0 分；
+    **「这次没测到」同样是 0 分**——分母固定 27，测不到就不拿分，既不折算成
+    剩下那几项的比例，也不会因为「测到的都过了」而显示接近满分。要么测到并
+    通过，要么这一项就不给分。
 
     加分项：登录方式通过时额外加 BONUS_POINTS 分，不计入那 27 项，总分最高 105。
     """
-    w = {"ok": 1.0, "warn": 0.5, "bad": 0.0}
+    w = {"ok": 1.0, "warn": 0.5, "bad": 0.0, "na": 0.0}
     counts = {"ok": 0, "warn": 0, "bad": 0, "na": 0}
     for r in rows:
         counts[_kind(r[1])] += 1
     bonus = 0
-    base = []
+    earned = 0.0
+    seen = set()
     for r in rows:
         if r[0] == BONUS_ROW:
             if _kind(r[1]) == "ok":
                 bonus = BONUS_POINTS
             continue
-        base.append(r)
-    counted = [r for r in base if _kind(r[1]) in w]
-    if not counted:
-        return {"score": None, "total": None, "bonus": bonus, "per_item": BASE_MAX / BASE_ITEMS,
-                "grade": "—", "counts": counts, "ring": "#94a3b8"}
-    score = round(BASE_MAX * sum(w[_kind(r[1])] for r in counted) / len(counted))
+        if r[0] in seen:
+            # 同一项出现两次只算一次：否则多出来的一条「通过」会把另一条失败抵消掉。
+            continue
+        seen.add(r[0])
+        earned += w[_kind(r[1])]
+    # 分母固定为 27：以后真加了检查项而没有同步 BASE_ITEMS，宁可分数封顶，
+    # 也不能让它靠多出来的行把总分撑过 100。
+    score = min(BASE_MAX, round(BASE_MAX * earned / BASE_ITEMS))
     total = score + bonus
     if total >= 100:
         grade, ring = "A+", "#35a952"
@@ -545,8 +549,12 @@ def _manual_html(manual) -> str:
 
 
 def render(report: dict, before: dict = None, report_path=None,
-           live=None, actions=None) -> str:
-    """渲染整页。report 是体检报告字典，before 是同一轮里动手前那份（可选）。"""
+           live=None, actions=None, note: str = "") -> str:
+    """渲染整页。report 是体检报告字典，before 是同一轮里动手前那份（可选）。
+
+    note 会原样印在页面顶部：用来标注「这一轮没有改动」「已取消」这类上下文——
+    以前只在终端打印，页面单独发出去就看不出它是哪一种了。
+    """
     import account_guard as g  # 延迟导入：单独跑本模块时也要能用，且避免循环导入
 
     rows = g.build_summary(report)
@@ -582,14 +590,22 @@ def render(report: dict, before: dict = None, report_path=None,
         if not items:
             continue
         kinds = [_kind(r[1]) for r in items]
-        scored = [k for k in kinds if k != "na"]
-        pct = round(100 * sum(1 for k in scored if k == "ok") / len(scored)) if scored else 0
+        ok_n = sum(1 for k in kinds if k == "ok")
+        na_n = sum(1 for k in kinds if k == "na")
+        # 分母用这一组的全部检查项：「没测到」按 0 分，分组通过率也就不会被
+        # 那几项悄悄抬高——和总分是同一口径。
+        pct = round(100 * ok_n / len(items))
         cls = "ok" if pct == 100 else ("warn" if pct >= 60 else "bad")
         bad = [r[0] for r in items if _kind(r[1]) in ("bad", "warn")]
+        notes = []
+        if bad:
+            notes.append("待处理：" + "、".join(bad))
+        if na_n:
+            notes.append(f"未测到 {na_n} 项")
         group_cards.append(
-            f"<div class='card'><h3>{_esc(gname)}<em>{sum(1 for k in scored if k=='ok')}/{len(scored)}</em></h3>"
+            f"<div class='card'><h3>{_esc(gname)}<em>{ok_n}/{len(items)}</em></h3>"
             f"<div class='bar'><i class='{cls}' style='width:{pct}%'></i></div>"
-            f"<div class='tiny'>{'全部通过' if not bad else '待处理：' + _esc('、'.join(bad))}</div></div>"
+            f"<div class='tiny'>{_esc('；'.join(notes) or '全部通过')}</div></div>"
         )
 
     # ── 逐项 ──
@@ -608,6 +624,7 @@ def render(report: dict, before: dict = None, report_path=None,
 
     # ── 需要你处理的 ──
     todo = [r for r in rows if _kind(r[1]) in ("bad", "warn")]
+    na_n = sum(1 for r in rows if _kind(r[1]) == "na")
     if todo:
         todo_html = "".join(
             f"<div class='item {_kind(r[1])}'><div class='dot'>{'!' if _kind(r[1])=='warn' else '✗'}</div>"
@@ -616,6 +633,11 @@ def render(report: dict, before: dict = None, report_path=None,
             f"<div class='detail'>{_esc(strip_article_refs(r[2]))}</div></div></div>"
             for r in todo
         )
+    elif na_n:
+        # 「没测到」按 0 分计，就不能再说「全部通过」——0 分和全部通过同时出现，
+        # 等于把没测到的项偷偷当成了通过。
+        todo_html = (f"<div class='card'>{len(rows) - na_n} 项已经判定，另有 {na_n} 项"
+                     f"这次没测到、按 0 分计，不能算通过；要下结论先把这几项测到。</div>")
     else:
         todo_html = f"<div class='card'>{len(rows)} 项全部通过，不需要你做任何事。</div>"
 
@@ -658,6 +680,8 @@ def render(report: dict, before: dict = None, report_path=None,
             "<span class='pill'>本页不加载任何外部资源</span>"]
     score_txt = "—" if sc["total"] is None else sc["total"]
     ring_pct = 0 if sc["total"] is None else min(100, sc["total"])
+    note_html = (f"<div class='hero-note' style='color:#e8c07d;margin-top:6px'>"
+                 f"{_esc(note)}</div>") if note else ""
 
     # 修复按钮只在本地服务模式下出现（静态文件执行不了命令，出了按钮只会骗人）。
     if live:
@@ -681,14 +705,15 @@ def render(report: dict, before: dict = None, report_path=None,
 
 <div class="hero">
   <h1>Claude 环境体检报告</h1>
-  <div class="sub">CC tackle · {len(rows)} 项检查（{BASE_ITEMS} 项计分，{_esc(BONUS_ROW)}为加分项）· 未测到的项不计入分数</div>
+  <div class="sub">CC tackle · {len(rows)} 项检查（{BASE_ITEMS} 项计分，{_esc(BONUS_ROW)}为加分项）· 未测到的项按 0 分计</div>
   <div class="hero-grid">
     <div class="ring" style="--p:{ring_pct};--ring:{sc['ring']}">
       <div class="ring-in"><div style="text-align:center"><b>{score_txt}</b><br><small>/ {MAX_SCORE}</small></div></div>
     </div>
     <div class="grade">{sc['grade']}<small>综合评分</small></div>
     <div>
-      <div class="hero-note">{BASE_ITEMS} 项基础分合计 {BASE_MAX} 分：通过拿满、待处理拿一半、未通过 0 分；「没测到」不进分母。{_esc(BONUS_ROW)}是加分项，通过再加 {BONUS_POINTS} 分，满分 {MAX_SCORE}。</div>
+      <div class="hero-note">{BASE_ITEMS} 项基础分合计 {BASE_MAX} 分：通过拿满、待处理拿一半、未通过 0 分；「没测到」也按 0 分计，分母固定 {BASE_ITEMS} 项，不折算成剩下几项的比例。{_esc(BONUS_ROW)}是加分项，通过再加 {BONUS_POINTS} 分，满分 {MAX_SCORE}。</div>
+      {note_html}
       {delta}
     </div>
   </div>
@@ -725,13 +750,17 @@ def render(report: dict, before: dict = None, report_path=None,
 
 
 def write_report(report: dict, before: dict = None, out_dir=None,
-                 open_it: bool = False, report_path=None) -> pathlib.Path:
-    """落盘一份 HTML 报告，返回路径。open_it 为真时在 macOS 上用默认浏览器打开。"""
+                 open_it: bool = False, report_path=None, note: str = "") -> pathlib.Path:
+    """落盘一份 HTML 报告，返回路径。open_it 为真时在 macOS 上用默认浏览器打开。
+
+    note 原样印在页面顶部（「这一轮没有改动」「已取消」这类上下文）。
+    """
     out_dir = pathlib.Path(out_dir) if out_dir else BACKUP_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     path = out_dir / f"report-{stamp}.html"
-    path.write_text(render(report, before=before, report_path=report_path), encoding="utf-8")
+    path.write_text(render(report, before=before, report_path=report_path, note=note),
+                    encoding="utf-8")
     if open_it and sys.platform == "darwin" and not os.environ.get("CLAUDE_GUARD_NO_OPEN"):
         try:
             subprocess.run(["open", str(path)], check=False, timeout=15)

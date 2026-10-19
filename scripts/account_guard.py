@@ -2,12 +2,14 @@
 """CC tackle —— 按《你的 Claude 账号是怎么被封的》四层防线做本机体检与加固。
 
 设计沿用 skills/claude-cleanup 的安全约定：
-  * 只读审计永远安全，任何写操作都要真实 TTY + 逐项询问 + 最终 CONFIRM；
-  * CONFIRM 后、任何目标状态变更前先完成备份，失败即停（并发锁是控制元数据）；
+  * 只读审计永远安全；写操作要么走完整加固（真实 TTY + 逐项询问 + 最终 CONFIRM），
+    要么走 --fix-auto（只碰有备份、改完能就地复验的四类残留，动手前单独确认一次）；
+  * 确认之后、任何目标状态变更前先完成备份，失败即停（并发锁是控制元数据）；
   * 需要 root 时只在终端原生 sudo 隐藏提示里输密码，脚本从不读取或保存密码；
   * 每项改动之后立刻复验，验证失败即报错并保留备份。
 
 用法：
+  python3 scripts/account_guard.py --preflight --fix-auto   # 一次问清 → 体检 → 修 → 复检 → HTML
   python3 scripts/account_guard.py --audit      # 只读体检，输出报告
   python3 scripts/account_guard.py              # 交互式加固
   python3 scripts/account_guard.py --audit --json   # 机器可读
@@ -2225,6 +2227,33 @@ def check_proxy_residue() -> dict:
     return out
 
 
+# shell 配置里真正算「残留」的变量名。以前是按行做 `proxy|ANTHROPIC|CLAUDE` 的宽匹配，
+# 于是 `alias claude='claude --verbose'`、`export CLAUDE_CONFIG_DIR=...` 也会被当成
+# 代理行整行删掉——确认清单写的是「代理行」，删的却是用户的别名和路径配置。
+SHELL_RESIDUE_VAR = re.compile(
+    r"^(?:[A-Za-z0-9_]*PROXY"
+    r"|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY"
+    r"|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_API_KEY)$", re.I)
+SHELL_ASSIGN = re.compile(
+    r"^(?:export\s+|declare\s+-x\s+|typeset\s+-x\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+
+
+def shell_line_is_residue(line: str) -> bool:
+    """这一行 shell 配置是不是要清的残留（代理 / 端点 / 凭据）。
+
+    只认「赋值」这一种写法：`export HTTPS_PROXY=...`、`HTTPS_PROXY=...`、
+    `declare -x ANTHROPIC_BASE_URL=...`。别名、路径、模型这些不动——它们含
+    claude/anthropic 字样但不是代理也不是端点。注释行一律不动。
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    match = SHELL_ASSIGN.match(stripped)
+    if not match:
+        return False
+    return bool(SHELL_RESIDUE_VAR.match(match.group(1)))
+
+
 def check_terminal_env() -> dict:
     """A1 终端代理与中转残留。文章 2.5⑤ 的四条：环境变量、shell 启动文件、
     npm/git 配置、settings.json；另加一条 Homebrew（文章里没有，属补充项）。
@@ -2256,7 +2285,7 @@ def check_terminal_env() -> dict:
         # 存结构化行号，清理时才能精确定位；只存字符串的话没法安全删除
         hits = []
         for n, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
-            if re.search(r"proxy|ANTHROPIC|CLAUDE", line, re.I) and not line.strip().startswith("#"):
+            if shell_line_is_residue(line):
                 clean_line = line.rstrip("\r\n")
                 hits.append({"line": n,
                              "text": redact_credentials(clean_line.strip())[:120],
@@ -4873,25 +4902,28 @@ def build_summary(report: dict) -> list:
     return rows
 
 
-def write_html_only(report: dict, before: dict | None = None, note: str = "") -> None:
+def write_html_only(report: dict, before: dict | None = None,
+                    note: str = "") -> pathlib.Path | None:
     """只落一份 HTML，不写 audit JSON、不动出口历史与缓存。
 
-    与 --save-audit 的区别：那条路会连 JSON 和状态一起写，而「就想看一眼报告」的人
-    不该被顺带改状态。报告是给人看的附属产物，渲染失败只提示、不往上抛，否则一次
-    成功的加固会因为模板里某个字段没对上而以 traceback 收场。
+    返回页面路径；没写成返回 None，由调用方决定这算不算失败。--fix-auto 把
+    「收尾必须出页面」当成交付的一部分，所以它会在拿到 None 时报非 0；只读
+    审计那条路仍然只提示，不改变退出码。
     """
     try:
         from report_html import write_report
-        page = write_report(report, before=before, open_it=True)
+        page = write_report(report, before=before, open_it=True, note=note)
         suffix = f"（{note}）" if note else ""
         print(f"\nHTML 报告{suffix}：{page}")
-    except Exception as error:      # 同上：附属产物不该影响主流程的结论
-        print(f"\nHTML 报告生成失败（上面的结论不受影响）：{error}", file=sys.stderr)
+        return page
+    except Exception as error:      # 渲染失败不往上抛：一次成功的改动不该以 traceback 收场
+        print(f"\nHTML 报告生成失败：{error}", file=sys.stderr)
+        return None
 
 
-def write_html_twin(before: dict, after: dict) -> None:
+def write_html_twin(before: dict, after: dict) -> pathlib.Path | None:
     """改动前后的对照版 HTML：两个参数都是同一次运行里的真读数。"""
-    write_html_only(after, before=before)
+    return write_html_only(after, before=before)
 
 
 def print_summary_table(report: dict) -> None:
@@ -6009,7 +6041,8 @@ def release_run_lock() -> None:
         holder = path.read_text(encoding="utf-8").strip()
     except OSError:
         return
-    if holder.split()[0] != str(os.getpid()):
+    if not holder or holder.split()[0] != str(os.getpid()):
+        # 空锁文件是上次建完就被打断留下的：不是自己的，别乱删，也别抛 IndexError。
         return
     try:
         path.unlink()
@@ -6694,6 +6727,12 @@ def clear_rc_proxy_lines(rc_files: dict) -> list[str]:
         if len(kept) == len(lines):
             continue
         p.write_text("".join(kept), encoding="utf-8")
+        # 写完当场复验：文件里不能再有代理/端点赋值。审计到确认之间被人插了一行
+        # 也能在这里发现，而不是等收尾那次体检才兜底。
+        remaining = [ln for ln in p.read_text(errors="replace").splitlines()
+                     if shell_line_is_residue(ln)]
+        if remaining:
+            raise RuntimeError(f"{p} 清理后仍有代理行：{remaining[0].strip()[:80]}")
         changed.append(str(p))
     return changed
 
@@ -7944,6 +7983,175 @@ def auto_clean_plan(report: dict) -> dict:
     }
 
 
+def _auto_fix_inventory(plan: dict, defer_settings: bool) -> list[str]:
+    """--fix-auto 这一轮真正会动的项。
+
+    只收录四类既有备份、改完又能就地复验的残留。环境变量、Homebrew、~/.npmrc
+    这些「进程持有或不属于本工具」的东西照旧只报告，不在这儿冒充可修复项。
+    """
+    items = []
+    if plan.get("proxy_residue"):
+        items.append(f"系统代理残留 {len(plan['proxy_residue'])} 项（只清 Enabled=No 的存值）")
+    rc = plan.get("rc_files") or {}
+    if rc:
+        items.append("shell 配置里的代理行：" + "、".join(f"{k} {len(v)} 行" for k, v in rc.items()))
+    if plan.get("npm_git"):
+        items.append("npm / git 全局代理：" + "、".join(plan["npm_git"]))
+    if (plan.get("settings_base_url") or plan.get("settings_env_proxy")) and not defer_settings:
+        items.append("Claude Code settings.json 里指向别处的端点 / 代理变量")
+    return items
+
+
+def run_preflight(args) -> None:
+    """体检之前一次性问清「要不要测浏览器」「要不要探 WebRTC」「有没有预期出口」。
+
+    只问一屏，问完不再为同一件事打断。--json 与非真实终端不问，同样的授权
+    改用 --verify-browser / --webrtc / --expected-country / --expected-exit-ip 表达。
+    """
+    if args.json:
+        return
+    if not sys.stdin.isatty():
+        print("提示：当前不是真实终端，已跳过前置提问；同样的授权请用 "
+              "--verify-browser / --webrtc / --expected-country / --expected-exit-ip 表达。",
+              file=sys.stderr)
+        return
+    print("── 体检前先确认这一次要测什么（只问这一屏）──")
+    if not args.verify_browser:
+        if ask_yes("现在打开浏览器复核页，把 Intl 区域设置与媒体权限测回来？", default=True):
+            args.verify_browser = True
+    if not args.webrtc:
+        if ask_yes("顺带跑一次 WebRTC 泄漏探测？会临时起一个浏览器资料，结束后清理",
+                   default=True):
+            args.webrtc = True
+    if args.expected_country is None and args.expected_exit_ip is None:
+        if ask_yes("有固定的出口国家 / IP 要声明吗？", default=False):
+            try:
+                args.expected_country = normalize_expected_country(
+                    input("  预期出口国家（两位代码，例如 US；直接回车跳过）：").strip() or None)
+                args.expected_exit_ip = normalize_expected_ip(
+                    input("  预期出口 IP（可留空）：").strip() or None)
+            except ValueError as error:
+                print(f"  声明无效，这一项按未声明处理：{error}")
+    print()
+
+
+def run_fix_auto(report: dict, args, under_claude: bool = False) -> int:
+    """--fix-auto：体检之后当场处理「可自动修」的残留，再复检、出 HTML。
+
+    与完整加固的边界只有一处不同：这里只碰四类有备份、改完能就地复验的残留，
+    不申请 root、不删任何不可原样回滚的东西、不问遥测开关与 IPv6。
+    在 Claude Code 里运行时跳过它正在使用的 settings.json，其余照常。
+    """
+    plan = auto_clean_plan(report)
+    scope = report.get("scope_manifest") or {}
+    defer_settings = bool(under_claude or scope.get("custom"))
+    defer_reason = ("Claude Code 正在用它" if under_claude
+                    else "CLAUDE_CONFIG_DIR 指向自定义目录")
+    settings_hit = bool(plan.get("settings_base_url") or plan.get("settings_env_proxy"))
+    todo = _auto_fix_inventory(plan, defer_settings)
+
+    if not todo:
+        print("\n没有这一轮能自动修的项。")
+        if settings_hit and defer_settings:
+            print(f"  · settings.json 里的端点 / 代理变量这一轮跳过（{defer_reason}）。")
+        page = write_html_only(report, note="这一轮没有改动，报告只有体检结果")
+        if page is None:
+            print("停止：这一轮没有可修的项，但连体检页面也没写成。", file=sys.stderr)
+            return 2
+        return 0
+
+    print("\n── 可自动修的项：这一轮直接处理 ──")
+    for line in todo:
+        print(f"  · {line}")
+    if settings_hit and defer_settings:
+        print(f"  · settings.json 里的端点 / 代理变量本轮跳过（{defer_reason}）。")
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("拒绝执行：--fix-auto 要真实终端确认；agent 已经拿到用户授权时再加 --yes。",
+                  file=sys.stderr)
+            return 2
+        if input("按上面的清单修（先备份、改完复检）？输入 y 确认：").strip().lower() != "y":
+            print("已取消，没有修改任何内容。")
+            write_html_only(report, note="已取消，这是改动前的状态")
+            return 1
+
+    locked, lock_note = acquire_run_lock()
+    if not locked:
+        print(f"停止：{lock_note}", file=sys.stderr)
+        print("等它跑完再来；若确认那个进程已经不在了，删掉锁文件即可。", file=sys.stderr)
+        return 2
+    print(f"  {lock_note}")
+
+    backup = None
+    try:
+        selected = {"browser_locale": False, "dead_permissions": False,
+                    "project_junk": False, "wrapper": False}
+        paths, _ = backup_paths_for_plan(plan, report, selected)
+        manual_boundaries = []
+        if plan.get("proxy_residue"):
+            # 系统代理是 networksetup 的系统状态，拷不进文件备份：把原值和
+            # 「这一项要人工复核/恢复」一起写进 manifest，别让「已备份」变成空话。
+            manual_boundaries.append("系统代理 networksetup 状态需人工复核/恢复")
+            print("\n  系统代理残留原值（改前记录，恢复时按这里核对）：")
+            for item in plan["proxy_residue"]:
+                print(f"    · {item.get('service')} / {item.get('kind')}："
+                      f"server={item.get('server') or '(空)'}  port={item.get('port') or '(空)'}")
+        backup = create_backup(paths, [], manual_boundaries=manual_boundaries)
+        _refresh_backup_manifest(backup, "fix-auto-backup")
+        print(f"\n备份：{backup}")
+    except (OSError, RuntimeError, ValueError) as error:
+        release_run_lock()
+        print(f"停止：备份没做成，因此没有改动任何文件（{error}）", file=sys.stderr)
+        return 2
+
+    try:
+        done = []
+        if plan.get("proxy_residue"):
+            # networksetup 的状态进不了文件备份，改之前先把原值打出来，
+            # 否则「备份（回滚用）」这句话对系统代理这一项是空的。
+            _mark_backup_in_progress(backup, "proxy-residue")
+            n = clear_proxy_residue(plan["proxy_residue"])
+            done.append(f"系统代理残留：清了 {n} 项（其余保持原样）")
+        if plan.get("rc_files"):
+            _mark_backup_in_progress(backup, "shell-rc")
+            changed = clear_rc_proxy_lines(plan["rc_files"])
+            done.append("shell 代理行：" + ("、".join(changed) if changed else "没有命中"))
+        if plan.get("npm_git"):
+            _mark_backup_in_progress(backup, "npm-git")
+            names = clear_npm_git_proxy()
+            done.append("npm / git 全局代理：" + ("、".join(names) if names else "没有命中"))
+        if settings_hit and not defer_settings:
+            _mark_backup_in_progress(backup, "settings")
+            done.append(clear_anthropic_base_url())
+        _refresh_backup_manifest(backup, "fix-auto-done")
+        for line in done:
+            print(f"  ✓ {line}")
+
+        print("\n重新体检一次，下面是改动前后的对照（同一次运行里的两遍真读数）：")
+        fresh = audit(persist=False, expected_country=args.expected_country,
+                      expected_exit_ip=args.expected_exit_ip)
+        if "A7_webrtc" in report:
+            fresh["A7_webrtc"] = report["A7_webrtc"]
+        print_before_after(report, fresh)
+        if write_html_twin(report, fresh) is None:
+            print("注意：改动已经完成并复检过，但收尾那份 HTML 没写成；"
+                  f"备份（回滚用）：{backup}", file=sys.stderr)
+            return 2
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        # 失败前可能已经改了一半：把当前状态记进 manifest，恢复才能看到「改过」。
+        try:
+            _refresh_backup_manifest(backup, "fix-auto-failed")
+        except (OSError, RuntimeError, ValueError):
+            pass
+        print(f"停止：{error}", file=sys.stderr)
+        print(f"停止前已执行的改动会保留；备份（回滚用）：{backup}", file=sys.stderr)
+        return 2
+    finally:
+        release_run_lock()
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="按四层防线做 Claude 本机体检与加固")
     ap.add_argument("--audit", action="store_true", help="只读体检，不做任何修改")
@@ -7977,9 +8185,41 @@ def main(argv: list[str] | None = None) -> int:
                          "（安装那一下仍要你自己点，Chrome 不允许脚本代装）")
     ap.add_argument("--verify-browser", action="store_true",
                     help="配合 --audit：体检前脚本自己打开复核页，把 Intl 与媒体权限收回来（会写复核缓存）")
+    ap.add_argument("--fix-auto", action="store_true",
+                    help="体检后直接处理可自动修的残留（系统代理残留、shell 代理行、npm/git 全局代理、"
+                         "settings.json 端点与代理变量）：先备份再改、改完复检，并出一份前后对照 HTML")
+    ap.add_argument("--yes", action="store_true",
+                    help="配合 --fix-auto：跳过动手前的确认（用于 agent 已经拿到用户授权的非交互运行）")
+    ap.add_argument("--preflight", action="store_true",
+                    help="体检前在终端里先问一次：是否现在开浏览器复核页、是否跑 WebRTC 探测、"
+                         "有没有预期出口要声明")
     ap.add_argument("--commands", action="store_true", help="只打印手工核对用的终端命令清单，不体检")
     ap.add_argument("--manual", action="store_true", help="只打印必须人工做的行动清单（带点击路径），不体检")
     args = ap.parse_args(argv)
+
+    if args.fix_auto:
+        # --fix-auto 的体检是修复的前置，不必再写一遍 --audit
+        args.audit = True
+
+    if args.yes and not args.fix_auto:
+        print("拒绝组合：--yes 只配合 --fix-auto 使用；其它模式仍要在真实终端里逐项确认。",
+              file=sys.stderr)
+        return 2
+
+    if args.fix_auto and args.json:
+        print("拒绝组合：--fix-auto 会改本机状态，不能和 --json 一起用；"
+              "先 --audit --json 看数据，再单独跑 --fix-auto。", file=sys.stderr)
+        return 2
+
+    if args.fix_auto and args.save_audit:
+        print("拒绝组合：--fix-auto 开头那份体检不落盘（复检才是结果）；"
+              "要留档先用 --audit --save-audit。", file=sys.stderr)
+        return 2
+
+    if args.fix_auto and (args.commands or args.manual or args.install_webrtc_limiter):
+        print("拒绝组合：--fix-auto 不能和 --commands / --manual / "
+              "--install-webrtc-limiter 混用——那三个是只说不做的模式。", file=sys.stderr)
+        return 2
 
     if args.verify_browser and not args.audit:
         print("拒绝组合：--verify-browser 只配合 --audit 使用；单独复核用 --check-locale 或 --check-media。",
@@ -8046,12 +8286,13 @@ def main(argv: list[str] | None = None) -> int:
         # 「Claude Code 里只放行只读」那条限制（安装那一下仍旧只能你自己点）。
         return 0 if install_webrtc_limiter()["ok"] else 2
 
-    # --verify-browser 会打开一个浏览器页面并写复核缓存，所以它不算只读模式：
-    # 在 Claude Code 里仍旧只放行纯 --audit。
-    read_only_run = args.audit and not args.verify_browser
+    # --verify-browser 只开一个本机复核页、写自己的复核缓存，不动 Claude 的状态；
+    # --fix-auto 只碰有备份、改完能就地复验的四类残留，并在 Claude Code 里跳过
+    # 它正在使用的 settings.json。真正会改系统状态的是完整加固，那条仍旧只许普通终端。
     under_claude = running_under_claude()
-    if under_claude and not read_only_run:
-        print("拒绝执行：当前脚本由 Claude Code 启动。加固步骤会改本机状态，请改用普通终端；这里只允许 --audit。", file=sys.stderr)
+    if under_claude and not args.audit:
+        print("拒绝执行：当前脚本由 Claude Code 启动。加固步骤会改本机状态，请改用普通终端；"
+              "这里只允许 --audit、--verify-browser 与限定范围的 --fix-auto。", file=sys.stderr)
         return 2
     if not args.audit:
         scope = claude_config_scope()
@@ -8067,6 +8308,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.audit and not sys.stdin.isatty():
         print("拒绝执行：需要真实 TTY 完成知情确认。", file=sys.stderr)
         return 2
+
+    if args.preflight:
+        # 问在体检之前：问完这一屏，这一轮就不会再留下「未测到」的两项，
+        # 也不会因为少给了预期出口而在收尾时补问一次。
+        run_preflight(args)
 
     if args.verify_browser:
         # 顺序不能反：audit() 读的正是这两份复核缓存，先体检再复核等于白跑一次。
@@ -8104,6 +8350,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.audit:
         # 只读模式：体检完直接给总表
         print_summary_table(report)
+        if args.fix_auto:
+            # --fix-auto：这张表是「修之前」的读数，收尾还会给一份改动后的对照与 HTML。
+            return run_fix_auto(report, args, under_claude=under_claude)
         print("\n  想自己复核上面每一项：python3 scripts/account_guard.py --commands")
         print("  必须人工做的那些（带点击路径）：python3 scripts/account_guard.py --manual")
         if args.save_audit:
@@ -8513,8 +8762,11 @@ def main(argv: list[str] | None = None) -> int:
         release_run_lock()
 
 
-def ask_yes(prompt: str) -> bool:
-    return input(f"{prompt} [y/N]：").strip().lower() == "y"
+def ask_yes(prompt: str, default: bool = False) -> bool:
+    answer = input(f"{prompt} {'[Y/n]' if default else '[y/N]'}：").strip().lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
 
 
 def ask_choice(prompt: str, allowed: set[int]) -> int:
