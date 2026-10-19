@@ -1807,11 +1807,15 @@ class TestScheduleConsistency(unittest.TestCase):
 class TestLocalGitCheck(unittest.TestCase):
     """文章 §6 第 11 步 / §9 末条：代码别只存在 Claude 里。"""
 
-    def test_without_project_roots_it_says_how_to_enable(self):
-        with mock.patch.dict("os.environ", {}, clear=True):
+    def test_without_project_roots_it_falls_back_to_the_skill_repo(self):
+        # 裸跑不再「跳过」：走 project_roots 的兜底（skill 所在的 git 仓）。
+        # 以前的用例把整个环境清空，连 PATH 都没了，git 跑不起来才「跳过」——
+        # 那不是在测兜底，是在测 manifest 里没 PATH。
+        with mock.patch.dict(os.environ, {"CLAUDE_GUARD_PROJECT_ROOTS": ""}, clear=False):
             r = g.check_local_git()
-        self.assertEqual(r["repos"], [])
-        self.assertIn("CLAUDE_GUARD_PROJECT_ROOTS", r["note"])
+        self.assertTrue(r["roots"], "兜底没生效")
+        self.assertFalse(r["note"])
+        self.assertTrue(r["repos"], "skill 自己就在一个 git 仓里")
 
     def test_counts_repos_and_dirty(self):
         root = pathlib.Path(tempfile.mkdtemp())
@@ -2239,6 +2243,16 @@ class TestProjectRowsInSummary(unittest.TestCase):
         rows = g.build_summary({"A24_project_claude": {"dirs": 0, "note": "未指定项目目录"}})
         row = [r for r in rows if r[0] == "项目级 .claude 规模"][0]
         self.assertIs(row[1], g.S_NA)
+
+    def test_scanned_but_empty_is_a_pass_not_an_unknown(self):
+        # 范围扫完了、没有 .claude / 没有权限文件，是结论；标「没测到」会让
+        # 全新用户裸跑时永远留两个空行。
+        rows = g.build_summary({"A24_project_claude": {"dirs": 0, "roots": ["/tmp/proj"]},
+                                "A26_claude_settings": {"files": 0, "roots": ["/tmp/proj"]}})
+        for name in ("项目级 .claude 规模", "settings 失效权限"):
+            row = [r for r in rows if r[0] == name][0]
+            self.assertIs(row[1], g.S_OK, name)
+            self.assertIn("proj", row[2])
 
 
 class TestPlanCarriesStaleWorktrees(unittest.TestCase):
@@ -5095,6 +5109,20 @@ class TestIterationOneSafety(unittest.TestCase):
         unbound = {"checkedAt": g.now_stamp()}
         self.assertFalse(g.cache_is_fresh(stale)[0])
         self.assertFalse(g.cache_is_fresh(unbound)[0])
+
+    def test_a_fresh_user_gets_a_usable_cache_without_declaring_a_profile(self):
+        # 全新用户不会去设 CLAUDE_GUARD_BROWSER_PROFILE：没声明时按默认资料记，
+        # 否则跑一轮永远拿不到浏览器 Intl 的结论。
+        cache = {"intlLocale": "en-US", "checkedAt": g.now_stamp(),
+                 "profileScope": "default", "openedBy": "script"}
+        env = {"CLAUDE_GUARD_BROWSER_PROFILE": "", "CLAUDE_GUARD_BROWSER_PROFILE_DIR": ""}
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertTrue(g.cache_is_fresh(cache)[0])
+
+    def test_declaring_a_different_profile_still_invalidates_the_default_cache(self):
+        cache = {"intlLocale": "en-US", "checkedAt": g.now_stamp(), "profileScope": "default"}
+        with mock.patch.dict(os.environ, {"CLAUDE_GUARD_BROWSER_PROFILE": "work"}, clear=False):
+            self.assertFalse(g.cache_is_fresh(cache)[0])
 
     def test_browser_cache_requires_current_explicit_profile_identity(self):
         cache = {"intlLocale": "en-US", "checkedAt": g.now_stamp(), "profileScope": "profile-a"}

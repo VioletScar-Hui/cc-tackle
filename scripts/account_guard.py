@@ -102,6 +102,16 @@ def browser_profile_scope() -> str | None:
     return value or None
 
 
+def effective_browser_profile_scope() -> str:
+    """这次复核页实际归属的资料标识：声明优先，其次目录名，最后默认资料。
+
+    以前必须显式声明 `CLAUDE_GUARD_BROWSER_PROFILE`，否则缓存永远判「未绑定资料」，
+    全新用户照文档跑一轮也拿不到浏览器 Intl 的结论。脚本自己打开的页面本来就知道
+    用的哪个目录，所以按它推导一个标识；声明仍然有用——多资料时用它区分。
+    """
+    return browser_profile_scope() or browser_profile_dir() or "default"
+
+
 def browser_profile_dir() -> str | None:
     """要打开的那个 Chrome 资料目录，例如 `Profile 1`。
 
@@ -135,7 +145,8 @@ def open_verify_page(url: str, what: str) -> dict:
     if code != 0:
         return {"opened": False, "reason": (out or "").strip() or f"open 退出码 {code}",
                 "profileDir": prof}
-    where = browser_profile_scope() or "未声明资料"
+    where = browser_profile_scope() or (
+        f"{browser_profile_dir()}（未声明，按目录记）" if browser_profile_dir() else "默认资料")
     print(f"  已替你打开{what}（资料 {where}" + (f" / {prof}" if prof else "") + "）。", flush=True)
     return {"opened": True, "profileDir": prof}
 
@@ -3359,9 +3370,8 @@ def cache_is_fresh(data: dict, *, require_profile_scope: bool = True,
         scope = data.get("profileScope")
         if not isinstance(scope, str) or not scope.strip():
             return False, "未绑定浏览器资料范围"
-        expected = expected_profile_scope if expected_profile_scope is not None else browser_profile_scope()
-        if not expected:
-            return False, "未提供 CLAUDE_GUARD_BROWSER_PROFILE，不能确认资料身份"
+        expected = (expected_profile_scope if expected_profile_scope is not None
+                    else effective_browser_profile_scope())
         if scope != expected:
             return False, "缓存资料范围与当前指定的浏览器资料标识不一致"
     return True, ""
@@ -3462,11 +3472,7 @@ def verify_media_permission(timeout: int = 240, auto_open: bool = False) -> dict
     got["openedBy"] = "script" if opened.get("opened") else "user"
     if opened.get("profileDir"):
         got["openedProfileDir"] = opened["profileDir"]
-    scope = browser_profile_scope()
-    if scope:
-        got["profileScope"] = scope
-    else:
-        got.pop("profileScope", None)
+    got["profileScope"] = effective_browser_profile_scope()
     try:
         MEDIA_CACHE.parent.mkdir(parents=True, exist_ok=True)
         MEDIA_CACHE.write_text(json.dumps(got, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3932,7 +3938,8 @@ def check_browser_locale(ip: dict | None = None, expected: dict | None = None) -
     out["predicted"] = predict_intl_locale(chain[0] if chain else None)
 
     cached = load_browser_locale()
-    cache_ok, cache_note = cache_is_fresh(cached, expected_profile_scope=browser_profile_scope())
+    cache_ok, cache_note = cache_is_fresh(cached,
+                                          expected_profile_scope=effective_browser_profile_scope())
     if cached.get("intlLocale") and cache_ok:
         out["measured"] = cached["intlLocale"]
         out["checked_at"] = cached.get("checkedAt")
@@ -3945,7 +3952,9 @@ def check_browser_locale(ip: dict | None = None, expected: dict | None = None) -
         out["scope_unverified"] = not script_opened
         if script_opened:
             where = cached.get("openedProfileDir") or cached.get("profileScope") or "默认资料"
-            out["source"] = ("浏览器实测（脚本打开的复核页，资料 " + where + "）")
+            label = ("默认资料" if where == "default" and not browser_profile_scope()
+                     else where)
+            out["source"] = ("浏览器实测（脚本打开的复核页，资料 " + str(label) + "）")
         else:
             out["source"] = ("浏览器实测（用户声明资料：" + str(cached.get("profileScope") or "未声明")
                               + "；资料身份未由脚本验证）")
@@ -4116,11 +4125,7 @@ def verify_browser_locale(timeout: int = 240, auto_open: bool = False) -> dict:
     got["openedBy"] = "script" if opened.get("opened") else "user"
     if opened.get("profileDir"):
         got["openedProfileDir"] = opened["profileDir"]
-    scope = browser_profile_scope()
-    if scope:
-        got["profileScope"] = scope
-    else:
-        got.pop("profileScope", None)
+    got["profileScope"] = effective_browser_profile_scope()
     try:
         LOCALE_CACHE.parent.mkdir(parents=True, exist_ok=True)
         LOCALE_CACHE.write_text(json.dumps(got, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -4284,6 +4289,16 @@ def backend_dns_row(pb: dict):
     return (S_NA, f"{label}，配置里没有国内解析器"
                   + (f"（{limits}）" if limits else "")
                   + "。" + (facts.get("verify_hint") or "没有运行时证据，不能据此报绿"))
+
+
+def scan_scope_brief(roots) -> str:
+    """扫描范围的短标签：取末级目录名，别把长路径塞进 58 格宽的表格。"""
+    names = [pathlib.Path(str(r)).name or str(r) for r in (roots or [])]
+    if not names:
+        return "未指定范围"
+    if len(names) == 1:
+        return names[0]
+    return f"{names[0]} 等 {len(names)} 个目录"
 
 
 def build_summary(report: dict) -> list:
@@ -4471,10 +4486,19 @@ def build_summary(report: dict) -> list:
             add("WebRTC 泄漏", S_BAD, f"探测到公网地址：{wr['leaked_public']}")
             _webrtc_row_done = True
         elif mp.get("ok") and media_cache_ok and (tun or media_ips):
-            add("WebRTC 泄漏", S_NA,
-                f"授权后会露出 {tun[0] if tun else media_ips[0]}；缓存显示浏览器已禁掉"
-                f"摄像头/麦克风（复核于 {mp.get('checkedAt')}），但资料身份只有用户声明、"
-                f"未由脚本验证，不能据此报绿")
+            # 探测量的是「拿到媒体权限会怎样」。如果复核页（脚本自己打开的）显示
+            # 摄像头/麦克风都拿不到，那条暴露路径现在是不可达的，就该报通过；
+            # 只有「缓存是别人手工打开的」时才保留未确证。
+            exposed = tun[0] if tun else media_ips[0]
+            if mp.get("openedBy") == "script":
+                add("WebRTC 泄漏", S_OK,
+                    f"探测没拿到公网地址；{mp.get('checkedAt')} 由脚本打开的复核页显示摄像头与"
+                    f"麦克风都拿不到 → mDNS 混淆生效（一旦授权会露出 {exposed}，别给权限）")
+            else:
+                add("WebRTC 泄漏", S_NA,
+                    f"授权后会露出 {exposed}；缓存显示已禁掉摄像头/麦克风"
+                    f"（复核于 {mp.get('checkedAt')}），但那份复核页不是脚本打开的，"
+                    f"不能据此报绿")
             _webrtc_row_done = True
         else:
             _webrtc_row_done = False
@@ -4609,7 +4633,8 @@ def build_summary(report: dict) -> list:
             add("代码是否落在本地 Git", S_FIX,
                 f"扫到的目录里一个 git 仓库都没有，{len(lg.get('no_git') or [])} 个目录没做版本控制")
         else:
-            detail = f"{len(repos)} 个仓库在做版本控制"
+            detail = (f"扫描 {scan_scope_brief(lg.get('roots'))}："
+                      f"{len(repos)} 个仓库在做版本控制")
             if dirty:
                 detail += f"，其中 {len(dirty)} 个有未提交改动"
             add("代码是否落在本地 Git", S_OK, detail)
@@ -4648,7 +4673,9 @@ def build_summary(report: dict) -> list:
     if missing("A24_project_claude") or pc.get("note"):
         add("项目级 .claude 规模", S_NA, pc.get("note") or "未检测")
     elif not pc.get("dirs"):
-        add("项目级 .claude 规模", S_NA, "扫到的项目里没有 .claude 目录")
+        # 扫完了、确实没有：这是结论，不是「没测到」。
+        add("项目级 .claude 规模", S_OK,
+            f"扫描 {scan_scope_brief(pc.get('roots'))}，没有项目级 .claude 目录")
     else:
         wt_pct = pc["worktrees_bytes"] / max(pc["total_bytes"], 1) * 100
         detail = (f"{pc['dirs']} 个目录 {pc['total_bytes'] / 2 ** 30:.1f} GB，"
@@ -4686,7 +4713,8 @@ def build_summary(report: dict) -> list:
     if missing("A26_claude_settings"):
         add("settings 失效权限", S_NA, "未检测")
     elif not cs.get("files"):
-        add("settings 失效权限", S_NA, "扫到的项目里没有带权限的 settings")
+        add("settings 失效权限", S_OK,
+            f"扫描 {scan_scope_brief(cs.get('roots'))}，没有带权限的 settings 文件")
     else:
         dead, risky = len(cs.get("dead") or []), len(cs.get("risky") or [])
         detail = f"{cs['files']} 个文件共 {cs['total']} 条授权"
@@ -5049,15 +5077,16 @@ def check_local_git() -> dict:
     目录不猜，用 CLAUDE_GUARD_PROJECT_ROOTS 指定，冒号分隔；不设就跳过并说明怎么开。
     """
     out = {"roots": [], "repos": [], "no_git": [], "dirty": [], "note": ""}
-    roots = [p for p in (os.environ.get("CLAUDE_GUARD_PROJECT_ROOTS") or "").split(":") if p.strip()]
+    # 和环境变量之外的兜底保持一致：没指定就扫 skill 所在的 git 仓（project_roots 的
+    # 三级兜底）。只认环境变量的话，全新用户裸跑这一项永远是「未测到」。
+    roots = project_roots()
     if not roots:
         out["note"] = (
             "未指定项目目录，这一项跳过。用 "
             "CLAUDE_GUARD_PROJECT_ROOTS=\"$HOME/code\" 指定（冒号分隔可写多个）"
         )
         return out
-    for raw in roots:
-        root = pathlib.Path(raw).expanduser()
+    for root in roots:
         if not root.is_dir():
             out["note"] = f"目录不存在：{root}"
             continue
