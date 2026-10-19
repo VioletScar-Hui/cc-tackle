@@ -190,7 +190,7 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 | Claude Code | `settings.json` 端点与凭据、遥测开关、第三方客户端、CLI 签名完整性、CLI 登录凭据 |
 | 环境卫生 | 项目级 `.claude`、失效权限、过期工作树登记、可回收系统体积 |
 
-浏览器缓存型结果要同时满足三件事才出结论：不超过 24 小时、`profileScope` 与显式设置的 `CLAUDE_GUARD_BROWSER_PROFILE` 一致、以及缓存里的 `openedBy` 是 `script`（复核页由脚本自己拉起，而不是别人手工打开）。这个资料名由用户声明，脚本能证明的是「哪个资料打开了这个页面」，不能独立证明它就是你的日常账号，所以页面上会把依据写成「浏览器实测（脚本打开的复核页，资料 Profile 1）」而不是一句「通过」。
+浏览器缓存型结果要同时满足三件事才出结论：不超过 24 小时、`profileScope` 与这次复核页实际打开的资料一致、以及缓存里的 `openedBy` 是 `script`（复核页由脚本自己拉起，而不是别人手工打开）。资料范围默认按实际打开的那个资料记（没声明就是 Chrome 默认资料），所以你照文档跑一轮就能拿到结论；多资料时再用 `CLAUDE_GUARD_BROWSER_PROFILE` 把它钉到某个名字上。脚本能证明的是「哪个资料打开了这个页面」，不能独立证明它就是你的日常账号，所以页面上会把依据写成「浏览器实测（脚本打开的复核页，资料 Profile 1）」而不是一句「通过」。
 
 状态表会区分：
 
@@ -249,8 +249,8 @@ claude setup-token        # 按提示完成这一次认证，拿到长期有效�
 
 ```bash
 export CLAUDE_GUARD_PROJECT_ROOTS="$HOME/code:$HOME/work"
-export CLAUDE_GUARD_BROWSER_PROFILE="my-claude-profile"      # 你给这个资料起的名字（写进缓存做范围校验）
-export CLAUDE_GUARD_BROWSER_PROFILE_DIR="Profile 1"          # 复核页开在哪个 Chrome 目录里
+export CLAUDE_GUARD_BROWSER_PROFILE="my-claude-profile"      # 可选：多资料时给「日常用 Claude 的那个」起个名字
+export CLAUDE_GUARD_BROWSER_PROFILE_DIR="Profile 1"          # 可选：复核页开在哪个 Chrome 目录；不设就是默认资料
 export CLAUDE_GUARD_EXPECTED_COUNTRY="US"           # 你声明这条线路应该落在哪一国
 export CLAUDE_GUARD_EXPECTED_EXIT_IP="203.0.113.10" # 可选：把出口 IP 也一起钉死
 ```

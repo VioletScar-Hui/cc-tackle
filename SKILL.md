@@ -300,7 +300,7 @@ python3 -m unittest discover -s tests -v
 ## 浏览器 Intl 区域设置
 
 `Intl.DateTimeFormat().resolvedOptions().locale`，ippure 权重 10，只认大陆简体。见 mapping A27。
-浏览器媒体权限与 Intl 缓存必须同时满足 24 小时 freshness 和资料范围匹配：运行复核前显式设置 `CLAUDE_GUARD_BROWSER_PROFILE`（例如 `work-chrome-profile`），缓存中的 `profileScope` 必须与当前环境值完全一致；未设置或切换资料后都按未测处理。脚本无法从本地复核页自行识别 Chrome 资料路径，不会写入伪造的资料标签。
+浏览器媒体权限与 Intl 缓存必须同时满足 24 小时 freshness 和资料范围匹配：缓存里的 `profileScope` 要和这次复核页实际打开的资料一致。范围默认取 `CLAUDE_GUARD_BROWSER_PROFILE`，没设就取 `CLAUDE_GUARD_BROWSER_PROFILE_DIR`，两者都没有就记 `default`（Chrome 默认资料）——这样全新用户照文档跑一轮也能拿到结论。多资料或切换资料后，显式设一个名字把它钉住；对不上就按未测处理。脚本无法从本地复核页自行识别 Chrome 资料路径，只会记下自己实际用的那个目录，不会伪造资料标签。
 决定这两项能不能算证据的是缓存里的 `openedBy`：`--verify-browser`（以及 `--check-media` / `--check-locale`）由脚本自己拉起 `CLAUDE_GUARD_BROWSER_PROFILE_DIR` 指定的 Chrome 资料去开复核页，回传记 `openedBy=script`，这两项才出结论；页面是别人手工打开、脚本只等回传时记 `openedBy=user`，即使 `profileScope` 对上、时效也在，仍按未确证处理。脚本能证明的是「哪个资料打开了这个页面」，不是「这个资料就是你的日常账号」，所以页面上写的是「浏览器实测（脚本打开的复核页，资料 Profile 1）」，把依据一并摊开。
 `--audit` 不能和 `--check-media`、`--check-locale` 同时使用（那两项会写缓存、要和体检分开跑）；要用一次跑完就走 `--audit --verify-browser`。
 
