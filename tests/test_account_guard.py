@@ -146,8 +146,11 @@ class TestClassifyAsn(unittest.TestCase):
 class TestPromptHelpers(unittest.TestCase):
     """沿用 claude-cleanup 的 [y/N] 与选项编号约定。"""
 
-    def test_ask_yes_only_accepts_y(self):
-        for raw, want in (("y", True), ("Y", True), ("yes", False), ("", False), ("n", False)):
+    def test_ask_yes_accepts_the_obvious_yes(self):
+        # 提示写的是 [y/N] / [Y/n]，那 "yes" 就是正常回答：静默把它当成「否」
+        # 会让用户以为同意了，实际什么都没做。空回车才走默认值。
+        for raw, want in (("y", True), ("Y", True), ("yes", True), ("YES", True),
+                          ("", False), ("n", False), ("no", False)):
             with mock.patch("builtins.input", return_value=raw):
                 self.assertIs(g.ask_yes("q"), want, raw)
 
@@ -454,6 +457,19 @@ class TestAutoClean(unittest.TestCase):
     def test_rc_noop_when_nothing_matched(self):
         (self.tmp / ".zshrc").write_text("export EDITOR=vim\n", encoding="utf-8")
         self.assertEqual(g.clear_rc_proxy_lines({".zshrc": []}), [])
+
+    def test_rc_recheck_catches_a_proxy_line_added_after_the_audit(self):
+        # 审计之后文件里多出一行代理：它不在计划里，删完必须复验发现，
+        # 而不是报告「已清干净」。
+        rc = self.tmp / ".zshrc"
+        rc.write_text(
+            "export HTTPS_PROXY=http://127.0.0.1:7000\n"
+            "export EDITOR=vim\n"
+            "export HTTP_PROXY=http://127.0.0.1:7897\n",
+            encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "仍有代理行"):
+            g.clear_rc_proxy_lines({".zshrc": [{
+                "line": 3, "text": "export HTTP_PROXY=http://127.0.0.1:7897"}]})
 
     def test_rc_refuses_inserted_or_changed_line(self):
         rc = self.tmp / ".zshrc"
@@ -5603,18 +5619,28 @@ class TestHtmlReport(unittest.TestCase):
         self.assertNotIn("<img src=x", h)
         self.assertIn("&lt;img src=x", h)
 
-    def test_score_leaves_unmeasured_out_of_the_denominator(self):
+    def test_unmeasured_counts_as_zero_points(self):
+        # 两个通过 + 一个没测到：分母仍是 27 项，所以是 2/27，
+        # 而不是把已测到的两项折算成 100——「没测到」就是没拿到分。
         sc = rh._score([("a", g.S_OK, ""), ("b", g.S_NA, ""), ("c", g.S_OK, "")])
-        self.assertEqual(sc["score"], 100)
+        self.assertEqual(sc["score"], round(100 * 2 / rh.BASE_ITEMS))
         self.assertEqual(sc["counts"]["na"], 1)
 
     def test_attention_items_count_as_half(self):
-        self.assertEqual(rh._score([("a", g.S_OK, ""), ("b", g.S_FIX, "")])["score"], 75)
-        self.assertEqual(rh._score([("a", g.S_OK, ""), ("b", g.S_BAD, "")])["score"], 50)
+        self.assertEqual(rh._score([("a", g.S_OK, ""), ("b", g.S_FIX, "")])["score"],
+                         round(100 * 1.5 / rh.BASE_ITEMS))
+        self.assertEqual(rh._score([("a", g.S_OK, ""), ("b", g.S_BAD, "")])["score"],
+                         round(100 / rh.BASE_ITEMS))
 
-    def test_all_unmeasured_has_no_score(self):
+    def test_a_duplicated_row_cannot_offset_a_failure(self):
+        rows = [("a", g.S_OK, ""), ("b", g.S_OK, ""), ("c", g.S_BAD, ""), ("a", g.S_OK, "")]
+        # a 重复一次不能把 c 的失败抵掉：27 项里只有 2 项通过就是 2/27。
+        self.assertEqual(rh._score(rows)["score"], round(100 * 2 / rh.BASE_ITEMS))
+
+    def test_all_unmeasured_scores_zero(self):
         sc = rh._score([("a", g.S_NA, "")])
-        self.assertIsNone(sc["score"])
+        self.assertEqual(sc["score"], 0)
+        self.assertEqual(sc["grade"], "F")
 
     def test_base_is_27_items_worth_100(self):
         """加分制：27 个基础项合计 100 分，登录方式不算在里面。"""
@@ -5631,29 +5657,37 @@ class TestHtmlReport(unittest.TestCase):
         self.assertEqual(len(names), rh.BASE_ITEMS + 1)
         self.assertEqual(names.count(rh.BONUS_ROW), 1)
 
+    def _full_base(self, over: str | None = None):
+        """27 项基础分全过的底稿；给 over 时把第一项替换成那个状态。"""
+        rows = [(f"r{i}", g.S_OK, "") for i in range(rh.BASE_ITEMS)]
+        if over:
+            rows[0] = ("r0", over, "")
+        return rows
+
     def test_bonus_row_is_scored_on_top_of_the_base(self):
-        rows = [("a", g.S_OK, ""), ("b", g.S_OK, ""), (rh.BONUS_ROW, g.S_OK, "")]
+        rows = self._full_base() + [(rh.BONUS_ROW, g.S_OK, "")]
         sc = rh._score(rows)
-        self.assertEqual(sc["score"], 100)                 # 基础项全过
+        self.assertEqual(sc["score"], 100)                 # 27 项基础分全过
         self.assertEqual(sc["bonus"], rh.BONUS_POINTS)
         self.assertEqual(sc["total"], 100 + rh.BONUS_POINTS)
         self.assertEqual(sc["grade"], "A+")
 
     def test_bonus_row_stays_out_of_the_base_denominator(self):
-        # 登录方式若被算进基础分母，这一组会得 50 而不是 100
-        self.assertEqual(rh._score([("a", g.S_OK, ""), (rh.BONUS_ROW, g.S_OK, "")])["score"], 100)
+        # 登录方式若被算进那 27 项，这里会变成 26/27 而不是 100
+        rows = self._full_base() + [(rh.BONUS_ROW, g.S_OK, "")]
+        self.assertEqual(rh._score(rows)["score"], 100)
 
     def test_bonus_row_earns_nothing_unless_it_passes(self):
         for status in (g.S_FIX, g.S_BAD, g.S_NA):
-            sc = rh._score([("a", g.S_OK, ""), (rh.BONUS_ROW, status, "")])
+            sc = rh._score(self._full_base() + [(rh.BONUS_ROW, status, "")])
             self.assertEqual(sc["bonus"], 0, status)
             self.assertEqual(sc["total"], 100, status)
 
     def test_base_and_bonus_add_up_to_the_total(self):
-        sc = rh._score([("a", g.S_OK, ""), ("b", g.S_FIX, ""), (rh.BONUS_ROW, g.S_OK, "")])
-        self.assertEqual(sc["score"], 75)
+        sc = rh._score(self._full_base(over=g.S_FIX) + [(rh.BONUS_ROW, g.S_OK, "")])
+        self.assertEqual(sc["score"], 98)      # 26 满 + 1 半 = 26.5 / 27
         self.assertEqual(sc["bonus"], rh.BONUS_POINTS)
-        self.assertEqual(sc["total"], 75 + rh.BONUS_POINTS)
+        self.assertEqual(sc["total"], 98 + rh.BONUS_POINTS)
 
     def test_page_shows_the_bonus_note_and_the_new_max(self):
         rows = [("出口 IP 与归属", g.S_OK, ""), (rh.BONUS_ROW, g.S_OK, "")]
@@ -7414,6 +7448,218 @@ class TestCliLogin(unittest.TestCase):
         flat = " ".join(" ".join(steps) for _, _, steps, _ in groups[target[0]])
         self.assertIn("claude setup-token", flat)
         self.assertIn(g.CLI_LOGIN_TOKEN_ENV, flat)
+
+
+class TestFixAuto(unittest.TestCase):
+    """--fix-auto：体检之后当场修四类残留，动手前确认一次，收尾必须给 HTML。
+
+    这一组守的是「一轮跑完」的边界：没有 --yes 就不许在管道里改东西；
+    有 --yes 也必须先备份；不管修没修、取没取消，页面都得给出来。
+    """
+
+    EMPTY_PLAN = {
+        "summary": [], "proxy_residue": [], "rc_files": {}, "npm_git": [],
+        "settings_base_url": False, "settings_env_proxy": [], "clash_dns": False,
+        "browser_locale": False, "storage_bytes": 0, "dead_permissions": 0,
+        "stale_worktrees": [], "project_junk": False, "other_proxy_dns": {},
+        "npmrc": [], "brew_proxy": [],
+    }
+
+    def _plan(self, **over):
+        plan = dict(self.EMPTY_PLAN)
+        plan.update(over)
+        return plan
+
+    def test_yes_without_fix_auto_is_refused(self):
+        self.assertEqual(g.main(["--yes"]), 2, "--yes 只能配合 --fix-auto")
+
+    def test_fix_auto_refuses_json(self):
+        self.assertEqual(g.main(["--fix-auto", "--json"]), 2,
+                         "--fix-auto 会写状态，不能混进纯 JSON 输出")
+
+    def test_fix_auto_without_yes_needs_a_real_tty(self):
+        written = []
+        with mock.patch.object(g, "audit", return_value={}), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "print_summary_table"), \
+             mock.patch.object(g, "auto_clean_plan",
+                               return_value=self._plan(proxy_residue=[{"service": "Wi-Fi"}])), \
+             mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=False), \
+             mock.patch("report_html.write_report",
+                        side_effect=lambda *a, **k: written.append(k) or pathlib.Path("/tmp/r.html")):
+            self.assertEqual(g.main(["--fix-auto"]), 2)
+        self.assertEqual(written, [], "被拒绝时不该顺手出页面")
+
+    def test_nothing_to_fix_still_hands_over_a_page(self):
+        written = []
+        with mock.patch.object(g, "audit", return_value={}), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "print_summary_table"), \
+             mock.patch.object(g, "auto_clean_plan", return_value=self._plan()), \
+             mock.patch.object(g, "create_backup") as backup, \
+             mock.patch("report_html.write_report",
+                        side_effect=lambda *a, **k: written.append(k) or pathlib.Path("/tmp/r.html")):
+            self.assertEqual(g.main(["--fix-auto", "--yes"]), 0)
+        backup.assert_not_called()
+        self.assertEqual(len(written), 1, "没有可修项也要给一份只有体检结果的页面")
+
+    def test_cancel_at_the_inline_confirm_keeps_the_machine_untouched(self):
+        written = []
+        report = {"scope_manifest": {}}
+        with mock.patch.object(g, "audit", return_value=report), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "print_summary_table"), \
+             mock.patch.object(g, "auto_clean_plan",
+                               return_value=self._plan(proxy_residue=[{"service": "Wi-Fi"}])), \
+             mock.patch.object(g, "create_backup") as backup, \
+             mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=True), \
+             mock.patch("builtins.input", return_value="n"), \
+             mock.patch("report_html.write_report",
+                        side_effect=lambda *a, **k: written.append(k) or pathlib.Path("/tmp/r.html")):
+            self.assertEqual(g.main(["--fix-auto"]), 1)
+        backup.assert_not_called()
+        self.assertEqual(len(written), 1, "取消时也要把改动前那份页面给出来")
+
+    def test_preflight_asks_before_the_audit_and_only_once(self):
+        args = mock.Mock(verify_browser=False, webrtc=False, expected_country=None,
+                         expected_exit_ip=None, json=False)
+        with mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=True), \
+             mock.patch("builtins.input", side_effect=["", "", "n"]):
+            g.run_preflight(args)
+        self.assertTrue(args.verify_browser, "空的默认回答应当按「要测」处理")
+        self.assertTrue(args.webrtc, "WebRTC 探测也要在体检之前问，否则这一项必然未测到")
+
+    def test_preflight_stays_out_of_the_way_without_a_tty(self):
+        args = mock.Mock(verify_browser=False, webrtc=False, expected_country=None,
+                         expected_exit_ip=None, json=False)
+        stderr = io.StringIO()
+        with mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=False), \
+             mock.patch("builtins.input") as ask, \
+             contextlib.redirect_stderr(stderr):
+            g.run_preflight(args)
+        ask.assert_not_called()
+        self.assertFalse(args.verify_browser)
+        self.assertIn("--verify-browser", stderr.getvalue())
+
+
+class TestShellResidueMatcher(unittest.TestCase):
+    """shell 配置里只删「代理/端点赋值」，不碰别名和路径配置。
+
+    2026-10-19 独立复测发现：旧实现按 `proxy|ANTHROPIC|CLAUDE` 匹配整行，
+    `.zshrc` 里的 `alias claude=...` 与 `CLAUDE_CONFIG_DIR` 会被当代理行删掉。
+    """
+
+    def test_proxy_and_endpoint_assignments_are_residue(self):
+        for line in ("export HTTPS_PROXY=http://127.0.0.1:7897",
+                     "https_proxy=http://127.0.0.1:7897",
+                     "export ALL_PROXY=socks5://127.0.0.1:7897",
+                     "export NO_PROXY=localhost,127.0.0.1",
+                     "declare -x ANTHROPIC_BASE_URL=https://relay.example.com",
+                     "export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-xxx"):
+            self.assertTrue(g.shell_line_is_residue(line), line)
+
+    def test_claude_alias_and_path_config_are_not_residue(self):
+        for line in ("alias claude='claude --verbose'",
+                     'export CLAUDE_CONFIG_DIR="$HOME/.claude-alt"',
+                     "export ANTHROPIC_MODEL=claude-opus-4",
+                     "# export HTTPS_PROXY=http://127.0.0.1:7897",
+                     "export PATH=$PATH:$HOME/.local/bin"):
+            self.assertFalse(g.shell_line_is_residue(line), line)
+
+    def test_the_scan_uses_this_matcher(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-rc-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        home = g.HOME
+        g.HOME = tmp
+        self.addCleanup(lambda: setattr(g, "HOME", home))
+        (tmp / ".zshrc").write_text(
+            "alias claude='claude --verbose'\n"
+            "export CLAUDE_CONFIG_DIR=$HOME/.alt\n"
+            "export HTTPS_PROXY=http://127.0.0.1:7897\n", encoding="utf-8")
+        with mock.patch.object(g, "run", return_value=(1, "")):
+            out = g.check_terminal_env()
+        hits = out["rc_files"][".zshrc"]
+        self.assertEqual([h["line"] for h in hits], [3], "只有第 3 行是代理行")
+
+
+class TestFixAutoSafety(unittest.TestCase):
+    """--fix-auto 的备份/日志边界：改之前先记，失败也能看出改过。"""
+
+    PLAN = {"summary": [], "proxy_residue": [], "rc_files": {}, "npm_git": [],
+            "settings_base_url": False, "settings_env_proxy": [], "clash_dns": False,
+            "browser_locale": False, "storage_bytes": 0, "dead_permissions": 0,
+            "stale_worktrees": [], "project_junk": False, "other_proxy_dns": {},
+            "npmrc": [], "brew_proxy": []}
+
+    def _run(self, plan, backup=None, mark=None, page=None):
+        backup_mock = backup or mock.Mock(return_value=pathlib.Path("/tmp/bk"))
+        mark_mock = mark or mock.Mock()
+        page_mock = page or mock.Mock(return_value=pathlib.Path("/tmp/r.html"))
+        with mock.patch.object(g, "audit", return_value={"scope_manifest": {}}), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "print_summary_table"), \
+             mock.patch.object(g, "auto_clean_plan", return_value=plan), \
+             mock.patch.object(g, "create_backup", backup_mock), \
+             mock.patch.object(g, "_refresh_backup_manifest"), \
+             mock.patch.object(g, "_mark_backup_in_progress", mark_mock), \
+             mock.patch.object(g, "backup_paths_for_plan", return_value=([], [])), \
+             mock.patch.object(g, "acquire_run_lock", return_value=(True, "locked")), \
+             mock.patch.object(g, "release_run_lock"), \
+             mock.patch.object(g, "print_before_after"), \
+             mock.patch.object(g, "write_html_twin", page_mock):
+            return g.main(["--fix-auto", "--yes"])
+
+    def test_the_mutation_is_journalled_before_it_runs(self):
+        plan = dict(self.PLAN, rc_files={".zshrc": [{"line": 1, "text": "x"}]})
+        mark = mock.Mock()
+        with mock.patch.object(g, "clear_rc_proxy_lines", return_value=[".zshrc"]):
+            self.assertEqual(self._run(plan, mark=mark), 0)
+        mark.assert_called_with(mock.ANY, "shell-rc")
+
+    def test_under_claude_defers_the_settings_write(self):
+        # 在 Claude Code 里跑时不能改它正在用的 settings.json：跳过这一项，
+        # 但页面照出、其余项照修。
+        plan = dict(self.PLAN, settings_base_url=True)
+        args = mock.Mock(yes=True, expected_country=None, expected_exit_ip=None)
+        with mock.patch.object(g, "auto_clean_plan", return_value=plan), \
+             mock.patch.object(g, "write_html_only") as page, \
+             mock.patch.object(g, "clear_anthropic_base_url") as clear:
+            self.assertEqual(g.run_fix_auto({"scope_manifest": {}}, args, under_claude=True), 0)
+        clear.assert_not_called()
+        page.assert_called_once()
+
+    def test_a_failed_report_is_not_reported_as_success(self):
+        # 收尾页面是这条流程的交付物：没写成还返回 0，调用方会以为拿到了报告。
+        plan = dict(self.PLAN, rc_files={".zshrc": [{"line": 1, "text": "x"}]})
+        with mock.patch.object(g, "clear_rc_proxy_lines", return_value=[".zshrc"]):
+            self.assertEqual(self._run(plan, page=mock.Mock(return_value=None)), 2)
+
+    def test_proxy_residue_is_recorded_as_a_manual_boundary(self):
+        plan = dict(self.PLAN, proxy_residue=[{"service": "Wi-Fi", "kind": "webproxy",
+                                              "server": "127.0.0.1", "port": "7897"}])
+        backup = mock.Mock(return_value=pathlib.Path("/tmp/bk"))
+        with mock.patch.object(g, "clear_proxy_residue", return_value=1):
+            self.assertEqual(self._run(plan, backup=backup), 0)
+        boundaries = backup.call_args.kwargs.get("manual_boundaries") or []
+        self.assertTrue(any("系统代理" in b for b in boundaries), boundaries)
+
+
+class TestHtmlHonesty(unittest.TestCase):
+    """页面不能一边给 0 分一边说「全部通过」；上下文备注要印在页面上。"""
+
+    def test_all_unmeasured_never_claims_everything_passed(self):
+        rows = [(f"r{i}", g.S_NA, "") for i in range(rh.BASE_ITEMS)]
+        with mock.patch.object(g, "build_summary", return_value=rows):
+            page = rh.render({"timestamp": "2026-01-01 00:00:00"})
+        self.assertNotIn("项全部通过", page, "0 分和「全部通过」不能同时出现")
+        self.assertIn("没测到", page)
+
+    def test_the_note_is_printed_on_the_page(self):
+        rows = [("a", g.S_OK, "")] * rh.BASE_ITEMS
+        with mock.patch.object(g, "build_summary", return_value=rows):
+            page = rh.render({"timestamp": "2026-01-01 00:00:00"},
+                             note="已取消，这是改动前的状态")
+        self.assertIn("已取消，这是改动前的状态", page)
 
 
 if __name__ == "__main__":
