@@ -4067,12 +4067,21 @@ class TestProxyRowsInSummary(unittest.TestCase):
         self.assertIs(row[1], g.S_FIX)
         self.assertIn("~/.npmrc 1 行", row[2])
 
-    def test_brew_proxy_turns_the_row_into_a_fix(self):
+    def test_brew_proxy_is_environment_not_residue(self):
+        # brew config 里的代理来自环境变量，不是 Claude 的配置：只报告，不算残留。
         r = self._report(self._te(brew={"installed": True,
                                         "proxy": ["http_proxy=http://127.0.0.1:9"]}))
         row = self._row(g.build_summary(r), "终端 / shell / npm / git 代理")
-        self.assertIs(row[1], g.S_FIX)
-        self.assertIn("Homebrew 1 项", row[2])
+        self.assertIs(row[1], g.S_OK)
+        self.assertIn("brew config", row[2])
+
+    def test_environment_only_proxy_is_a_pass_with_a_note(self):
+        # 典型场景：Claude 从带代理的终端启动。配置里一条都没有，就该算干净。
+        r = self._report(self._te(env_hits=["HTTPS_PROXY=http://127.0.0.1:7897"]))
+        row = self._row(g.build_summary(r), "终端 / shell / npm / git 代理")
+        self.assertIs(row[1], g.S_OK)
+        self.assertIn("环境变量", row[2])
+        self.assertIn("Claude 自己的配置里没有代理", row[2])
 
     def test_settings_proxy_turns_the_settings_row_into_a_fix(self):
         r = self._report(self._te(settings_proxy=["HTTPS_PROXY"]))
@@ -7565,10 +7574,23 @@ class TestFixAuto(unittest.TestCase):
         args = mock.Mock(verify_browser=False, webrtc=False, expected_country=None,
                          expected_exit_ip=None, json=False)
         with mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=True), \
-             mock.patch("builtins.input", side_effect=["", "", "n"]):
+             mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("builtins.input", side_effect=["", "", "", "n"]):
             g.run_preflight(args)
         self.assertTrue(args.verify_browser, "空的默认回答应当按「要测」处理")
         self.assertTrue(args.webrtc, "WebRTC 探测也要在体检之前问，否则这一项必然未测到")
+
+    def test_preflight_records_the_profile_answer_up_front(self):
+        # 资料名提前问、写进环境变量：复核缓存与后续判定用的是同一份声明。
+        args = mock.Mock(verify_browser=False, webrtc=False, expected_country=None,
+                         expected_exit_ip=None, json=False)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_GUARD_")}
+        with mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=True), \
+             mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch("builtins.input", side_effect=["", "", "Profile 1", "n"]):
+            g.run_preflight(args)
+            self.assertEqual(os.environ.get(g.BROWSER_PROFILE_DIR_ENV), "Profile 1")
+            self.assertEqual(os.environ.get(g.BROWSER_PROFILE_ENV), "Profile 1")
 
     def test_preflight_stays_out_of_the_way_without_a_tty(self):
         args = mock.Mock(verify_browser=False, webrtc=False, expected_country=None,
