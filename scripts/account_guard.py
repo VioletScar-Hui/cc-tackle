@@ -707,7 +707,7 @@ def clash_config() -> pathlib.Path:
     return clash_dir() / "clash-verge.yaml"
 
 # ───────────────────────── 代理后端识别 ─────────────────────────
-# 2026-10-15 补。体检里原有 87 行是 Clash 专有的：26 项里「绝不直连」与「DNS 泄漏」
+# 2026-10-15 补。体检里原有 87 行是 Clash 专有的：28 项里「绝不直连」与「DNS 泄漏」
 # 直接读 mihomo 的 socket 与 clash-verge.yaml。用别的代理软件的人打开报告只会看到
 # 两行「未测到」，分不清是「脚本不认识你这家」还是「网络真有问题」。
 #
@@ -2232,8 +2232,7 @@ def check_proxy_residue() -> dict:
 # 代理行整行删掉——确认清单写的是「代理行」，删的却是用户的别名和路径配置。
 SHELL_RESIDUE_VAR = re.compile(
     r"^(?:[A-Za-z0-9_]*PROXY"
-    r"|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY"
-    r"|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_API_KEY)$", re.I)
+    r"|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY)$", re.I)
 SHELL_ASSIGN = re.compile(
     r"^(?:export\s+|declare\s+-x\s+|typeset\s+-x\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 
@@ -2244,6 +2243,8 @@ def shell_line_is_residue(line: str) -> bool:
     只认「赋值」这一种写法：`export HTTPS_PROXY=...`、`HTTPS_PROXY=...`、
     `declare -x ANTHROPIC_BASE_URL=...`。别名、路径、模型这些不动——它们含
     claude/anthropic 字样但不是代理也不是端点。注释行一律不动。
+    `CLAUDE_CODE_OAUTH_TOKEN` 是官方长期凭据，不匹配（它含 auth_token 子串，
+    早先的宽匹配会把它当残留删掉）。
     """
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
@@ -6767,6 +6768,10 @@ def clear_npm_git_proxy() -> list[str]:
     return done
 
 
+SETTINGS_RESIDUE_KEY = re.compile(
+    r"^(?:ANTHROPIC|CLAUDE|CLAUDE_CODE)_(?:BASE_URL|AUTH_TOKEN|API_KEY)$", re.I)
+
+
 def clear_anthropic_base_url() -> str:
     """A2 删掉 Claude Code settings.json 里指向别处的端点、凭据与代理变量。
 
@@ -6776,14 +6781,16 @@ def clear_anthropic_base_url() -> str:
     代理键按名字里有没有 proxy 判 —— 三类一起覆盖，别漏了 proxy 那一类。
     并成一趟写，避免两次写同一个文件互相覆盖。
     ~/.codex 与 ~/.dsh 属于别的工具，只报告不代改 —— 本 skill 的范围是 Claude Code。
+    CLAUDE_CODE_OAUTH_TOKEN 是官方长期凭据（claude setup-token 的产物），不在清理范围；
+    只认 `*_BASE_URL`、`*_AUTH_TOKEN`、`*_API_KEY` 这三种整名。
     """
     data = read_json(SETTINGS, {})
     env = dict(data.get("env", {}) or {})
     removed = [
         k for k in env
-        if (k.startswith(("ANTHROPIC_", "CLAUDE_"))
-            and re.search(r"base_url|auth_token|api_key", k, re.I))
-        or "proxy" in k.lower()
+        # 整名匹配：以前用 re.search("auth_token") 会把 CLAUDE_CODE_OAUTH_TOKEN
+        # 一起删掉，而它正是文档让用户放长期 token 的地方。
+        if SETTINGS_RESIDUE_KEY.match(k) or "proxy" in k.lower()
     ]
     if not removed:
         return "Claude Code 的 settings.json 里没有需要清掉的端点或代理变量"
@@ -7880,8 +7887,9 @@ def auto_clean_plan(report: dict) -> dict:
     if npm_git:
         summary.append("npm / git 全局代理：" + "、".join(npm_git))
     if npmrc:
-        # 只报告：.npmrc 没进备份清单，脚本不代改别人的配置文件。
-        summary.append(f"~/.npmrc 里 {len(npmrc)} 行代理配置（只报告，脚本不代改）")
+        # npm config delete 会连 ~/.npmrc 里那几行一起删（文件本身在备份清单里），
+        # 所以不能写「不代改」——用户会以为那个文件不会被碰。
+        summary.append(f"~/.npmrc 里 {len(npmrc)} 行代理配置（会随 npm config 一起删，已备份）")
     if brew_proxy:
         summary.append(
             "Homebrew 报出代理 " + "、".join(brew_proxy)

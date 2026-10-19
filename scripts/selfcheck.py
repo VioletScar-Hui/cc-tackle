@@ -4,7 +4,7 @@
 把散在 SKILL.md 和桌面指令文档各节的复核命令串成一条。检查七件事：技能文件
 齐全 → 语法编译 → 全部单元测试 → 三个守护脚本 → Clash 内核状态 → 系统代理四
 开关 → 完整环境体检，跑完出两张表：先一张七项自检的结论表，再把最后那项
-「完整环境体检」的 26 项逐条展开（明细取自体检自己输出的 JSON，判定不在
+「完整环境体检」的 28 项逐条展开（明细取自体检自己输出的 JSON，判定不在
 这里重写一遍，免得两处各说各话）。
 
 用法：
@@ -268,8 +268,10 @@ def check_audit(project_roots: str = "", browser: bool = True):
         env.pop("CLAUDE_GUARD_PROJECT_ROOTS", None)
     cmd = [sys.executable, str(HERE / "account_guard.py"), "--audit", "--json"]
     if browser:
-        # 让脚本自己弹出浏览器复核页：不弹的话「浏览器 Intl」「WebRTC」两项必然没结论。
+        # 让脚本自己弹出浏览器复核页并做一次 WebRTC 探测：不跑的话
+        # 「浏览器 Intl」和「WebRTC 泄漏」两项必然没结论，自检就白称「测全」。
         cmd.append("--verify-browser")
+        cmd.append("--webrtc")
     code, out, err = sh_split(cmd, timeout=900, cwd=SKILL, env=env)
     try:
         report = json.loads(out)
