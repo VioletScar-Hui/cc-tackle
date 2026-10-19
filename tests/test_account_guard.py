@@ -3982,6 +3982,17 @@ class TestSettingsEnvProxyCleanup(unittest.TestCase):
         self.assertIn("HTTP_PROXY", msg)
         self.assertEqual(self._after()["env"], {"KEEP": "1"})
 
+    def test_long_lived_oauth_token_is_never_removed(self):
+        # CLAUDE_CODE_OAUTH_TOKEN 里含 auth_token 子串，早先的宽匹配会连它一起删，
+        # 结果修完「登录方式」从通过变成待处理——正好和文档推荐的做法相反。
+        msg = self._clear({"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-xxx",
+                           "ANTHROPIC_BASE_URL": "https://mirror/anthropic",
+                           "KEEP": "1"})
+        self.assertIn("ANTHROPIC_BASE_URL", msg)
+        self.assertNotIn("OAUTH", msg)
+        self.assertEqual(self._after()["env"],
+                         {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-xxx", "KEEP": "1"})
+
     def test_clean_settings_is_a_noop(self):
         msg = self._clear({"DISABLE_TELEMETRY": "1"})
         self.assertIn("没有需要清掉", msg)
@@ -4089,10 +4100,12 @@ class TestProxyKeysEnterAutoCleanPlan(unittest.TestCase):
         self.assertEqual(plan["npmrc"], [])
         self.assertEqual(plan["brew_proxy"], [])
 
-    def test_npmrc_is_reported_but_not_promised_as_cleanable(self):
+    def test_npmrc_says_it_will_be_removed_with_npm_config(self):
+        # npm config delete 会改写 ~/.npmrc，说「只报告、不代改」就是谎报。
         plan = self._plan(self._te(npmrc=[{"line": 2, "text": "proxy=http://127.0.0.1:9"}]))
         self.assertEqual(len(plan["npmrc"]), 1)
-        self.assertTrue(any("只报告" in line for line in plan["summary"]))
+        self.assertTrue(any("npm config" in line for line in plan["summary"]))
+        self.assertFalse(any("不代改" in line for line in plan["summary"]))
 
 
 class TestBeforeAfterTable(unittest.TestCase):
@@ -7554,14 +7567,15 @@ class TestShellResidueMatcher(unittest.TestCase):
                      "https_proxy=http://127.0.0.1:7897",
                      "export ALL_PROXY=socks5://127.0.0.1:7897",
                      "export NO_PROXY=localhost,127.0.0.1",
-                     "declare -x ANTHROPIC_BASE_URL=https://relay.example.com",
-                     "export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-xxx"):
+                     "declare -x ANTHROPIC_BASE_URL=https://relay.example.com"):
             self.assertTrue(g.shell_line_is_residue(line), line)
 
     def test_claude_alias_and_path_config_are_not_residue(self):
         for line in ("alias claude='claude --verbose'",
                      'export CLAUDE_CONFIG_DIR="$HOME/.claude-alt"',
                      "export ANTHROPIC_MODEL=claude-opus-4",
+                     # 长期 token 是文档让用户放的，删了等于把登录方式从 ✓ 变 !。
+                     "export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-xxx",
                      "# export HTTPS_PROXY=http://127.0.0.1:7897",
                      "export PATH=$PATH:$HOME/.local/bin"):
             self.assertFalse(g.shell_line_is_residue(line), line)
