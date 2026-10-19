@@ -73,6 +73,23 @@ python3 scripts/account_guard.py                      # 修：列清单 → CONF
 
 这条路径要跑两次，因为第一步是纯只读的；`--preflight` 只是让第一遍也把那三项测到，不至于体检完还是 `·`。第二条命令本身是完整流水线：动手前体检、备份、改动、复检、前后对照，最后落一份 HTML 并打开。只想单独留一份快照（没有前后对照）时用 `--report`，它也不顺带写 JSON 与出口历史；在 CONFIRM 处取消时，加过 `--report` 才会给出「改动前」那一份。
 
+### Claude 直连看门狗（可选，默认不装）
+
+体检只是在「看」，这个脚本负责「拦」：每 5 秒看一遍 Claude 相关进程的对外 TCP 连接，
+发现它绕过了隧道（路由落在 `en0` 这类物理接口，而不是 `utun`）就 SIGKILL 那个进程，
+并把 pid、进程路径、目标地址、出口接口写进日志。
+
+```bash
+python3 scripts/net_guard.py --once --dry-run   # 先看一眼判据，只看不杀
+python3 scripts/net_guard.py                    # 前台跑，每 5 秒一次，发现直连就杀
+python3 scripts/net_guard.py --install --yes    # 装成 LaunchAgent 常驻（每 5 秒）
+python3 scripts/net_guard.py --status           # 在不在跑
+python3 scripts/net_guard.py --uninstall        # 卸载
+```
+
+它**不会**把「Clash 规则选了 DIRECT」当成直连——那种流量仍然走 TUN。它抓的是「绕过了隧道」。
+判据、误杀边界与已知盲区见 [references/net-guard.md](references/net-guard.md)。
+
 ### 只读审计入口
 
 ```bash

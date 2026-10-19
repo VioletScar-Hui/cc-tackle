@@ -87,7 +87,9 @@ def check_files() -> None:
         "scripts/account_guard.py",
         "scripts/report_html.py",
         "scripts/report_serve.py",
+        "scripts/net_guard.py",
         "tests/test_account_guard.py",
+        "tests/test_net_guard.py",
         "references/article-mapping.md",
     ]
     missing = [p for p in need if not (SKILL / p).exists()]
@@ -107,9 +109,10 @@ def check_files() -> None:
 
 # ── 2. 语法 ─────────────────────────────────────────────────────────
 def check_compile() -> None:
-    code, out = sh([sys.executable, "-m", "py_compile", str(HERE / "account_guard.py")])
+    code, out = sh([sys.executable, "-m", "py_compile",
+                    str(HERE / "account_guard.py"), str(HERE / "net_guard.py")])
     add("语法编译", OK if code == 0 else BAD,
-        "account_guard.py 通过" if code == 0 else tail(out))
+        "account_guard.py、net_guard.py 通过" if code == 0 else tail(out))
 
 
 # ── 3. 全部单元测试 ──────────────────────────────────────────────────
