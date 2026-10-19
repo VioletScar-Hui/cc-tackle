@@ -608,6 +608,41 @@ def render(report: dict, before: dict = None, report_path=None,
             f"<div class='tiny'>{_esc('；'.join(notes) or '全部通过')}</div></div>"
         )
 
+    # ── 常驻任务（不计分，只是清单）──
+    resident = report.get("A30_resident") or {}
+    resident_html = ""
+    if resident.get("items"):
+        cards = []
+        for item in resident["items"]:
+            if item.get("running"):
+                kind, mark = "ok", "●"
+            elif item.get("loaded"):
+                kind, mark = "warn", "!"
+            else:
+                kind, mark = "bad", "✗"
+            program = (item.get("program") or "").strip()
+            if len(program) > 96:
+                program = "…" + program[-95:]
+            detail = f"{item.get('state') or ''} · {item.get('autostart') or ''}"
+            if program:
+                detail += f" · {program}"
+            cards.append(
+                f"<div class='item {kind}'><div class='dot'>{mark}</div>"
+                f"<div style='flex:1'><div class='name-row'>"
+                f"<div class='name'>{_esc(item.get('label') or '')}</div></div>"
+                f"<div class='detail'>{_esc(detail)}</div></div></div>"
+            )
+        hint = (f"{resident.get('total', len(cards))} 个，"
+                f"{resident.get('autostart', 0)} 个设了开机自启")
+        if resident.get("not_loaded"):
+            hint += f"，{resident['not_loaded']} 个未加载"
+        if resident.get("disabled"):
+            hint += f"，{resident['disabled']} 个被禁用"
+        resident_html = (
+            "<section><h2>常驻任务 <span class='hint'>" + _esc(hint) + "</span></h2>"
+            "<div class='card'>" + "".join(cards) + "</div></section>"
+        )
+
     # ── 逐项 ──
     item_cards = []
     for name, status, detail in rows:
@@ -721,6 +756,8 @@ def render(report: dict, before: dict = None, report_path=None,
   {acts}
   <div class="facts">{facts}</div>
 </div>
+
+{resident_html}
 
 <section><h2>分组通过率 <span class="hint">按你在排查什么归类</span></h2>
   <div class="grid g3">{''.join(group_cards)}</div></section>

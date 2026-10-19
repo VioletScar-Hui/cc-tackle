@@ -27,6 +27,7 @@ import ipaddress
 import json
 import os
 import pathlib
+import plistlib
 import re
 import secrets
 import socketserver
@@ -5229,6 +5230,128 @@ def current_cli_version() -> str | None:
     return name or None
 
 
+RESIDENT_SKIP_PREFIXES = (
+    "com.apple.",              # 系统自带
+    "application.",            # 正在运行的 App 实例，不是脚本
+    "com.google.",             # 浏览器更新器
+    "io.github.clash-verge-rev.",  # 代理软件自己
+)
+
+
+def _read_agent_plist(path: pathlib.Path) -> dict:
+    """读一个 LaunchAgent 的执行方式；读坏了就当没有，不抛。"""
+    try:
+        data = plistlib.loads(path.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    argv = [str(a) for a in (data.get("ProgramArguments") or []) if str(a).strip()]
+    program = " ".join(argv)
+    if not program:
+        program = str(data.get("Program") or "")
+    return {
+        "label": str(data.get("Label") or ""),
+        "program": program,
+        "run_at_load": bool(data.get("RunAtLoad")),
+        "keep_alive": bool(data.get("KeepAlive")),
+        "interval": data.get("StartInterval") if isinstance(data.get("StartInterval"), int) else None,
+        "calendar": bool(data.get("StartCalendarInterval")),
+    }
+
+
+def check_resident_tasks() -> dict:
+    """A30 用户域里登记过的常驻任务：谁在跑、谁设了开机自启、谁根本没加载。
+
+    只读 `launchctl list` 与 `~/Library/LaunchAgents/*.plist`，不改任何 plist。
+    这一项不进结果总表、不计分——它是清单，不是体检结论。
+    """
+    out = {"items": [], "total": 0, "autostart": 0, "running": 0,
+           "not_loaded": 0, "disabled": 0, "failing": [], "note": ""}
+    code, body = run(["launchctl", "list"], timeout=20)
+    if code != 0:
+        out["note"] = "launchctl list 读不到，无法清点常驻任务"
+        return out
+    loaded: dict[str, tuple[str, str]] = {}
+    for line in body.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        pid, status, label = (p.strip() for p in parts[:3])
+        if not label or label == "Label" or pid == "PID":      # launchctl 的表头
+            continue
+        if label.startswith(RESIDENT_SKIP_PREFIXES):
+            continue
+        loaded[label] = (pid, status)
+
+    # print-disabled 才是「重启也不会起来」的真相：plist 还在、RunAtLoad 还是 true，
+    # 但用户域里被 disable 过，登录时不会加载。
+    disabled: set[str] = set()
+    code_d, body_d = run(["launchctl", "print-disabled", f"gui/{os.getuid()}"], timeout=20)
+    if code_d == 0:
+        for line in body_d.splitlines():
+            match = re.match(r'\s*"([^"]+)"\s*=>\s*disabled', line)
+            if match:
+                disabled.add(match.group(1))
+
+    agents_dir = HOME / "Library" / "LaunchAgents"
+    labels = set(loaded)
+    if agents_dir.is_dir():
+        for plist in sorted(agents_dir.glob("*.plist")):
+            info = _read_agent_plist(plist)
+            label = info.get("label") or plist.stem
+            if label.startswith(RESIDENT_SKIP_PREFIXES):
+                continue
+            labels.add(label)
+
+    for label in sorted(labels):
+        plist = agents_dir / f"{label}.plist"
+        info = _read_agent_plist(plist) if plist.exists() else {}
+        pid, status = loaded.get(label, ("-", "-"))
+        running = pid.isdigit()
+        if label in disabled:
+            state = "已禁用（重启也不会自启）"
+            out["disabled"] += 1
+        elif running:
+            state = f"运行中（pid {pid}）"
+        elif label in loaded:
+            state = "已加载，未运行"
+            if status not in ("0", "-") and status:
+                state += f"；上次退码 {status}"
+                out["failing"].append(label)
+        else:
+            state = "未加载（不会自启）"
+            out["not_loaded"] += 1
+        flags = []
+        if info.get("run_at_load"):
+            flags.append("登录时启动")
+        if info.get("interval"):
+            flags.append(f"每 {info['interval']} 秒")
+        elif info.get("calendar"):
+            flags.append("定时")
+        if info.get("keep_alive"):
+            flags.append("常驻守护")
+        autostart = "，".join(flags) or "仅手动"
+        # 被禁用的不算自启：plist 里 RunAtLoad 还是 true，但 launchd 不会加载它。
+        if (info.get("run_at_load") or info.get("interval") or info.get("calendar")) \
+                and label not in disabled:
+            out["autostart"] += 1
+        if running:
+            out["running"] += 1
+        out["items"].append({
+            "label": label,
+            "state": state,
+            "running": running,
+            "loaded": label in loaded,
+            "disabled": label in disabled,
+            "autostart": autostart,
+            "program": info.get("program", ""),
+            "plist": str(plist) if plist.exists() else None,
+        })
+    out["total"] = len(out["items"])
+    return out
+
+
 def check_claude_storage() -> dict:
     """A25 系统级 Claude 占用里**可清理**的部分。
 
@@ -7658,6 +7781,7 @@ def audit(*, persist: bool = False, expected_country: str | None = None,
         "A26_claude_settings": check_claude_settings(),
         "A27_browser_locale": check_browser_locale(ip, expected),
         "E1_keychain": check_keychain(),
+        "A30_resident": check_resident_tasks(),
     }
     report["A1_export_ip"]["expected"] = expected
     return report
