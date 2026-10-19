@@ -190,6 +190,18 @@ python3 scripts/account_guard.py --audit \
 
 **这条覆盖不到的情况要说清**：内核（`verge-mihomo`）本身退出或 TUN 接口消失时，接管流量的那几条路由会随之消失，default 路由回到物理网卡，那一刻是全量直出。规则层和组配置都管不到这件事。缓解在于内核挂在 root 特权助手 `clash-verge-service` 底下，崩溃后会秒级重启。
 
+## 直连看门狗（可选常驻）
+
+体检在「看」，看门狗在「拦」：`scripts/net_guard.py` 每 5 秒扫一遍 Claude 进程的 TCP 连接，
+对端路由落在物理接口（`en0` 等）而不是 `utun` 时 SIGKILL 那个进程，并记录 pid、进程路径、
+目标地址、出口接口。判据、误杀边界、盲区见 `references/net-guard.md`。
+
+- 默认不常驻：要显式 `--install --yes` 才装 LaunchAgent，`--uninstall` 卸掉，`--status` 看状态。
+- 先 `--once --dry-run` 看一遍判据再决定要不要开——TUN 正常工作时它根本不会触发，这是预期行为。
+- 它不管「Clash 规则选了 DIRECT」：那种流量照样走 TUN，路由仍是 `utun`。它回答的是
+  「有没有绕过隧道」，和「绝不直连」那一项查的 Clash 规则是两件事，别互相替代。
+- 这一项不计入那 28 行，也没有加分：它是可选的运行时保护，不是体检结论。
+
 ## 不只认 Clash
 
 上面那套判据是 mihomo 的。真正依赖代理软件的只有两行——「绝不直连」与「DNS 泄漏」，其余各项（出口 IP 与 ASN、系统代理残留、终端与 shell 残留、时区、CLI 完整性、浏览器两项）用哪一家都照跑。
