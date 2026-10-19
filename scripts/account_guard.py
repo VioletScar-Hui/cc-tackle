@@ -4751,15 +4751,25 @@ def build_summary(report: dict) -> list:
     brew_n = len(((te.get("brew") or {}).get("proxy")) or [])
     if custom_config_scope or missing("A1_terminal_env"):
         pass
-    elif env_n or rc_n or npmgit or npmrc_n or brew_n:
+    elif rc_n or npmgit or npmrc_n:
+        # 只有落在文件里的才是「Claude 的配置」；进程环境变量与 brew config 报的是
+        # 启动它的那个进程带进来的东西（典型：从带代理的终端启动 DSH），脚本改不了、
+        # 也不该算成残留。用户的口径：Claude 自己配置干净就算通过。
         extra = []
         if npmrc_n:
             extra.append(f"~/.npmrc {npmrc_n} 行")
-        if brew_n:
-            extra.append(f"Homebrew {brew_n} 项")
         add("终端 / shell / npm / git 代理", S_FIX,
-            f"env {env_n} 条，rc {rc_n} 条，npm/git {len(npmgit)} 项"
+            f"rc {rc_n} 条，npm/git {len(npmgit)} 项"
             + ("；" + "、".join(extra) if extra else "") + "，确认后计划清掉")
+    elif env_n or brew_n:
+        bits = []
+        if env_n:
+            bits.append(f"{env_n} 条环境变量")
+        if brew_n:
+            bits.append(f"brew config 里 {brew_n} 项")
+        add("终端 / shell / npm / git 代理", S_OK,
+            "Claude 自己的配置里没有代理（shell 0 行、npm/git 0 项、~/.npmrc 0 行）；"
+            "只剩 " + "、".join(bits) + "，那是启动它的进程带来的，脚本不改别的进程")
     else:
         # 文章 2.5④ 那批命令有五处出处，一处一处写进证据里，别只说一句「没有代理」。
         add("终端 / shell / npm / git 代理", S_OK,
@@ -8060,6 +8070,16 @@ def run_preflight(args) -> None:
         if ask_yes("顺带跑一次 WebRTC 泄漏探测？会临时起一个浏览器资料，结束后清理",
                    default=True):
             args.webrtc = True
+    if args.verify_browser and not browser_profile_dir():
+        # 资料名提前问：不声明的话复核页开在默认资料，换了资料以后缓存会对不上，
+        # 那两项又退回「未测到」。这里问一次，答案直接进环境变量，后面所有入口一致。
+        try:
+            answer = input("  复核页开在哪个 Chrome 资料？留空=默认资料（例如 Profile 1）：").strip()
+        except EOFError:
+            answer = ""
+        if answer:
+            os.environ[BROWSER_PROFILE_DIR_ENV] = answer
+            os.environ[BROWSER_PROFILE_ENV] = answer
     if args.expected_country is None and args.expected_exit_ip is None:
         if ask_yes("有固定的出口国家 / IP 要声明吗？", default=False):
             try:
