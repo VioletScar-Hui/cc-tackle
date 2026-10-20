@@ -5260,17 +5260,41 @@ def _read_agent_plist(path: pathlib.Path) -> dict:
     }
 
 
-def check_resident_tasks() -> dict:
-    """A30 用户域里登记过的常驻任务：谁在跑、谁设了开机自启、谁根本没加载。
+RESIDENT_FUNCTIONS = (
+    ("网络防护", ("net_guard.py",)),
+    ("报告服务", ("report_serve.py",)),
+    ("体检与清理", ("account_guard.py", "selfcheck.py")),
+)
 
-    只读 `launchctl list` 与 `~/Library/LaunchAgents/*.plist`，不改任何 plist。
-    这一项不进结果总表、不计分——它是清单，不是体检结论。
+
+def resident_function(program: str) -> str:
+    """按脚本名归到功能组；组名就是报告页上那几张小卡片。"""
+    for name, needles in RESIDENT_FUNCTIONS:
+        if any(needle in program for needle in needles):
+            return name
+    return "其他"
+
+
+def _is_skill_owned(label: str, program: str) -> bool:
+    """只认这个 skill 自己的常驻程序，别的软件的 agent 不往报告里塞。"""
+    marker = str(SKILL_DIR)
+    if marker and marker in (program or ""):
+        return True
+    return label.startswith(("com.violetscarhui.claude-", "local.claude-"))
+
+
+def check_resident_tasks() -> dict:
+    """A30 本 skill 装出来的常驻程序：谁在跑、谁设了开机自启、谁被禁用。
+
+    只读 `launchctl list`、`launchctl print-disabled` 与 `~/Library/LaunchAgents/*.plist`，
+    不改任何 plist、也不启动任何东西。系统与其它 App 的 agent 一律不列——报告页只回答
+    「这个 skill 自己留了什么在后台跑」。
     """
-    out = {"items": [], "total": 0, "autostart": 0, "running": 0,
+    out = {"items": [], "groups": [], "total": 0, "autostart": 0, "running": 0,
            "not_loaded": 0, "disabled": 0, "failing": [], "note": ""}
     code, body = run(["launchctl", "list"], timeout=20)
     if code != 0:
-        out["note"] = "launchctl list 读不到，无法清点常驻任务"
+        out["note"] = "launchctl list 读不到，无法清点常驻程序"
         return out
     loaded: dict[str, tuple[str, str]] = {}
     for line in body.splitlines():
@@ -5279,8 +5303,6 @@ def check_resident_tasks() -> dict:
             continue
         pid, status, label = (p.strip() for p in parts[:3])
         if not label or label == "Label" or pid == "PID":      # launchctl 的表头
-            continue
-        if label.startswith(RESIDENT_SKIP_PREFIXES):
             continue
         loaded[label] = (pid, status)
 
@@ -5299,14 +5321,14 @@ def check_resident_tasks() -> dict:
     if agents_dir.is_dir():
         for plist in sorted(agents_dir.glob("*.plist")):
             info = _read_agent_plist(plist)
-            label = info.get("label") or plist.stem
-            if label.startswith(RESIDENT_SKIP_PREFIXES):
-                continue
-            labels.add(label)
+            labels.add(info.get("label") or plist.stem)
 
     for label in sorted(labels):
         plist = agents_dir / f"{label}.plist"
         info = _read_agent_plist(plist) if plist.exists() else {}
+        program = info.get("program", "")
+        if not _is_skill_owned(label, program):
+            continue
         pid, status = loaded.get(label, ("-", "-"))
         running = pid.isdigit()
         if label in disabled:
@@ -5340,15 +5362,24 @@ def check_resident_tasks() -> dict:
             out["running"] += 1
         out["items"].append({
             "label": label,
+            "function": resident_function(program),
             "state": state,
             "running": running,
             "loaded": label in loaded,
             "disabled": label in disabled,
             "autostart": autostart,
-            "program": info.get("program", ""),
+            "program": program,
             "plist": str(plist) if plist.exists() else None,
         })
+
     out["total"] = len(out["items"])
+    if not out["items"]:
+        out["note"] = "这个 skill 目前没有常驻程序"
+        return out
+    for name, _needles in RESIDENT_FUNCTIONS + (("其他", ()),):
+        members = [i for i in out["items"] if i["function"] == name]
+        if members:
+            out["groups"].append({"name": name, "labels": [m["label"] for m in members]})
     return out
 
 
@@ -7624,12 +7655,20 @@ def check_timezone_layers() -> dict:
     )
     out["layers"]["new_process"] = body.strip() if code == 0 and body.strip() else "(node 不可用)"
 
-    # 历史：timed 的日志逐条带时间戳解析，取最后一条事件，而不是「出现过就算」
-    code, body = run(
-        ["log", "show", "--last", "6h", "--style", "compact",
-         "--predicate", 'process == "timed" AND eventMessage CONTAINS "TZ,"'],
-        timeout=150,
-    )
+    # 历史：timed 的日志逐条带时间戳解析，取最后一条事件，而不是「出现过就算」。
+    # `log show` 的 CONTAINS 是全量扫，机器一忙能跑几分钟；而这段只是「第二道闸读不到时」
+    # 的旁证。已经有 24 小时内的闸门实测（root 读过或缓存）就跳过，别让一次体检卡在这儿。
+    code, body = 1, ""
+    if load_location_gate_cache() is None:
+        code, body = run(
+            ["log", "show", "--last", "6h", "--style", "compact",
+             "--predicate", 'process == "timed" AND eventMessage CONTAINS "TZ,"'],
+            timeout=15,
+        )
+        if code != 0:
+            out["note"] = "timed 日志读取超时或不可用（15 秒），已跳过；不影响其它判定"
+    else:
+        out["note"] = "已有时区闸门的实测缓存，跳过 timed 日志旁证"
     if code == 0:
         events = []
         for line in body.splitlines():

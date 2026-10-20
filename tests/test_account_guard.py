@@ -1201,6 +1201,13 @@ class TestTimezoneLayers(unittest.TestCase):
     所以这里只负责把事实摆出来，改不改由人决定。
     """
 
+    def setUp(self):
+        # 机器上真有 24 小时内的闸门缓存时，check_timezone_layers 会跳过 `log show`
+        # 那段旁证（`log show` 一忙能跑几分钟）。这一组测的是日志解析，把缓存挡掉。
+        patcher = mock.patch.object(g, "load_location_gate_cache", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @staticmethod
     def _factory(link="Asia/Taipei", node="Asia/Taipei", log_body="", auto_val="0"):
         def fake_run(cmd, timeout=20):
