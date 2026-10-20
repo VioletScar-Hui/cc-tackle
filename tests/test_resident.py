@@ -32,13 +32,18 @@ class TestResidentTasks(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         agents = self.tmp / "Library" / "LaunchAgents"
         agents.mkdir(parents=True)
+        guard = str(g.SKILL_DIR / "scripts" / "net_guard.py")
+        checker = str(g.SKILL_DIR / "scripts" / "account_guard.py")
         (agents / "local.running.plist").write_bytes(
-            _plist("local.running", argv=("/bin/bash", "/opt/x/run.sh")))
+            _plist("local.running", argv=("/usr/bin/python3", guard)))
         (agents / "local.idle.plist").write_bytes(
-            _plist("local.idle", run_at_load=False, keep_alive=False))
-        (agents / "local.gone.plist").write_bytes(_plist("local.gone"))
+            _plist("local.idle", run_at_load=False, keep_alive=False,
+                   argv=("/usr/bin/python3", guard)))
+        (agents / "local.gone.plist").write_bytes(
+            _plist("local.gone", argv=("/opt/other/tool.sh",)))
         (agents / "local.every.plist").write_bytes(
-            _plist("local.every", run_at_load=False, keep_alive=False, interval=60))
+            _plist("local.every", run_at_load=False, keep_alive=False, interval=60,
+                   argv=("/usr/bin/python3", checker)))
         old_home = g.HOME
         g.HOME = self.tmp
         self.addCleanup(setattr, g, "HOME", old_home)
@@ -61,23 +66,23 @@ class TestResidentTasks(unittest.TestCase):
             "-\t2\tlocal.every\n",
             '"local.gone" => disabled\n')
         by_label = {item["label"]: item for item in out["items"]}
-        self.assertEqual(out["total"], 4)
+        self.assertNotIn("local.gone", by_label, "别的软件的 agent 不该进清单")
+        self.assertEqual(out["total"], 3)
         self.assertIn("运行中", by_label["local.running"]["state"])
         self.assertIn("已加载，未运行", by_label["local.idle"]["state"])
         self.assertIn("上次退码 2", by_label["local.every"]["state"])
-        self.assertIn("已禁用", by_label["local.gone"]["state"])
-        self.assertEqual(out["disabled"], 1)
         self.assertEqual(out["running"], 1)
         self.assertEqual(out["failing"], ["local.every"])
 
     def test_autostart_flags_come_from_the_plist(self):
         # 带上禁用表：被禁用的那个虽然 RunAtLoad=true，但不该算进「会自启」。
-        out = self._check("PID\tStatus\tLabel\n", '"local.gone" => disabled\n')
+        out = self._check("PID\tStatus\tLabel\n", '"local.running" => disabled\n')
         by_label = {item["label"]: item for item in out["items"]}
+        self.assertIn("已禁用", by_label["local.running"]["state"])
         self.assertIn("登录时启动", by_label["local.running"]["autostart"])
         self.assertEqual(by_label["local.idle"]["autostart"], "仅手动")
         self.assertIn("每 60 秒", by_label["local.every"]["autostart"])
-        self.assertEqual(out["autostart"], 2)   # running + every
+        self.assertEqual(out["autostart"], 1)   # 只剩 every 会自启
 
     def test_the_header_line_is_not_an_agent(self):
         out = self._check("PID\tStatus\tLabel\n")
@@ -86,7 +91,15 @@ class TestResidentTasks(unittest.TestCase):
     def test_program_is_kept_for_display(self):
         out = self._check("PID\tStatus\tLabel\n123\t0\tlocal.running\n")
         item = [i for i in out["items"] if i["label"] == "local.running"][0]
-        self.assertIn("run.sh", item["program"])
+        self.assertIn("net_guard.py", item["program"])
+
+    def test_function_groups_are_derived_from_the_script(self):
+        out = self._check("PID\tStatus\tLabel\n")
+        by_label = {item["label"]: item for item in out["items"]}
+        self.assertEqual(by_label["local.running"]["function"], "网络防护")
+        self.assertEqual(by_label["local.every"]["function"], "体检与清理")
+        names = [group["name"] for group in out["groups"]]
+        self.assertEqual(names, ["网络防护", "体检与清理"])
 
 
 class TestResidentSectionInHtml(unittest.TestCase):
@@ -95,8 +108,10 @@ class TestResidentSectionInHtml(unittest.TestCase):
             "timestamp": "2026-01-01 00:00:00",
             "A30_resident": {
                 "total": 2, "autostart": 1, "running": 1, "not_loaded": 0, "disabled": 1,
+                "groups": [{"name": "网络防护", "labels": ["local.a", "local.b"]}],
                 "items": [
                     {"label": "local.a", "state": "运行中（pid 7）", "autostart": "登录时启动",
+                     "function": "网络防护",
                      "program": "/bin/sh /a.sh", "running": True, "loaded": True, "disabled": False},
                     {"label": "local.b", "state": "已禁用（重启也不会自启）", "autostart": "登录时启动",
                      "program": "/bin/sh /b.sh", "running": False, "loaded": False, "disabled": True},
@@ -106,10 +121,11 @@ class TestResidentSectionInHtml(unittest.TestCase):
         rows = [("a", g.S_OK, "")] * rh.BASE_ITEMS
         with mock.patch.object(g, "build_summary", return_value=rows):
             page = rh.render(report)
-        self.assertIn("常驻任务", page)
+        self.assertIn("本 skill 的常驻程序", page)
         self.assertIn("local.a", page)
         self.assertIn("已禁用", page)
         self.assertIn("1 个被禁用", page)
+        self.assertIn("网络防护", page)
 
 
 if __name__ == "__main__":

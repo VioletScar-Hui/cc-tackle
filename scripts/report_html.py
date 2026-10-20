@@ -608,39 +608,56 @@ def render(report: dict, before: dict = None, report_path=None,
             f"<div class='tiny'>{_esc('；'.join(notes) or '全部通过')}</div></div>"
         )
 
-    # ── 常驻任务（不计分，只是清单）──
+    # ── 常驻程序（只列本 skill 自己的，按功能分组；不计分）──
     resident = report.get("A30_resident") or {}
     resident_html = ""
     if resident.get("items"):
+        by_label = {item["label"]: item for item in resident.get("items") or []}
+        groups = resident.get("groups") or [
+            {"name": "常驻程序", "labels": list(by_label)}]
         cards = []
-        for item in resident["items"]:
-            if item.get("running"):
-                kind, mark = "ok", "●"
-            elif item.get("loaded"):
-                kind, mark = "warn", "!"
-            else:
-                kind, mark = "bad", "✗"
-            program = (item.get("program") or "").strip()
-            if len(program) > 96:
-                program = "…" + program[-95:]
-            detail = f"{item.get('state') or ''} · {item.get('autostart') or ''}"
-            if program:
-                detail += f" · {program}"
+        for group in groups:
+            members = [by_label[label] for label in (group.get("labels") or [])
+                       if label in by_label]
+            if not members:
+                continue
+            entries = []          # 别叫 rows：外面那个 rows 是整张表的 28 行
+            for item in members:
+                if item.get("running"):
+                    kind, mark = "ok", "●"
+                elif item.get("loaded"):
+                    kind, mark = "warn", "!"
+                else:
+                    kind, mark = "bad", "✗"
+                program = (item.get("program") or "").strip()
+                if len(program) > 96:
+                    program = "…" + program[-95:]
+                detail = f"{item.get('state') or ''} · {item.get('autostart') or ''}"
+                if program:
+                    detail += f" · {program}"
+                entries.append(
+                    f"<div class='item {kind}'><div class='dot'>{mark}</div>"
+                    f"<div style='flex:1'><div class='name-row'>"
+                    f"<div class='name'>{_esc(item.get('label') or '')}</div></div>"
+                    f"<div class='detail'>{_esc(detail)}</div></div></div>"
+                )
             cards.append(
-                f"<div class='item {kind}'><div class='dot'>{mark}</div>"
-                f"<div style='flex:1'><div class='name-row'>"
-                f"<div class='name'>{_esc(item.get('label') or '')}</div></div>"
-                f"<div class='detail'>{_esc(detail)}</div></div></div>"
-            )
-        hint = (f"{resident.get('total', len(cards))} 个，"
+                f"<div class='card'><h3>{_esc(group.get('name') or '')}"
+                f"<em>{len(members)} 个</em></h3>{''.join(entries)}</div>")
+        hint = (f"{resident.get('total', len(by_label))} 个，"
                 f"{resident.get('autostart', 0)} 个设了开机自启")
-        if resident.get("not_loaded"):
-            hint += f"，{resident['not_loaded']} 个未加载"
         if resident.get("disabled"):
             hint += f"，{resident['disabled']} 个被禁用"
+        if resident.get("not_loaded"):
+            hint += f"，{resident['not_loaded']} 个未加载"
         resident_html = (
-            "<section><h2>常驻任务 <span class='hint'>" + _esc(hint) + "</span></h2>"
-            "<div class='card'>" + "".join(cards) + "</div></section>"
+            f"<section><h2>本 skill 的常驻程序 <span class='hint'>{_esc(hint)}</span></h2>"
+            f"<div class='grid g3'>{''.join(cards)}</div></section>"
+        )
+    elif "A30_resident" in report and resident.get("note"):
+        resident_html = (
+            "<section><h2>本 skill 的常驻程序</h2>"
+            f"<div class='card'>{_esc(resident['note'])}</div></section>"
         )
 
     # ── 逐项 ──
