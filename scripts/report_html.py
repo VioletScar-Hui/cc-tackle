@@ -816,10 +816,19 @@ def write_report(report: dict, before: dict = None, out_dir=None,
     path.write_text(render(report, before=before, report_path=report_path, note=note),
                     encoding="utf-8")
     if open_it and sys.platform == "darwin" and not os.environ.get("CLAUDE_GUARD_NO_OPEN"):
+        # 打不开要说出来：Claude Code 的沙箱、SSH、没有 GUI 会话时 `open` 会失败，
+        # 以前 check=False + 吞异常，用户只看到一个路径，以为页面没生成。
         try:
-            subprocess.run(["open", str(path)], check=False, timeout=15)
-        except (OSError, subprocess.SubprocessError):
-            pass
+            proc = subprocess.run(["open", str(path)], check=False, timeout=15,
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                print(f"没能自动打开报告（open 返回 {proc.returncode}"
+                      + (f"：{detail[:120]}" if detail else "") + f"）；路径：{path}",
+                      file=sys.stderr)
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"没能自动打开报告（{type(error).__name__}: {error}）；路径：{path}",
+                  file=sys.stderr)
     return path
 
 

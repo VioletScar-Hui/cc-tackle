@@ -111,7 +111,7 @@ python3 scripts/account_guard.py
 
    跑完的形状是一条链：体检 → 当场修可自动修的 → 复检 → HTML。收尾把 HTML 路径给用户，别让报告只停在终端里。
 
-   在 Claude Code 里：`--audit`、`--verify-browser`、`--fix-auto` 都能跑，但 `--fix-auto` 会跳过 Claude Code 正在用的 `~/.claude/settings.json`，那部分留给用户换普通终端再清；完整加固（不带参数那条）仍然只能在普通终端跑。
+   在 Claude Code 里：`--audit`、`--verify-browser`、`--fix-auto` 都能跑，但 **`--fix-auto` 必须带 `--yes`**——agent 没有 TTY，脚本会拒绝没有确认的写入（拒绝时仍会落一份页面，注明「未执行修复：缺 --yes」）。另外 `--fix-auto` 会跳过 Claude Code 正在用的 `~/.claude/settings.json`，那部分留给用户换普通终端再清；完整加固（不带参数那条）仍然只能在普通终端跑。
 
 2. 由普通终端执行时，先跑审计并向用户说明：确认前不写任何状态；确认后先备份再改目标状态；代理、shell、npm/git 和 Claude settings 会按计划处理，Clash DNS 与 Chrome Intl 分开询问且默认否；密码只走 sudo 原生提示；每项改动后立即复验。`--save-audit` 只与 `--audit` 或 `--json` 一起使用，完整加固模式会拒绝该组合。
 

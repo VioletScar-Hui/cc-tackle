@@ -5575,6 +5575,20 @@ class TestReportOnlyFlow(unittest.TestCase):
         self.assertFalse(list((tmp / "backups").glob("audit-*.json")) if (tmp / "backups").exists() else [],
                          "--report 不该写 audit JSON，那是 --save-audit 的事")
 
+    def test_save_audit_opens_the_page_too(self):
+        # 以前这条路只写不打开：用户看到路径却等不到浏览器。两条 HTML 出口要一致。
+        tmp = self._sandbox()
+        calls = []
+        with mock.patch.object(g, "audit", return_value={"A1_export_ip": {}}), \
+             mock.patch.object(g, "print_audit"), \
+             mock.patch.object(g, "print_summary_table"), \
+             mock.patch.object(g, "save_audit_report", return_value=tmp / "audit.json"), \
+             mock.patch("report_html.write_report",
+                        side_effect=lambda *a, **k: calls.append(k) or (tmp / "r.html")):
+            self.assertEqual(g.main(["--audit", "--save-audit"]), 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0].get("open_it"), True, "--save-audit 也要把页面打开")
+
     def test_audit_report_does_not_touch_the_caches(self):
         tmp = self._sandbox()
         with mock.patch.object(g, "audit", return_value={}), \
@@ -7545,7 +7559,9 @@ class TestFixAuto(unittest.TestCase):
              mock.patch("report_html.write_report",
                         side_effect=lambda *a, **k: written.append(k) or pathlib.Path("/tmp/r.html")):
             self.assertEqual(g.main(["--fix-auto"]), 2)
-        self.assertEqual(written, [], "被拒绝时不该顺手出页面")
+        self.assertEqual(len(written), 1,
+                         "被拒也要给页面：用户至少能看到这一轮测到了什么、为什么没修")
+        self.assertIn("缺少 --yes", written[0].get("note", ""))
 
     def test_nothing_to_fix_still_hands_over_a_page(self):
         written = []
@@ -7731,6 +7747,23 @@ class TestHtmlHonesty(unittest.TestCase):
             page = rh.render({"timestamp": "2026-01-01 00:00:00"},
                              note="已取消，这是改动前的状态")
         self.assertIn("已取消，这是改动前的状态", page)
+
+
+class TestReportOpenFailure(unittest.TestCase):
+    """`open` 失败要说出来：沙箱 / SSH / 无 GUI 时用户得知道页面在哪，而不是以为没生成。"""
+
+    def test_failure_prints_the_path(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-open-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fake = mock.Mock(returncode=1, stdout="", stderr="Unable to find application")
+        stderr = io.StringIO()
+        with mock.patch("subprocess.run", return_value=fake), \
+             mock.patch("sys.stderr", stderr):
+            page = rh.write_report({"timestamp": "2026-01-01 00:00:00"},
+                                   out_dir=tmp, open_it=True)
+        self.assertIn(str(page), stderr.getvalue())
+        self.assertIn("没能自动打开", stderr.getvalue())
+        self.assertTrue(page.exists())
 
 
 if __name__ == "__main__":
