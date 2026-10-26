@@ -14,7 +14,7 @@ description: >-
 
 一个脚本做两件事：**检测环境**，然后在用户确认后清理可安全清理的残留。
 
-安全约定沿用 `claude-cleanup`：只读审计永远安全且默认不落盘（注意它仍会调用 `claude` / `npm` 读状态，这两个 CLI 自己可能写迁移或日志，`--fix-auto` 的备份是动手前那一刻的状态）；写操作需要真实 TTY 和一次最终确认，确认前不请求 sudo、不建备份、不改状态；确认后先完成备份再改目标状态（并发锁只是控制元数据），备份失败即停；需要 root 时只在终端原生 sudo 隐藏提示里输密码，脚本从不读取或保存密码。
+安全约定沿用 `claude-cleanup`：只读审计永远安全，**默认落一份 HTML 页面并打开**（不写审计 JSON／出口历史／缓存；脚本化场景设 `CLAUDE_GUARD_NO_REPORT=1` 关掉页面）（注意它仍会调用 `claude` / `npm` 读状态，这两个 CLI 自己可能写迁移或日志，`--fix-auto` 的备份是动手前那一刻的状态）；写操作需要真实 TTY 和一次最终确认，确认前不请求 sudo、不建备份、不改状态；确认后先完成备份再改目标状态（并发锁只是控制元数据），备份失败即停；需要 root 时只在终端原生 sudo 隐藏提示里输密码，脚本从不读取或保存密码。
 
 ## 确认后可清理什么
 
@@ -168,7 +168,7 @@ python3 scripts/account_guard.py --audit \
 
 ## 结果页：HTML 报告
 
-默认**只在完整加固的最后落一份**（`~/ClaudeGuardBackups/report-<时间戳>.html`）：零外部资源、无 JS。这一页天生是前后对照——顶上「修复前 X → 修复后 Y」的分数，下面逐项把动手前与动手后的记号并排列出来，因为那一轮里真的测过两次。分数用**加分制**：27 个基础项合计 100 分，每项 100/27 分，通过拿满、待处理拿一半、未通过 0 分，「没测到」也按 0 分计，分母固定 27 项，不折算；「登录方式」是第 28 行但不计基础分，属于额外加分项，通过再加 5 分，满分 105。只读自检 `selfcheck.py` 不出页面：一次流程只留最后那一份，免得最终报告被稀释成随手可得的快照。只读运行想要一份快照就显式加 `--report`（页面会注明「只有这一次体检，没有改动对照」），`--audit --save-audit` 落盘并打印路径。想在上面**点着修**就跑 `python3 scripts/report_serve.py` —— 本地回环服务加一次性令牌，只给「本来就敢自动做」的项出按钮。详见 `references/report-page.md`。
+**每次运行都会落一份**（`--audit` 也一样，`~/ClaudeGuardBackups/report-<时间戳>.html`）：零外部资源、无 JS。这一页天生是前后对照——顶上「修复前 X → 修复后 Y」的分数，下面逐项把动手前与动手后的记号并排列出来，因为那一轮里真的测过两次。分数用**加分制**：27 个基础项合计 100 分，每项 100/27 分，通过拿满、待处理拿一半、未通过 0 分，「没测到」也按 0 分计，分母固定 27 项，不折算；「登录方式」是第 28 行但不计基础分，属于额外加分项，通过再加 5 分，满分 105。只读自检 `selfcheck.py` 不出页面：一次流程只留最后那一份，免得最终报告被稀释成随手可得的快照。只读运行的页面会注明「只有这一次体检，没有改动对照」；`--audit --save-audit` 另外落一份审计 JSON 并打印路径。想在上面**点着修**就跑 `python3 scripts/report_serve.py` —— 本地回环服务加一次性令牌，只给「本来就敢自动做」的项出按钮。详见 `references/report-page.md`。
 
 ## 「绝不直连」怎么判
 
@@ -260,7 +260,7 @@ cp ~/ClaudeGuardBackups/guard-<时间戳>/files/Users__*__settings.json ~/.claud
 cp ~/ClaudeGuardBackups/guard-<时间戳>/files/Users__*__.zshrc ~/.zshrc
 ```
 
-需要 root 的文件（`/var/db/locationd/clients.plist`）用 `sudo cp` 从同一目录还原。本次新建的 `~/.local/bin/claude-safe` 可直接删除；原本已存在的 wrapper 按 `manifest.json` 从备份恢复。只有显式 `--save-audit` 时才会把报告写到 `~/ClaudeGuardBackups/audit-<时间戳>.json`；普通 `--audit` 不写报告、出口历史或浏览器缓存。
+需要 root 的文件（`/var/db/locationd/clients.plist`）用 `sudo cp` 从同一目录还原。本次新建的 `~/.local/bin/claude-safe` 可直接删除；原本已存在的 wrapper 按 `manifest.json` 从备份恢复。只有显式 `--save-audit` 时才会把审计 JSON 写到 `~/ClaudeGuardBackups/audit-<时间戳>.json`；普通 `--audit` 只写那份 HTML 页面，不写出口历史或浏览器缓存。
 
 系统代理、Chrome Intl 和 IPv6 的原态不在文件恢复快照里，恢复时必须按输出人工复核；系统级缓存、旧版本和 Git worktree 注册也没有完整的自动恢复范围。Clash 配置文件如果被恢复，运行中的内核不会由 `--restore` 自动重载，需在 Clash Verge 中重载或重启后再跑一次审计确认实时状态。
 

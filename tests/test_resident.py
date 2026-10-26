@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 import plistlib
 import tempfile
@@ -10,6 +11,9 @@ import shutil
 import sys
 import unittest
 from unittest import mock
+
+# 测试不写页面：--audit 现在默认落一份并打开，别让用例往真实目录里写。
+os.environ.setdefault("CLAUDE_GUARD_NO_REPORT", "1")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 
