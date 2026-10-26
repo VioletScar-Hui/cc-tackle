@@ -30,6 +30,9 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
+# 测试不写页面：--audit 现在默认落一份并打开，别让用例往真实目录里写。
+os.environ.setdefault("CLAUDE_GUARD_NO_REPORT", "1")
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 
 import account_guard as g  # noqa: E402
@@ -7740,6 +7743,14 @@ class TestHtmlHonesty(unittest.TestCase):
             page = rh.render({"timestamp": "2026-01-01 00:00:00"})
         self.assertNotIn("项全部通过", page, "0 分和「全部通过」不能同时出现")
         self.assertIn("没测到", page)
+
+    def test_the_page_tells_a_beginner_what_to_run_next(self):
+        rows = [("a", g.S_OK, "")] * rh.BASE_ITEMS
+        with mock.patch.object(g, "build_summary", return_value=rows):
+            page = rh.render({"timestamp": "2026-01-01 00:00:00"})
+        self.assertIn("下一步", page)
+        self.assertIn("--fix-auto", page)
+        self.assertIn("claude setup-token", page)
 
     def test_the_note_is_printed_on_the_page(self):
         rows = [("a", g.S_OK, "")] * rh.BASE_ITEMS

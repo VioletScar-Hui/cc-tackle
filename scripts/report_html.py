@@ -608,6 +608,20 @@ def render(report: dict, before: dict = None, report_path=None,
             f"<div class='tiny'>{_esc('；'.join(notes) or '全部通过')}</div></div>"
         )
 
+    # ── 下一步（给不想研究参数的人：三条复制就能跑的命令）──
+    guard = pathlib.Path(__file__).resolve().parent / "account_guard.py"
+    next_html = (
+        "<section><h2>下一步 <span class='hint'>不用记参数，复制就能跑</span></h2>"
+        "<div class='card'>"
+        "<div class='detail'>① 自动修可自动修的（先备份、改完复检、再出一份对照页）："
+        f"<code>python3 {_esc(str(guard))} --fix-auto</code></div>"
+        "<div class='detail'>② 需要 root 或要清旧版本的（逐项问你，默认否）："
+        f"<code>python3 {_esc(str(guard))}</code> —— 在普通终端里跑</div>"
+        "<div class='detail'>③ 登录方式：<code>claude setup-token</code>，"
+        "把拿到的 token 放进 <code>CLAUDE_CODE_OAUTH_TOKEN</code></div>"
+        "</div></section>"
+    )
+
     # ── 常驻程序（只列本 skill 自己的，按功能分组；不计分）──
     resident = report.get("A30_resident") or {}
     resident_html = ""
@@ -781,6 +795,8 @@ def render(report: dict, before: dict = None, report_path=None,
 
 <section><h2>需要你处理的 <span class="hint">能自动修的已经在运行里处理掉</span></h2>
   {todo_html}</section>
+
+{next_html}
 
 {changed}
 

@@ -8382,7 +8382,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="允许修改脚本无法就地复验的别家代理配置（sing-box / v2ray / Surge 的 DNS）；"
                          "会先备份，改完要你自己重启那个软件才生效")
     ap.add_argument("--report", action="store_true",
-                    help="结束时落一份 HTML 报告（只读模式下也能用，不写 JSON 与状态）")
+                    help="兼容写法：HTML 页面现在默认就会落并打开，不写 JSON 与状态")
     ap.add_argument("--save-audit", action="store_true",
                     help="审计完成后显式保存报告与出口历史（默认 --audit 不落盘）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出体检结果")
@@ -8589,17 +8589,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"HTML 版  ：{write_report(report, report_path=str(p), open_it=True)}")
             except Exception as error:
                 print(f"HTML 版生成失败（上面的结论不受影响）：{error}", file=sys.stderr)
-        elif args.report:
-            # 只要一份 HTML，不要 JSON、不要状态：给同事或自己看一眼的那种用法。
+        elif args.report or not os.environ.get("CLAUDE_GUARD_NO_REPORT"):
+            # 默认就出页面并打开：终端里那张表新人看不出下一步，页面才是给人看的。
+            # 脚本化场景（CI、二次解析）设 CLAUDE_GUARD_NO_REPORT=1 关掉。
             write_html_only(report, note="只有这一次体检，没有改动对照")
-        elif getattr(args, "verify_browser", False):
-            # 这次的两份浏览器复核缓存是脚本自己开的页面写下的，说「没写缓存」就是谎报。
-            print("\n只读审计没写报告与出口历史；浏览器复核结果已存进 "
-                  "~/.local/state/claude-guard/ 下的两份缓存。"
-                  "需要留档加 --save-audit（含 JSON），只要 HTML 加 --report。")
+            if getattr(args, "verify_browser", False):
+                print("  浏览器复核结果已存进 ~/.local/state/claude-guard/ 下的两份缓存。")
         else:
-            print("\n只读审计未写入报告、出口历史或缓存；"
-                  "需要留档加 --save-audit（含 JSON），只要 HTML 加 --report。")
+            print("\n只读审计没有写页面（CLAUDE_GUARD_NO_REPORT=1）；"
+                  "去掉这个环境变量就会自动落一份并打开。")
         return 0
 
     scope = report.get("scope_manifest") or {}
