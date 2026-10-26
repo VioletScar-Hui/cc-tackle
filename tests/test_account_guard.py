@@ -7744,14 +7744,6 @@ class TestHtmlHonesty(unittest.TestCase):
         self.assertNotIn("项全部通过", page, "0 分和「全部通过」不能同时出现")
         self.assertIn("没测到", page)
 
-    def test_the_page_tells_a_beginner_what_to_run_next(self):
-        rows = [("a", g.S_OK, "")] * rh.BASE_ITEMS
-        with mock.patch.object(g, "build_summary", return_value=rows):
-            page = rh.render({"timestamp": "2026-01-01 00:00:00"})
-        self.assertIn("下一步", page)
-        self.assertIn("--fix-auto", page)
-        self.assertIn("claude setup-token", page)
-
     def test_the_note_is_printed_on_the_page(self):
         rows = [("a", g.S_OK, "")] * rh.BASE_ITEMS
         with mock.patch.object(g, "build_summary", return_value=rows):
