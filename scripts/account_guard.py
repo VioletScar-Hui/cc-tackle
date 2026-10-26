@@ -8290,6 +8290,9 @@ def run_fix_auto(report: dict, args, under_claude: bool = False) -> int:
         if not sys.stdin.isatty():
             print("拒绝执行：--fix-auto 要真实终端确认；agent 已经拿到用户授权时再加 --yes。",
                   file=sys.stderr)
+            print("  重跑：python3 scripts/account_guard.py --fix-auto --yes", file=sys.stderr)
+            # 被拒也要给页面：用户至少能看到这一轮测到了什么、为什么没修。
+            write_html_only(report, note="未执行修复：非交互环境缺少 --yes，这一份只有体检结果")
             return 2
         if input("按上面的清单修（先备份、改完复检）？输入 y 确认：").strip().lower() != "y":
             print("已取消，没有修改任何内容。")
@@ -8575,12 +8578,15 @@ def main(argv: list[str] | None = None) -> int:
             return run_fix_auto(report, args, under_claude=under_claude)
         print("\n  想自己复核上面每一项：python3 scripts/account_guard.py --commands")
         print("  必须人工做的那些（带点击路径）：python3 scripts/account_guard.py --manual")
+        print("  要一份可点的页面：在上面那条命令上加 --report")
+        print("  想让它当场修可自动修的（其余仍需你决定）：加 --fix-auto"
+              "（agent 非交互要再加 --yes）")
         if args.save_audit:
             p = save_audit_report(report)
             print(f"\n报告已存：{p}")
             try:
                 from report_html import write_report
-                print(f"HTML 版  ：{write_report(report, report_path=str(p))}")
+                print(f"HTML 版  ：{write_report(report, report_path=str(p), open_it=True)}")
             except Exception as error:
                 print(f"HTML 版生成失败（上面的结论不受影响）：{error}", file=sys.stderr)
         elif args.report:
