@@ -329,6 +329,18 @@ def _esc(v) -> str:
     return html.escape(str(v if v is not None else ""), quote=True)
 
 
+def _age_text(seconds: float) -> str:
+    """把秒数说成「12 秒 / 3 分 / 2 小时 / 5 天」。"""
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return f"{seconds} 秒"
+    if seconds < 3600:
+        return f"{seconds // 60} 分"
+    if seconds < 86400:
+        return f"{seconds // 3600} 小时"
+    return f"{seconds // 86400} 天"
+
+
 def _kind(status: str) -> str:
     """把 build_summary 的状态记号翻成 CSS 类名。"""
     return {"✓": "ok", "!": "warn", "✗": "bad"}.get((status or "").strip(), "na")
@@ -632,7 +644,12 @@ def render(report: dict, before: dict = None, report_path=None,
                 program = (item.get("program") or "").strip()
                 if len(program) > 96:
                     program = "…" + program[-95:]
-                detail = f"{item.get('state') or ''} · {item.get('autostart') or ''}"
+                state_txt = item.get("state") or ""
+                if item.get("elapsed"):
+                    state_txt += f"，已跑 {item['elapsed']}"
+                detail = f"{state_txt} · {item.get('autostart') or ''}"
+                if item.get("scan_age_seconds") is not None:
+                    detail += f" · 最近扫描 {_age_text(item['scan_age_seconds'])}前"
                 if program:
                     detail += f" · {program}"
                 entries.append(
