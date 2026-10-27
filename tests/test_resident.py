@@ -106,6 +106,36 @@ class TestResidentTasks(unittest.TestCase):
         self.assertEqual(names, ["网络防护", "体检与清理"])
 
 
+class TestRuntimeState(unittest.TestCase):
+    """「在跑」不能只写 pid：还要能看出跑了多久、看门狗上一轮扫描是什么时候。"""
+
+    def test_elapsed_formats(self):
+        self.assertEqual(g._human_elapsed("05:23"), "5 小时 23 分")
+        self.assertEqual(g._human_elapsed("02-03:04:05"), "2 天 3 小时")
+        self.assertEqual(g._human_elapsed("00:00"), "不到 1 分")
+
+    def test_last_scan_reads_the_log_tail(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-scan-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log = tmp / ".local" / "state" / "claude-guard" / "net-guard.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("2026-10-27T21:27:50+08:00 scan clean\n", encoding="utf-8")
+        old_home = g.HOME
+        g.HOME = tmp
+        self.addCleanup(setattr, g, "HOME", old_home)
+        stamp, age = g._watchdog_last_scan()
+        self.assertEqual(stamp, "2026-10-27T21:27:50+08:00")
+        self.assertIsNotNone(age)
+
+    def test_missing_log_is_not_an_error(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-noscan-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        old_home = g.HOME
+        g.HOME = tmp
+        self.addCleanup(setattr, g, "HOME", old_home)
+        self.assertEqual(g._watchdog_last_scan(), (None, None))
+
+
 class TestResidentSectionInHtml(unittest.TestCase):
     def test_section_renders_when_the_report_has_it(self):
         report = {

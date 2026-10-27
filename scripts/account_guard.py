@@ -5283,6 +5283,52 @@ def _is_skill_owned(label: str, program: str) -> bool:
     return label.startswith(("com.violetscarhui.claude-", "local.claude-"))
 
 
+def _human_elapsed(raw: str) -> str:
+    """`ps -o etime=` 的三种形状转成「1 天 2 小时」这种，读不出来就原样返回。"""
+    raw = raw.strip()
+    days = 0
+    if "-" in raw:
+        head, _, raw = raw.partition("-")
+        try:
+            days = int(head)
+        except ValueError:
+            return raw
+    parts = [int(p) for p in raw.split(":") if p.isdigit()]
+    if not parts:
+        return raw
+    hours, minutes = 0, 0
+    if days:
+        hours = parts[0] if parts else 0
+    else:
+        if len(parts) >= 2:
+            hours = parts[0]
+        minutes = parts[-1] if len(parts) < 3 else parts[1]
+    bits = []
+    if days:
+        bits.append(f"{days} 天")
+    if hours:
+        bits.append(f"{hours} 小时")
+    if minutes and not days:
+        bits.append(f"{minutes} 分")
+    return " ".join(bits) or "不到 1 分"
+
+
+def _watchdog_last_scan(now: dt.datetime | None = None) -> tuple[str | None, float | None]:
+    """看门狗日志最后一条扫描的时间与距今秒数；没有日志就 (None, None)。"""
+    path = HOME / ".local" / "state" / "claude-guard" / "net-guard.log"
+    try:
+        tail = path.read_text(errors="replace").splitlines()[-1].strip()
+    except (OSError, IndexError):
+        return None, None
+    stamp = tail.split(" ", 1)[0] if tail else ""
+    try:
+        when = dt.datetime.fromisoformat(stamp)
+    except ValueError:
+        return None, None
+    now = now or dt.datetime.now(when.tzinfo)
+    return when.isoformat(timespec="seconds"), max(0.0, (now - when).total_seconds())
+
+
 def check_resident_tasks() -> dict:
     """A30 本 skill 装出来的常驻程序：谁在跑、谁设了开机自启、谁被禁用。
 
@@ -5360,6 +5406,15 @@ def check_resident_tasks() -> dict:
             out["autostart"] += 1
         if running:
             out["running"] += 1
+        elapsed = ""
+        if running:
+            code_e, body_e = run(["ps", "-o", "etime=", "-p", pid], timeout=5)
+            if code_e == 0 and body_e.strip():
+                elapsed = _human_elapsed(body_e)
+        last_scan = None
+        scan_age = None
+        if "net_guard.py" in program:
+            last_scan, scan_age = _watchdog_last_scan()
         out["items"].append({
             "label": label,
             "function": resident_function(program),
@@ -5370,6 +5425,9 @@ def check_resident_tasks() -> dict:
             "autostart": autostart,
             "program": program,
             "plist": str(plist) if plist.exists() else None,
+            "elapsed": elapsed,
+            "last_scan": last_scan,
+            "scan_age_seconds": scan_age,
         })
 
     out["total"] = len(out["items"])
