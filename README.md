@@ -87,6 +87,10 @@ python3 scripts/net_guard.py --status           # 在不在跑
 python3 scripts/net_guard.py --uninstall        # 卸载
 ```
 
+还带一个可选的出口锁定：`--init-lock --expected-ip <住宅出口IP>` 之后，每 30 秒顺带查一次
+真实出口 IP（走本地代理），变了或判成机房就写日志 + 发系统通知。判定用 `scripts/ip_judge.py`
+多源交叉（ip-api / ipinfo / ipwho.is），判不准返回 `UNKNOWN` 而不是猜，结果缓存一周。
+
 它**不会**把「Clash 规则选了 DIRECT」当成直连——那种流量仍然走 TUN。它抓的是「绕过了隧道」。
 判据、误杀边界与已知盲区见 [references/net-guard.md](references/net-guard.md)。
 
