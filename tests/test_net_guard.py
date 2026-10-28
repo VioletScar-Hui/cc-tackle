@@ -14,6 +14,7 @@ import ipaddress
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from collections import deque
 from unittest import mock
@@ -200,3 +201,99 @@ class TestLaunchAgentPlist(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestExitLock(unittest.TestCase):
+    """出口锁定：配置读取、一次检查的各种判定、CLI 初始化。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = pathlib.Path(self.tmp.name)
+        self.old_cfg, self.old_state = ng.LOCK_CONFIG, ng.LOCK_STATE
+        self.old_dir = ng.STATE_DIR
+        ng.LOCK_CONFIG = base / "ip-lock.json"
+        ng.STATE_DIR = base / "state"
+        ng.LOCK_STATE = ng.STATE_DIR / "ip-lock.state.json"
+        self.patches = [
+            mock.patch.object(ng, "append_log", lambda line: None),
+            mock.patch.object(ng, "_notify", lambda *a, **k: None),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        ng.LOCK_CONFIG, ng.LOCK_STATE, ng.STATE_DIR = self.old_cfg, self.old_state, self.old_dir
+        self.tmp.cleanup()
+
+    def cfg(self, **kw):
+        base = {"expected_ip": "1.2.3.4", "proxy": "http://127.0.0.1:7890",
+                "interval": 30, "require_residential": True, "notify": True}
+        base.update(kw)
+        return base
+
+    def test_no_config_means_disabled(self):
+        self.assertIsNone(ng.load_lock_config())
+
+    def test_config_roundtrip_and_defaults(self):
+        ng.save_lock_config({"expected_ip": "1.2.3.4"})
+        cfg = ng.load_lock_config()
+        self.assertEqual(cfg["expected_ip"], "1.2.3.4")
+        self.assertEqual(cfg["proxy"], ng.DEFAULT_PROXY)
+        self.assertEqual(cfg["interval"], 30)
+        self.assertTrue(cfg["require_residential"])
+
+    def test_empty_expected_ip_disables(self):
+        ng.LOCK_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        ng.LOCK_CONFIG.write_text('{"expected_ip": ""}')
+        self.assertIsNone(ng.load_lock_config())
+
+    def test_ok_when_ip_and_residential_match(self):
+        with mock.patch.object(ng, "fetch_exit_ip", return_value="1.2.3.4"), \
+             mock.patch.object(ng, "judge_ip", return_value=("RESIDENTIAL", {"reason": "verizon"})):
+            event = ng.check_exit_lock(self.cfg(), verbose=False)
+        self.assertEqual(event["verdict"], "ok")
+        self.assertTrue(ng.LOCK_STATE.exists())
+
+    def test_drift_when_ip_differs(self):
+        with mock.patch.object(ng, "fetch_exit_ip", return_value="9.9.9.9"):
+            event = ng.check_exit_lock(self.cfg(), verbose=False)
+        self.assertEqual(event["verdict"], "drift")
+        self.assertIn("9.9.9.9", event["reason"])
+
+    def test_datacenter_detected(self):
+        with mock.patch.object(ng, "fetch_exit_ip", return_value="1.2.3.4"), \
+             mock.patch.object(ng, "judge_ip", return_value=("DATACENTER", {"reason": "hosting=True"})):
+            event = ng.check_exit_lock(self.cfg(), verbose=False)
+        self.assertEqual(event["verdict"], "datacenter")
+
+    def test_unknown_owner_is_not_ok(self):
+        with mock.patch.object(ng, "fetch_exit_ip", return_value="1.2.3.4"), \
+             mock.patch.object(ng, "judge_ip", return_value=("UNKNOWN", {"reason": "判不准"})):
+            event = ng.check_exit_lock(self.cfg(), verbose=False)
+        self.assertEqual(event["verdict"], "unknown-owner")
+
+    def test_residential_check_can_be_disabled(self):
+        with mock.patch.object(ng, "fetch_exit_ip", return_value="1.2.3.4"), \
+             mock.patch.object(ng, "judge_ip", side_effect=AssertionError("不该判住宅")):
+            event = ng.check_exit_lock(self.cfg(require_residential=False), verbose=False)
+        self.assertEqual(event["verdict"], "ok")
+
+    def test_unreachable(self):
+        with mock.patch.object(ng, "fetch_exit_ip", side_effect=ValueError("no route")):
+            event = ng.check_exit_lock(self.cfg(), verbose=False)
+        self.assertEqual(event["verdict"], "unreachable")
+
+    def test_init_lock_cli(self):
+        code = ng.main(["--init-lock", "--expected-ip", "5.6.7.8", "--no-residential"])
+        self.assertEqual(code, 0)
+        cfg = ng.load_lock_config()
+        self.assertEqual(cfg["expected_ip"], "5.6.7.8")
+        self.assertFalse(cfg["require_residential"])
+
+    def test_init_lock_requires_ip(self):
+        self.assertEqual(ng.main(["--init-lock"]), 2)
+
+    def test_check_ip_without_config(self):
+        self.assertEqual(ng.main(["--check-ip"]), 2)

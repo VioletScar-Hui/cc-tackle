@@ -74,3 +74,30 @@ python3 scripts/net_guard.py --uninstall          # 卸载
 - **SIP 保护的进程**：SIGKILL 会被系统拒绝，日志里记为 `kill-failed`。
 - **杀完就完了**：脚本不阻止重启，也不做持久化封禁；要彻底断，还是得在 Clash 侧把 Claude
   域名钉到固定出口组（这也是 `--audit` 里「绝不直连」那一项在查的东西）。
+
+## 出口锁定（吸收自 claude-residential-lock）
+
+看门狗管「别直连」，出口锁定管「直连之外，出口有没有变」。两件事分开：
+
+```bash
+# 配置期望的住宅出口 IP（只比 IP，并做住宅属性校验）
+python3 scripts/net_guard.py --init-lock --expected-ip 203.0.113.77
+
+# 手动查一次（走本地代理，不产生直连）
+python3 scripts/net_guard.py --check-ip
+
+# 只看配置和最近一次结果
+python3 scripts/net_guard.py --status
+```
+
+配置写在 `~/.config/claude-guard/ip-lock.json`（`expected_ip` / `proxy` / `interval` /
+`require_residential` / `notify`）。装过 LaunchAgent 后，看门狗每 `interval` 秒（默认 30）
+顺便查一次出口；IP 变了、判成机房、或者判不准，都会写日志并发 macOS 通知。
+
+判定用的是 `scripts/ip_judge.py`：同时问 ip-api、ipinfo、ipwho.is，
+任何一源 `hosting=True`、或 AS/组织名命中机房关键词（dmit/netlab/cloud/hosting…）→ 机房；
+命中家宽运营商（verizon/comcast/telecom/broadband…）→ 住宅；都认不出 → `UNKNOWN`，不猜。
+结果缓存一周在 `~/.cache/cc-tackle/ip-judge/`，离线也能用。
+
+边界：它只**告警**，不改 Clash 配置、不切节点——改配置属于人的决定，
+自动化去改容易把用户的订阅规则搞乱。要自愈，见 claude-residential-lock 的 `guard.sh`。
