@@ -172,7 +172,8 @@ class TestResidentSectionInHtml(unittest.TestCase):
         self.assertIn("已禁用", page)
         self.assertIn("1 个被禁用", page)
         self.assertIn("网络防护", page)
-        self.assertIn("防护：", page)
+        self.assertIn("这个进程保护什么", page)
+        self.assertIn("protects-box", page)
         self.assertIn("<li>每 5 秒扫一遍直连</li>", page)
         self.assertIn("<li>出口漂移每 30 秒告警</li>", page)
 
