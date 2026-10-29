@@ -214,8 +214,11 @@ h2 .hint{font-size:12px;color:var(--muted);font-weight:400}
 .na .dot{background:var(--na-bg);color:#64748b}
 .item .name{font-weight:600;font-size:14px}
 .item .detail{color:#3f4652;font-size:13px;margin-top:2px}
-    .item .protects{margin:4px 0 0 1.1em;padding:0;line-height:1.6}
-    .item .protects li{margin:1px 0}
+    .item .protects-box{margin-top:9px;background:#f6f7f4;border:1px solid var(--line);
+      border-radius:10px;padding:9px 13px}
+    .item .protects-title{font-size:13px;font-weight:700;color:var(--ink);margin-bottom:5px}
+    .item .protects{margin:0 0 0 1.15em;padding:0;line-height:1.7;font-size:14px;color:#2b3038}
+    .item .protects li{margin:2px 0}
 details{margin-top:7px}
 summary{cursor:pointer;font-size:12px;color:var(--muted);outline:none}
 summary:hover{color:var(--ink)}
@@ -660,7 +663,8 @@ def render(report: dict, before: dict = None, report_path=None,
                 protect_line = ""
                 if protects:
                     points = "".join(f"<li>{_esc(p)}</li>" for p in protects)
-                    protect_line = (f"<div class='detail'><div>防护：</div>"
+                    protect_line = (f"<div class='protects-box'>"
+                                    f"<div class='protects-title'>这个进程保护什么</div>"
                                     f"<ul class='protects'>{points}</ul></div>")
                 entries.append(
                     f"<div class='item {kind}'><div class='dot'>{mark}</div>"
@@ -679,7 +683,7 @@ def render(report: dict, before: dict = None, report_path=None,
             hint += f"，{resident['not_loaded']} 个未加载"
         resident_html = (
             f"<section><h2>本 skill 的常驻程序 <span class='hint'>{_esc(hint)}</span></h2>"
-            f"<div class='grid g3'>{''.join(cards)}</div></section>"
+            f"<div class='grid g2'>{''.join(cards)}</div></section>"
         )
     elif "A30_resident" in report and resident.get("note"):
         resident_html = (
