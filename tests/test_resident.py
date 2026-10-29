@@ -97,6 +97,17 @@ class TestResidentTasks(unittest.TestCase):
         item = [i for i in out["items"] if i["label"] == "local.running"][0]
         self.assertIn("net_guard.py", item["program"])
 
+    def test_protects_says_what_the_guard_covers(self):
+        out = self._check("PID\tStatus\tLabel\n123\t0\tlocal.running\n")
+        by_label = {item["label"]: item for item in out["items"]}
+        guard = by_label["local.running"]["protects"]
+        self.assertIsInstance(guard, list)
+        self.assertTrue(any("5 秒" in p for p in guard))
+        self.assertTrue(any("出口" in p for p in guard))
+        self.assertTrue(all(len(p) < 60 for p in guard), "每条都要短")
+        checker = by_label["local.every"]["protects"]
+        self.assertTrue(any("28 项" in p for p in checker))
+
     def test_function_groups_are_derived_from_the_script(self):
         out = self._check("PID\tStatus\tLabel\n")
         by_label = {item["label"]: item for item in out["items"]}
@@ -146,6 +157,7 @@ class TestResidentSectionInHtml(unittest.TestCase):
                 "items": [
                     {"label": "local.a", "state": "运行中（pid 7）", "autostart": "登录时启动",
                      "function": "网络防护",
+                     "protects": ["每 5 秒扫一遍直连", "出口漂移每 30 秒告警"],
                      "program": "/bin/sh /a.sh", "running": True, "loaded": True, "disabled": False},
                     {"label": "local.b", "state": "已禁用（重启也不会自启）", "autostart": "登录时启动",
                      "program": "/bin/sh /b.sh", "running": False, "loaded": False, "disabled": True},
@@ -160,6 +172,9 @@ class TestResidentSectionInHtml(unittest.TestCase):
         self.assertIn("已禁用", page)
         self.assertIn("1 个被禁用", page)
         self.assertIn("网络防护", page)
+        self.assertIn("防护：", page)
+        self.assertIn("<li>每 5 秒扫一遍直连</li>", page)
+        self.assertIn("<li>出口漂移每 30 秒告警</li>", page)
 
 
 if __name__ == "__main__":

@@ -5275,6 +5275,26 @@ def resident_function(program: str) -> str:
     return "其他"
 
 
+# 报告页上「它到底保护什么」——一句话说清边界，别让人只看到一个 pid。
+RESIDENT_PROTECTS = {
+    "网络防护": [
+        "每 5 秒扫一遍 Claude 进程的 TCP 连接",
+        "绕过隧道走 en0 / bridge 这类物理网卡 → SIGKILL 并记日志",
+        "可选出口锁定：每 30 秒查一次真实出口 IP 与住宅属性",
+        "出口漂移、判成机房、判不准 → 写日志 + 系统通知",
+        "只告警：不改 Clash 配置、不碰系统代理",
+    ],
+    "报告服务": [
+        "只在本机 127.0.0.1 提供静态报告页",
+        "不对外网、不上传任何数据",
+    ],
+    "体检与清理": [
+        "按需跑一遍 28 项体检",
+        "默认只读；自动修之前先备份",
+    ],
+}
+
+
 def _is_skill_owned(label: str, program: str) -> bool:
     """只认这个 skill 自己的常驻程序，别的软件的 agent 不往报告里塞。"""
     marker = str(SKILL_DIR)
@@ -5415,9 +5435,11 @@ def check_resident_tasks() -> dict:
         scan_age = None
         if "net_guard.py" in program:
             last_scan, scan_age = _watchdog_last_scan()
+        function = resident_function(program)
         out["items"].append({
             "label": label,
-            "function": resident_function(program),
+            "function": function,
+            "protects": RESIDENT_PROTECTS.get(function, []),
             "state": state,
             "running": running,
             "loaded": label in loaded,
