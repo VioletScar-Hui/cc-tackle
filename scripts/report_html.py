@@ -214,6 +214,8 @@ h2 .hint{font-size:12px;color:var(--muted);font-weight:400}
 .na .dot{background:var(--na-bg);color:#64748b}
 .item .name{font-weight:600;font-size:14px}
 .item .detail{color:#3f4652;font-size:13px;margin-top:2px}
+    .item .protects{margin:4px 0 0 1.1em;padding:0;line-height:1.6}
+    .item .protects li{margin:1px 0}
 details{margin-top:7px}
 summary{cursor:pointer;font-size:12px;color:var(--muted);outline:none}
 summary:hover{color:var(--ink)}
@@ -652,11 +654,19 @@ def render(report: dict, before: dict = None, report_path=None,
                     detail += f" · 最近扫描 {_age_text(item['scan_age_seconds'])}前"
                 if program:
                     detail += f" · {program}"
+                protects = item.get("protects") or []
+                if isinstance(protects, str):        # 兼容旧报告 JSON
+                    protects = [protects] if protects else []
+                protect_line = ""
+                if protects:
+                    points = "".join(f"<li>{_esc(p)}</li>" for p in protects)
+                    protect_line = (f"<div class='detail'><div>防护：</div>"
+                                    f"<ul class='protects'>{points}</ul></div>")
                 entries.append(
                     f"<div class='item {kind}'><div class='dot'>{mark}</div>"
                     f"<div style='flex:1'><div class='name-row'>"
                     f"<div class='name'>{_esc(item.get('label') or '')}</div></div>"
-                    f"<div class='detail'>{_esc(detail)}</div></div></div>"
+                    f"<div class='detail'>{_esc(detail)}</div>{protect_line}</div></div>"
                 )
             cards.append(
                 f"<div class='card'><h3>{_esc(group.get('name') or '')}"
