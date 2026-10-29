@@ -494,6 +494,7 @@ def agent_status() -> int:
     print(f"plist：{AGENT_PLIST}（{'存在' if AGENT_PLIST.exists() else '不存在'}）")
     print(f"日志：{LOG_PATH}（{LOG_PATH.stat().st_size if LOG_PATH.exists() else 0} 字节）")
     lock_status()
+    print("住宅链路锁定（规则自愈 / pf / DNS）：python3 scripts/residential_lock.py --status")
     return 0
 
 

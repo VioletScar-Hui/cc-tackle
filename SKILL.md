@@ -234,6 +234,28 @@ python3 scripts/account_guard.py --audit \
   它只告警不改配置——改 Clash 是自己的决定，别让脚本替用户改订阅规则。
 - 这一项不计入那 28 行，也没有加分：它是可选的运行时保护，不是体检结论。
 
+## 住宅链路锁定（可选，吸收自 claude-residential-lock）
+
+比看门狗更重的一层：把 Claude 的全部流量钉在一个住宅节点上——规则被订阅覆盖会自愈，
+物理网卡上的直连被 pf 挡住，代理不健康时 Claude 域名直接 NXDOMAIN。整套脚本收在
+`scripts/residential/`，统一入口是 `scripts/residential_lock.py`：
+
+```bash
+python3 scripts/residential_lock.py --status        # 参数文件 / 用户级守护 / pyyaml / root 层
+python3 scripts/residential_lock.py --init          # 交互生成参数文件（会问住宅节点、出口 IP）
+python3 scripts/residential_lock.py --install       # 装用户级自愈（LaunchAgent，30 秒 + WatchPaths）
+python3 scripts/residential_lock.py --check         # 只查规则健康，不修
+python3 scripts/residential_lock.py --discover      # 逐个节点测真实出口，找出住宅节点
+python3 scripts/residential_lock.py --selfcheck     # 真发流量验证出口 / UDP 泄漏 / 直连
+sudo python3 scripts/residential_lock.py --root-install   # pf 防火墙 + DNS 守卫（要 sudo）
+```
+
+- 用户级部分免 sudo；root 部分会改 `/etc/pf.conf`（先备份）并装两个 LaunchDaemon，
+  卸载用 `--root-uninstall`。
+- 依赖 Clash Verge（service 模式）和 pyyaml（`expand.py` 要用）。
+- 和看门狗分工：看门狗管「直连就杀」（5 秒一次）；这一套管「规则自愈 + 出口锁定 + 解析层拦截」。
+- 细节与踩坑：`references/residential-lock.md`、`references/residential-pitfalls.md`。
+
 ## 不只认 Clash
 
 上面那套判据是 mihomo 的。真正依赖代理软件的只有两行——「绝不直连」与「DNS 泄漏」，其余各项（出口 IP 与 ASN、系统代理残留、终端与 shell 残留、时区、CLI 完整性、浏览器两项）用哪一家都照跑。

@@ -87,7 +87,17 @@ python3 scripts/net_guard.py --status           # 在不在跑
 python3 scripts/net_guard.py --uninstall        # 卸载
 ```
 
-还带一个可选的出口锁定：`--init-lock --expected-ip <住宅出口IP>` 之后，每 30 秒顺带查一次
+更重一层还有「住宅链路锁定」（吸收自 claude-residential-lock）：Clash 规则自愈、pf 防火墙、
+代理不健康时 Claude 域名 NXDOMAIN。入口：
+
+```bash
+python3 scripts/residential_lock.py --status     # 先看现状
+python3 scripts/residential_lock.py --init       # 生成参数文件
+python3 scripts/residential_lock.py --install    # 装用户级自愈（免 sudo）
+sudo python3 scripts/residential_lock.py --root-install   # pf + DNS 守卫（要 sudo）
+```
+
+看门狗还带一个可选的出口锁定：`--init-lock --expected-ip <住宅出口IP>` 之后，每 30 秒顺带查一次
 真实出口 IP（走本地代理），变了或判成机房就写日志 + 发系统通知。判定用 `scripts/ip_judge.py`
 多源交叉（ip-api / ipinfo / ipwho.is），判不准返回 `UNKNOWN` 而不是猜，结果缓存一周。
 
