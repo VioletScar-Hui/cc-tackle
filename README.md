@@ -87,6 +87,10 @@ python3 scripts/net_guard.py --status           # 在不在跑
 python3 scripts/net_guard.py --uninstall        # 卸载
 ```
 
+出口体检也有一条独立命令：`python3 scripts/proxy_guard.py --check` 会指出 Claude 规则指向哪个组、
+组里几条线路、选中的节点是否活着；`--emit <client>` 能给 mihomo / sing-box / Surge / Shadowrocket 生成片段。
+（2026-10-30 的事故就是「组里只有一条线路」——见 references/client-adapters.md。）
+
 更重一层还有「住宅链路锁定」（吸收自 claude-residential-lock）：Clash 规则自愈、pf 防火墙、
 代理不健康时 Claude 域名 NXDOMAIN。入口：
 

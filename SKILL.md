@@ -256,6 +256,23 @@ sudo python3 scripts/residential_lock.py --root-install   # pf 防火墙 + DNS �
 - 和看门狗分工：看门狗管「直连就杀」（5 秒一次）；这一套管「规则自愈 + 出口锁定 + 解析层拦截」。
 - 细节与踩坑：`references/residential-lock.md`、`references/residential-pitfalls.md`。
 
+## Claude 出口体检（单点组排查）
+
+2026-10-30 实测踩过：Claude 组里只放了一条「连接线路1」，线路挂掉后 claude.ai 握手到一半断，
+claude.com 也打不开，而 GitHub/Google 全正常——因为它们走的是别的组。`select` 组不会自动切换，
+单点组就是隐性单点故障。
+
+```bash
+python3 scripts/proxy_guard.py --check        # 规则目标组 / 成员数 / 选中节点是否可用
+python3 scripts/proxy_guard.py --fix          # 组内切到可用成员（不动配置）
+python3 scripts/proxy_guard.py --fix-members --nodes "线路1,线路2,线路3,线路4"   # 补成员（Clash Verge Rev）
+python3 scripts/proxy_guard.py --emit sing-box # 生成某家客户端的组+规则片段
+```
+
+- 支持体检的：mihomo 内核（Clash Verge Rev / FlClash / Mihomo Party / ClashX）
+- 只给片段的：sing-box / Surge / Shadowrocket（无法从 Mac 侧探测）
+- 适配写法、贴哪里、事故复盘：`references/client-adapters.md`、`references/proxy-guard.md`
+
 ## 不只认 Clash
 
 上面那套判据是 mihomo 的。真正依赖代理软件的只有两行——「绝不直连」与「DNS 泄漏」，其余各项（出口 IP 与 ASN、系统代理残留、终端与 shell 残留、时区、CLI 完整性、浏览器两项）用哪一家都照跑。

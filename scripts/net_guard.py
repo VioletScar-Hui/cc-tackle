@@ -495,6 +495,7 @@ def agent_status() -> int:
     print(f"日志：{LOG_PATH}（{LOG_PATH.stat().st_size if LOG_PATH.exists() else 0} 字节）")
     lock_status()
     print("住宅链路锁定（规则自愈 / pf / DNS）：python3 scripts/residential_lock.py --status")
+    print("Claude 出口体检（单点组 / 死节点）：python3 scripts/proxy_guard.py --check")
     return 0
 
 
