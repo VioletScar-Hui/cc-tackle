@@ -1467,8 +1467,22 @@ class TestFailClosedVerdict(unittest.TestCase):
         self.assertFalse(r["fail_closed"]["ok"])
         self.assertTrue(any("select" in x for x in r["fail_closed"]["reasons"]))
 
-    def test_multi_member_select_fails(self):
+    def test_multi_member_select_is_still_fail_closed(self):
+        # 回归：多入口一度被判「不成立」，于是修好 10-30 单点组之后这一行反而变 ✗。
+        # select 不会自动切走，入口多少不改变「绝不直连」；抗单点由 proxy_guard 另判。
         r = self._check(members=["美国住宅节点 · 主线", "美国住宅节点 · 备用"])
+        self.assertTrue(r["fail_closed"]["ok"], r["fail_closed"]["reasons"])
+        self.assertFalse(r["claude_group"]["single_member"])
+
+    def test_direct_member_in_claude_group_fails(self):
+        # 成员里能选到 DIRECT 就是漏：多入口没问题，可直连的入口有问题。
+        r = self._check(members=["美国住宅节点 · 主线", "DIRECT"])
+        self.assertFalse(r["fail_closed"]["ok"])
+        self.assertTrue(any("直连" in x for x in r["fail_closed"]["reasons"]),
+                        r["fail_closed"]["reasons"])
+
+    def test_empty_claude_group_fails(self):
+        r = self._check(members=[])
         self.assertFalse(r["fail_closed"]["ok"])
         self.assertTrue(any("成员" in x for x in r["fail_closed"]["reasons"]))
 
@@ -1477,6 +1491,22 @@ class TestFailClosedVerdict(unittest.TestCase):
         r = self._check(hc=True)
         self.assertTrue(r["claude_group"]["healthcheck"])
         self.assertTrue(r["fail_closed"]["ok"])
+
+    def test_summary_marks_single_member_group_as_advisory(self):
+        # 单入口不是泄漏，所以打 ✓，但要把「单点组」的后果写进说明，别让用户以为没事
+        r = self._check()
+        row = [x for x in g.build_summary({"A12_clash_groups": r})
+               if x[0] == "绝不直连"][0]
+        self.assertIs(row[1], g.S_OK)
+        self.assertIn("单点组", row[2])
+
+    def test_summary_counts_multiple_entries(self):
+        r = self._check(members=["美国住宅节点 · 主线", "美国住宅节点 · 备用"])
+        row = [x for x in g.build_summary({"A12_clash_groups": r})
+               if x[0] == "绝不直连"][0]
+        self.assertIs(row[1], g.S_OK)
+        self.assertIn("2 个入口", row[2])
+        self.assertNotIn("单点组", row[2])
 
 
 class TestSummaryTable(unittest.TestCase):
@@ -2734,15 +2764,15 @@ class TestFailClosedIsModeAware(unittest.TestCase):
         self.assertFalse(fc["ok"])
         self.assertTrue(any("select" in r for r in fc["reasons"]), fc["reasons"])
 
-    def test_multi_member_claude_group_fails(self):
+    def test_multi_member_claude_group_passes(self):
+        # select 不会自己切走，多入口仍是「绝不直连」；只有 DIRECT/REJECT 成员才会漏。
         prox = {"Claude": {"type": "Selector", "now": "N1", "all": ["N1", "N2"]},
                 "GLOBAL": {"type": "Selector", "now": "Claude", "all": ["Claude"]}}
         rules = [{"type": "DomainSuffix", "payload": "claude.ai", "proxy": "Claude"},
                  {"type": "Match", "payload": "", "proxy": "Residential"}]
         self._patch("rule", prox, rules)
         fc = g.check_clash_groups()["fail_closed"]
-        self.assertFalse(fc["ok"])
-        self.assertTrue(any("成员" in r for r in fc["reasons"]))
+        self.assertTrue(fc["ok"], fc["reasons"])
 
     def test_statsigapi_is_recognized_as_a_claude_rule(self):
         # 回归：只按域名关键词过滤会漏掉这条——名字里既没有 anthropic 也没有 claude

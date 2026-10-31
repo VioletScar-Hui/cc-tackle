@@ -91,6 +91,9 @@ def check_files() -> None:
         "tests/test_account_guard.py",
         "tests/test_net_guard.py",
         "references/article-mapping.md",
+        "references/manual-checklist.md",
+        "references/scripts-index.md",
+        "references/verification-status.md",
     ]
     missing = [p for p in need if not (SKILL / p).exists()]
     if missing:

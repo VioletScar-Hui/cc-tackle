@@ -2592,7 +2592,12 @@ def check_clash_groups() -> dict:
     判成矛盾的毛病是同一个。
 
     两种模式共同的要求：Claude 组必须是 select（不做健康检查、不自动切换）、
-    只有一个成员、没有可切换的对象。
+    成员不少于一个、成员里不能有 DIRECT/REJECT 这种会直连的出口。
+
+    成员数不是这一项的判据。多入口的 select 组同样不会自己切走，`select` 这个类型
+    条件已经保证「不自动切换」；入口多一条并不意味着会漏。10-30 的单点组事故补的
+    是另一件事——组里只有一条线路时它挂掉 Claude 就整体不可用，那属于抗故障能力，
+    由 `scripts/proxy_guard.py --check` 单独判，不混进「绝不直连」。
     """
     out = {
         "reachable": False, "mode": None, "tun": {}, "groups": [], "auto_switching": [],
@@ -2651,6 +2656,8 @@ def check_clash_groups() -> dict:
         "now": claude.get("now"),
         "members": members,
         "healthcheck": bool(claude.get("url") or claude.get("interval")),
+        # 单入口是抗故障问题，不是泄漏问题：判据不因此不成立，只作为提示。
+        "single_member": len(members) == 1,
     }
 
     # rule 模式下还要知道规则怎么写的
@@ -2695,8 +2702,13 @@ def check_clash_groups() -> dict:
 
     if claude.get("type") != "Selector":
         reasons.append(f"Claude 组类型是 {claude.get('type')}，只有 select 才不做健康检查切换")
-    if len(members) != 1:
-        reasons.append(f"Claude 组有 {len(members)} 个成员，存在切换可能")
+    if not members:
+        reasons.append("Claude 组一个成员都没有")
+    direct_members = [m for m in members if str(m).strip().upper() in ("DIRECT", "REJECT")]
+    if direct_members:
+        reasons.append(
+            f"Claude 组成员里有 {direct_members}，选中它 Claude 流量就直连了"
+        )
     # 不判 healthcheck：select 组即使写了 url/interval 也只是拿来显示延迟，
     # mihomo 的 select 不做健康检查切换。真正会自己换的是 Fallback/URLTest，
     # 那种情况上面的类型判据已经拦住了。
@@ -4616,7 +4628,11 @@ def build_summary(report: dict) -> list:
         else:
             detail = (f"规则模式，{n_rules} 条规则把 Claude 域名交给专用组 → {grp.get('now')}"
                       f"；兜底 {(cg.get('fallback') or {}).get('proxy')}")
-        add("绝不直连", S_OK, detail + "（单成员、无健康检查、不自动切换）")
+        n_entry = len(grp.get("members") or [])
+        tail = f"（select、不自动切换；{n_entry} 个入口"
+        if grp.get("single_member"):
+            tail += "；单点组，这条线路挂了 Claude 会整体不可用，用 proxy_guard.py --check 查"
+        add("绝不直连", S_OK, detail + tail + "）")
     else:
         add("绝不直连", S_BAD, "；".join(fc.get("reasons") or ["判据不成立"]))
 
@@ -6177,7 +6193,7 @@ MANUAL_CHECKS = (
          "应为 global。规则模式下有 GeoSite,cn,DIRECT 这类分支，不是「绝不直连」的形态"),
         ("GLOBAL 指向哪个组", "本会话补",
          (SOCK_HINT,),
-         "应指向 Claude 专用组，且该组只有一个成员。只有 select 类型才不做健康检查切换"),
+         "应指向 Claude 专用组，组类型必须是 select（不做健康检查切换），成员里不能有 DIRECT/REJECT。多个入口不影响这一项——能不能抗单点由 proxy_guard.py --check 另判"),
         ("实际走哪条链", "本会话补",
          (SOCK_HINT,),
          "链里应只有 GLOBAL → Claude → 节点。出现 DIRECT 或 自动切换 就是漏了"),

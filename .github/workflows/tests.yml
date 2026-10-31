@@ -34,10 +34,13 @@ jobs:
         run: python -m pip install --disable-pip-version-check "PyYAML==6.0.3"
 
       - name: Compile Python modules
-        run: python -m py_compile scripts/account_guard.py scripts/selfcheck.py scripts/net_guard.py scripts/ip_judge.py scripts/residential_lock.py scripts/proxy_guard.py scripts/client_adapters.py
+        run: python -m compileall -q scripts
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+
+      - name: Verify reproducible skill package
+        run: python tools/package_skill.py --check --require SKILL.md --require scripts/account_guard.py
 
       - name: Check command help
         run: python scripts/account_guard.py --help
