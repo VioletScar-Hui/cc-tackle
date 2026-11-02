@@ -111,3 +111,12 @@
 **后果**：root 层必须由用户显式确认；非 Verge 环境（裸 mihomo、非 Verge 配置目录）要按 [`references/residential-pitfalls.md`](../references/residential-pitfalls.md) 调整，不能照搬默认路径。
 
 证据：[`SKILL.md`](../SKILL.md)「住宅链路锁定」、[`references/residential-lock.md`](../references/residential-lock.md)、[`tests/test_residential_lock.py`](../tests/test_residential_lock.py)。
+
+## ADR-013 · Claude 组放订阅的全部线路，落点是组增强文件
+
+**状态**：已采纳（2026-11-02）
+**背景**：2026-10-30 的单点组事故，修法是手工把四条入口线路贴进 Claude 组；手工清单会随订阅换线路而失效，而组里只剩一条就是单点故障。另一头 `--fix-members` 第一版会扫描所有含同名组的 profile，把当前订阅的线路名写进别的订阅的模板——那份配置缺这些节点，是真坏配置。
+**决定**：Claude 组应当覆盖当前订阅 `proxies:` 里的全部节点，而不是固定条数；同步用 `--fix-members --all`，比对逻辑进 `--check`；写入只碰当前订阅的组增强文件（`option.groups` 指向的那份）与运行时 `clash-verge.yaml`，其它 profile 跳过并打印文件名；只补不删，旧名字由检查报出来、由人决定怎么清。组类型仍是 `select`，多入口不改变「不自动切换」。
+**后果**：订阅换了线路要再跑一次同步；没有组增强文件的订阅只能改运行时，会在订阅更新后被覆盖，脚本必须明确提示。
+
+证据：[`references/proxy-guard.md`](../references/proxy-guard.md)、[`SKILL.md`](../SKILL.md)「Claude 出口体检」、[`tests/test_proxy_guard.py`](../tests/test_proxy_guard.py) 的 `TestSubscriptionSync`。

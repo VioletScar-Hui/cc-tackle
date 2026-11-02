@@ -121,13 +121,16 @@ def notes(client: str) -> str:
     """每个客户端「片段贴哪儿」的一句话说明。"""
     key = client.strip().lower()
     table = {
-        "mihomo": "贴进 mihomo 的 config.yaml（proxy-groups 与 rules 同级追加）。",
+        "mihomo": "贴进 mihomo 的 config.yaml（proxy-groups 与 rules 同级追加）；"
+                  "组里要列订阅里的全部线路，不是只列一条。",
         "clash-verge": "Clash Verge Rev：写进「订阅 → 编辑 → 全局扩展/Merge」，别直接改 clash-verge.yaml"
-                       "（订阅一更新就被覆盖）。",
-        "flclash": "FlClash：在「配置 → 编辑」里给 profile 加，或做成 Override 配置。",
+                       "（订阅一更新就被覆盖）；用 `proxy_guard.py --fix-members --all` "
+                       "可以从订阅一次同步全部线路。",
+        "flclash": "FlClash：在「配置 → 编辑」里给 profile 加，或做成 Override 配置；"
+                   "组里列订阅的全部线路。",
         "mihomo-party": "Mihomo Party：用「覆写」功能加 group 与 rules，不要只改运行时配置。",
         "sing-box": "sing-box：合并进 config.json 的 outbounds 与 route.rules（节点 outbound 先存在）。",
-        "surge": "Surge：Proxy Group 和 Rule 都在策略文件里；Mac 上可直接编辑。",
+        "surge": "Surge：Proxy Group 和 Rule 都在策略文件里；组里列订阅的全部线路。",
         "shadowrocket": "Shadowrocket 在 iOS 上，Mac 侧探测不到；在 App 的「配置」里加 [Rule]，"
                         "策略组名要和 App 里建的一致。",
     }

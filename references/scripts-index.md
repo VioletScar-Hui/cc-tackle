@@ -12,7 +12,7 @@
 | [`report_serve.py`](../scripts/report_serve.py) | 回环服务 + 页面上的修复按钮；URL 带令牌、POST 需自定义头、动作白名单；空闲自动退出 | `--no-open`、`--timeout`（默认 1800 秒）、`--roots` |
 | [`net_guard.py`](../scripts/net_guard.py) | 直连看门狗：每 5 秒扫 Claude 进程的 TCP 连接，路由落物理网卡就 SIGKILL；附带出口锁定告警 | `--once`、`--dry-run`、`--interval`（默认 5）、`--install --yes`、`--uninstall`、`--status`、`--init-lock --expected-ip`、`--check-ip`、`--no-residential`、`--proxy`、`--lock-interval`（默认 30） |
 | [`ip_judge.py`](../scripts/ip_judge.py) | 单个出口 IP 的住宅 / 机房判定：多源交叉、关键词兜底、判不准 `UNKNOWN`、缓存一周 | `<IP>`、`--json`、`--batch`（stdin 逐行）、`--no-cache` |
-| [`proxy_guard.py`](../scripts/proxy_guard.py) | Claude 出口体检：规则目标组、成员数、选中节点是否可用；单点组告警；组内切换 / 补成员 / 生成片段 | `--check`（默认）、`--json`、`--fix`、`--fix-members`、`--nodes`、`--emit <client>`、`--clients`、`--policy`（默认组名 `Claude`）、`--no-reload` |
+| [`proxy_guard.py`](../scripts/proxy_guard.py) | Claude 出口体检：规则目标组、成员数、选中节点是否可用、组里是否已包含订阅全部线路；组内切换 / 从订阅同步成员 / 生成片段 | `--check`（默认）、`--json`、`--fix`、`--fix-members`、`--all`（同步订阅全部线路）、`--nodes`、`--dry-run`、`--emit <client>`、`--clients`、`--policy`（默认组名 `Claude`）、`--no-reload` |
 | [`client_adapters.py`](../scripts/client_adapters.py) | 六种客户端的「组 + 规则」模板（库模块，没有独立 CLI，由 `proxy_guard.py --emit` 调用） | 无 |
 | [`residential_lock.py`](../scripts/residential_lock.py) | 住宅链路锁定的统一入口，把 `scripts/residential/` 下散落的脚本映射成动作 | `--status`、`--init`、`--install`、`--uninstall`、`--check`、`--discover`、`--selfcheck`、`--root-install`、`--root-uninstall`、`--dry-run` |
 

@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.1.0-111827?style=flat-square" alt="version 1.1.0" />
+    <img src="https://img.shields.io/badge/version-1.1.1-111827?style=flat-square" alt="version 1.1.1" />
   </p>
   <p>
     <a href="#what-it-does">What it does</a> ·
@@ -181,16 +181,17 @@ It **does not** treat "a Clash rule selected DIRECT" as a direct connection — 
 
 The watchdog also includes an optional egress lock: after `--init-lock --expected-ip <residential egress IP>`, it also queries the real egress IP every 30 seconds; if it changes or is judged a datacenter, it writes a log and sends a system notification. The judgment uses multi-source cross-checks in [`scripts/ip_judge.py`](scripts/ip_judge.py) (ip-api / ipinfo / ipwho.is); when it cannot decide, it returns `UNKNOWN` rather than guessing, and caches results for one week. It only alerts; it does not change configuration.
 
-**Claude egress check**: Hit in real testing on 2026-10-30 — the Claude group had only one route; when that route went down, claude.ai and claude.com both lost connectivity while other sites worked normally because they used other groups.
+**Claude egress check**: Hit in real testing on 2026-10-30 — the Claude group had only one route; when that route went down, claude.ai and claude.com both lost connectivity while other sites worked normally because they used other groups. **The rule now is: the Claude group holds every route from the subscription, not just one**; when the subscription changes routes, run `--fix-members --all` once to resync.
 
 ```bash
-python3 scripts/proxy_guard.py --check        # which group the rules point to, how many routes, whether the selected node is alive
+python3 scripts/proxy_guard.py --check        # which group the rules point to, how many routes, whether the selected node is alive, which subscription routes are missing
 python3 scripts/proxy_guard.py --fix          # switch in place when the group has a live node
-python3 scripts/proxy_guard.py --fix-members --nodes "line1,line2,line3,line4"
+python3 scripts/proxy_guard.py --fix-members --all              # sync every route from the subscription into the Claude group
+python3 scripts/proxy_guard.py --fix-members --all --dry-run    # show what would change without writing
 python3 scripts/proxy_guard.py --emit sing-box   # generate snippets for mihomo / sing-box / Surge / Shadowrocket
 ```
 
-A single-route group, a dead node, and a missing rule each get their own conclusion; only the local mihomo family (Clash Verge Rev / FlClash / Mihomo Party / ClashX) can be probed, and for the rest only snippets are emitted. Incident review and per-client configuration instructions: [`references/client-adapters.md`](references/client-adapters.md).
+A single-route group, a dead node, a missing rule, and an out-of-sync subscription each get their own conclusion; only the local mihomo family (Clash Verge Rev / FlClash / Mihomo Party / ClashX) can be probed, and for the rest only snippets are emitted. Incident review and per-client configuration instructions: [`references/client-adapters.md`](references/client-adapters.md).
 
 **Residential route lock**: a heavier layer than the watchdog — Clash rules self-heal, the pf firewall blocks direct connections through the physical NIC, and Claude domains return NXDOMAIN directly when the proxy is unhealthy. The full set of scripts lives in [`scripts/residential/`](scripts/residential/), with a unified entry point at `scripts/residential_lock.py`:
 
@@ -340,7 +341,7 @@ If the local secret is not the default value, inject the `CLASH_SECRET` environm
 
 - **Unit tests**: `python3 -m unittest discover -s tests` currently has 800+ cases (the `Ran N tests` line is authoritative), covering criteria, result-table alignment, backup before write, non-TTY rejection, the rule that missing fields in the result table must not default to clean, the bash 3.2 multibyte-variable regression, and per-client snippet formats. They all run on synthetic fixtures and do not touch real configuration, real proxies, or real browser permissions.
 - **CI**: macOS + Python 3.11/3.13; runs compile checks, the full unit test suite, command help, and reproducible packaging (two builds of the same zip must be byte-identical).
-- **Tested on a real machine**: verified on a local macOS 27.0 machine: mihomo / Clash Verge Rev rule and group criteria, TUN takeover and fake-ip, reloading a real sing-box instance, browser verification page callbacks, the 2026-10-30 single-route group incident and its fix, and re-verification after an egress switch.
+- **Tested on a real machine**: verified on a local macOS 27.0 machine: mihomo / Clash Verge Rev rule and group criteria, TUN takeover and fake-ip, reloading a real sing-box instance, browser verification page callbacks, the 2026-10-30 single-route group incident and its fix, re-verification after an egress switch, and the 2026-11-02 subscription sync (all 4 subscription routes are in the Claude group on this machine; `--check` reports no missing routes).
 - **Not verified, and not pretending otherwise**: Windows and Linux, browsers other than Chromium, every proxy client version installed manually by users, and causal relationships in server-side risk controls.
 - Per-item evidence levels and last real-machine dates are in [`references/verification-status.md`](references/verification-status.md); test coverage and gaps are in [`tests/README.md`](tests/README.md).
 

@@ -2,6 +2,23 @@
 
 本文件按交付批次记录变化，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。版本号与 `SKILL.md` frontmatter 里的 `metadata.version` 保持一致；`1.0.4` 及更早的版本号是事后回填的，依据见文末「版本号说明」。
 
+## [1.1.1] - 2026-11-02
+
+### Added
+
+- `proxy_guard.py --fix-members --all`：从当前订阅的 profile 读出 `proxies:` 下的全部线路名，按订阅顺序同步进 Claude 组；`--dry-run` 只打印「会改哪几个文件、成员从几条变几条、新增哪些名字」，不写文件也不建备份。
+- `--check` 现在比对「订阅有几条线路 / 组里有几条 / 缺哪几条」，并把组里「不在当前订阅里」的旧名字也报出来（选中它们会连不上）；JSON 输出新增 `subscription` 字段与 `fixable_by_sync` 标记。
+- `docs/decisions.md` ADR-013：Claude 组覆盖订阅全部线路，落点是该订阅的组增强文件。
+
+### Changed
+
+- `--fix-members` 只写两份文件：运行时 `clash-verge.yaml` 与**当前订阅**的组增强文件（`profiles.yaml` 里该订阅 `option.groups` 指向的那份）。别的订阅/模板里即使有同名组也跳过并打印文件名——第一版会把当前订阅的线路名写进别的订阅的模板，那份配置缺这些节点，是真坏配置。
+- 备份后缀从固定的 `.bak-20261031` 改成 `.bak-20261102`。
+
+### Fixed
+
+- 订阅换了线路名之后，Claude 组里残留的旧名字以前只会被算进「成员数」；现在单独报成「不在当前订阅里」。
+
 ## [1.1.0] - 2026-10-31
 
 本批次。代码部分见提交 `e20141b` 与本批次的 A12 判据修正（见 Fixed），文档部分随本批次一起整理（README、SKILL.md、本文件与维护文档）。

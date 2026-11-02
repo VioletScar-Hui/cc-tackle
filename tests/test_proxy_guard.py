@@ -159,5 +159,220 @@ class TestCommands(unittest.TestCase):
             self.assertEqual(pg.main(["--fix-members", "--nodes", "a,b"]), 2)
 
 
+class TestSubscriptionSync(unittest.TestCase):
+    """Claude 组要放订阅里的全部线路，而不是只放一条。
+
+    2026-10-30 的修法先是手工往组里补了四条名字；这里把「从当前订阅同步」这件事
+    固化下来：读订阅 profile 的 proxies 列表，只改当前订阅的组增强文件与运行时配置，
+    别把别的订阅的模板一起改坏。
+    """
+
+    PROFILES = (
+        "# Profiles Config for Clash Verge\n"
+        "current: act1\n"
+        "items:\n"
+        "- uid: Merge\n"
+        "  type: merge\n"
+        "  file: Merge.yaml\n"
+        "- uid: act1\n"
+        "  type: remote\n"
+        "  name: 住宅订阅\n"
+        "  file: act1.yaml\n"
+        "  selected:\n"
+        "- name: Claude\n"
+        "  now: line1\n"
+        "  option:\n"
+        "    groups: grp1\n"
+        "- uid: grp1\n"
+        "  type: groups\n"
+        "  file: grp1.yaml\n"
+        "- uid: old1\n"
+        "  type: remote\n"
+        "  file: old1.yaml\n"
+        "  option:\n"
+        "    groups: oldgrp\n"
+        "- uid: oldgrp\n"
+        "  type: groups\n"
+        "  file: oldgrp.yaml\n"
+    )
+
+    PROFILE = (
+        "mixed-port: 7890\n"
+        "proxies:\n"
+        '  - name: "line1"\n'
+        "    type: vless\n"
+        "    server: 1.1.1.1\n"
+        "  - name: line2\n"
+        "    type: vless\n"
+        "    server: 2.2.2.2\n"
+        "  - {name: line3, type: vless, server: 3.3.3.3}\n"
+        "proxy-groups:\n"
+        "- name: IpEqual\n"
+        "  type: select\n"
+        "  proxies:\n"
+        "  - line1\n"
+        "  - DIRECT\n"
+    )
+
+    RUNTIME = [
+        "proxy-groups:",
+        "- name: Claude",
+        "  type: select",
+        "  proxies:",
+        "  - line1",
+        "- name: IpEqual",
+        "  type: select",
+        "  proxies:",
+        "  - line1",
+    ]
+
+    GROUPS = [
+        "prepend:",
+        "  - name: Claude",
+        "    type: select",
+        "    proxies:",
+        "      - line1",
+        "",
+        "append: []",
+    ]
+
+    OLD_GROUPS = [
+        "prepend:",
+        "  - name: Claude",
+        "    type: select",
+        "    proxies:",
+        "      - old-line",
+        "",
+        "append: []",
+    ]
+
+    def make_verge(self):
+        """造一个最小的 Verge 目录：profiles.yaml + 当前订阅 + 两份组文件 + 运行时。"""
+        import shutil
+        import tempfile
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="proxy-guard-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "profiles").mkdir()
+        (tmp / "profiles.yaml").write_text(self.PROFILES, encoding="utf-8")
+        (tmp / "profiles" / "act1.yaml").write_text(self.PROFILE, encoding="utf-8")
+        (tmp / "profiles" / "grp1.yaml").write_text("\n".join(self.GROUPS) + "\n", encoding="utf-8")
+        (tmp / "profiles" / "oldgrp.yaml").write_text(
+            "\n".join(self.OLD_GROUPS) + "\n", encoding="utf-8")
+        (tmp / "profiles" / "Merge.yaml").write_text("prepend: []\n", encoding="utf-8")
+        (tmp / "clash-verge.yaml").write_text(
+            "\n".join(self.RUNTIME) + "\n", encoding="utf-8")
+        return tmp
+
+    def test_parse_profiles_reads_current_and_enhancement(self):
+        doc = pg.parse_profiles(self.PROFILES)
+        self.assertEqual(doc["current"], "act1")
+        item = doc["items"]["act1"]
+        self.assertEqual(item["file"], "act1.yaml")
+        self.assertEqual(item["groups"], "grp1")
+        self.assertEqual(item["name"], "住宅订阅")
+
+    def test_subscription_nodes_keeps_order_and_skips_groups(self):
+        self.assertEqual(pg.subscription_nodes(self.PROFILE), ["line1", "line2", "line3"])
+
+    def test_subscription_nodes_flow_style(self):
+        text = "proxies: [{name: a, type: ss}, {name: 'b', type: ss}]\n"
+        self.assertEqual(pg.subscription_nodes(text), ["a", "b"])
+
+    def test_subscription_nodes_missing_block_is_empty(self):
+        self.assertEqual(pg.subscription_nodes("mode: rule\n"), [])
+
+    def test_verge_profile_maps_the_enhancement_file(self):
+        tmp = self.make_verge()
+        with mock.patch.object(pg, "VERGE_DIR", tmp):
+            profile = pg.verge_profile()
+            self.assertEqual(profile["uid"], "act1")
+            self.assertEqual(profile["groups_file"], tmp / "profiles" / "grp1.yaml")
+            self.assertEqual(pg.subscription_nodes_from_verge(),
+                             ["line1", "line2", "line3"])
+
+    def test_sync_targets_only_touches_the_active_subscription(self):
+        tmp = self.make_verge()
+        with mock.patch.object(pg, "VERGE_DIR", tmp):
+            targets, skipped = pg.sync_targets("Claude")
+        self.assertEqual(targets, [tmp / "clash-verge.yaml", tmp / "profiles" / "grp1.yaml"])
+        self.assertEqual(skipped, [tmp / "profiles" / "oldgrp.yaml"])
+
+    def test_fix_members_all_writes_active_files_only(self):
+        tmp = self.make_verge()
+        old_before = (tmp / "profiles" / "oldgrp.yaml").read_text(encoding="utf-8")
+        with mock.patch.object(pg, "VERGE_DIR", tmp), \
+             mock.patch.object(pg, "find_socket", return_value=None), \
+             mock.patch("builtins.print"):
+            self.assertEqual(pg.fix_members(["line1", "line2", "line3"], hot_reload=False), 0)
+        runtime = (tmp / "clash-verge.yaml").read_text(encoding="utf-8")
+        groups = (tmp / "profiles" / "grp1.yaml").read_text(encoding="utf-8")
+        for text in (runtime, groups):
+            self.assertIn("- line2", text)
+            self.assertIn("- line3", text)
+        self.assertEqual((tmp / "profiles" / "oldgrp.yaml").read_text(encoding="utf-8"),
+                         old_before, "别的订阅的模板不能被写")
+        self.assertTrue((tmp / "profiles" / "grp1.yaml.bak-20261102").exists())
+        self.assertTrue((tmp / "clash-verge.yaml.bak-20261102").exists())
+
+    def test_fix_members_dry_run_writes_nothing(self):
+        tmp = self.make_verge()
+        runtime_before = (tmp / "clash-verge.yaml").read_text(encoding="utf-8")
+        with mock.patch.object(pg, "VERGE_DIR", tmp), mock.patch("builtins.print"):
+            self.assertEqual(pg.fix_members(["line1", "line2"], dry_run=True), 0)
+        self.assertEqual((tmp / "clash-verge.yaml").read_text(encoding="utf-8"),
+                         runtime_before)
+        self.assertFalse(list(tmp.glob("*.bak-*")))
+
+    def test_fix_members_all_without_verge_is_an_error(self):
+        with mock.patch.object(pg, "VERGE_DIR", pathlib.Path("/nonexistent")), \
+             mock.patch("builtins.print"):
+            self.assertEqual(pg.main(["--fix-members", "--all"]), 2)
+
+    def test_all_and_nodes_are_mutually_exclusive(self):
+        with mock.patch("builtins.print"):
+            self.assertEqual(pg.main(["--fix-members", "--all", "--nodes", "a,b"]), 2)
+
+    def test_main_syncs_all_subscription_lines(self):
+        tmp = self.make_verge()
+        with mock.patch.object(pg, "VERGE_DIR", tmp), \
+             mock.patch.object(pg, "find_socket", return_value=None), \
+             mock.patch("builtins.print"):
+            self.assertEqual(pg.main(["--fix-members", "--all", "--no-reload"]), 0)
+        runtime = (tmp / "clash-verge.yaml").read_text(encoding="utf-8")
+        self.assertIn("- line2", runtime)
+        self.assertIn("- line3", runtime)
+
+
+class TestDiagnoseSubscription(unittest.TestCase):
+    def _proxies(self, members):
+        out = {"Claude": {"type": "Selector", "now": members[0], "all": list(members)}}
+        for m in members:
+            out[m] = node()
+        return out
+
+    def test_missing_subscription_lines_are_reported(self):
+        diag = pg.diagnose(self._proxies(["line1"]),
+                           [rule("DomainSuffix", "claude.ai", "Claude")],
+                           subscription=["line1", "line2", "line3"])
+        self.assertTrue(diag["fixable_by_sync"])
+        self.assertIn("缺 2 条", " ".join(diag["problems"]))
+        self.assertEqual(diag["subscription"]["missing"], ["line2", "line3"])
+
+    def test_synced_group_has_no_sync_problem(self):
+        diag = pg.diagnose(self._proxies(["line1", "line2"]),
+                           [rule("DomainSuffix", "claude.ai", "Claude")],
+                           subscription=["line1", "line2"])
+        self.assertFalse(diag["fixable_by_sync"])
+        self.assertEqual(diag["subscription"]["missing"], [])
+
+    def test_stale_names_from_an_old_subscription_are_reported(self):
+        diag = pg.diagnose(self._proxies(["old-line1", "line1"]),
+                           [rule("DomainSuffix", "claude.ai", "Claude")],
+                           subscription=["line1", "line2"])
+        joined = " ".join(diag["problems"])
+        self.assertIn("不在当前订阅里", joined)
+        self.assertEqual(diag["subscription"]["extra"], ["old-line1"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -108,6 +108,17 @@ FINAL,DIRECT
 Shadowrocket 在 iOS 上，Mac 侧探测不到。在 App 里先建一个策略组（选住宅节点），
 再把上面几条 `DOMAIN-SUFFIX` 加进「配置 → 规则」。
 
+## 组里放什么：订阅的全部线路
+
+每个客户端的组都应该列出**订阅里的全部入口线路**，不是只列一条。下面片段里的线路名是占位，
+换成你订阅里真正有的那些：
+
+- `select` 组本身不自动切换，放多条不会让它自己换走，也不会削弱「绝不直连」。
+- 只放一条，那条挂了 Claude 就整体不可用，而别的网站全都正常——这就是 10-30 事故难排查的地方。
+- 订阅换过线路之后要重新对齐：Clash Verge Rev 直接跑
+  `python3 scripts/proxy_guard.py --fix-members --all` 从订阅同步；其它客户端重跑
+  `--emit <client>`，把新片段贴回它自己的组里。
+
 ## 探测能力对照
 
 | 客户端 | 能自动体检 | 说明 |
@@ -122,5 +133,7 @@ Shadowrocket 在 iOS 上，Mac 侧探测不到。在 App 里先建一个策略�
 - **症状**：claude.ai 握手到一半断开，claude.com 也打不开；GitHub、Google 全部正常。
 - **原因**：Claude 组只有一个成员「连接线路1」，这条线路当天挂了；`select` 组不自动切换，
   于是 Claude 流量全部失败。其它网站走 `IpEqual` 组，所以看起来「网络没问题」。
-- **修复**：把 4 条入口线路都加进 Claude 组，切到线路4；出口 IP 没变（同一个住宅 IP）。
+- **修复**：把订阅里的 4 条入口线路都加进 Claude 组（现在可以用
+  `python3 scripts/proxy_guard.py --fix-members --all` 一条命令同步），切到线路4；
+  出口 IP 没变（同一个住宅 IP）。
 - **教训**：单点组是隐性单点故障，报告里要能一眼看出来——这就是 `proxy_guard.py` 存在的理由。

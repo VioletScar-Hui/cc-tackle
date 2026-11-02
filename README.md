@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.1.0-111827?style=flat-square" alt="version 1.1.0" />
+    <img src="https://img.shields.io/badge/version-1.1.1-111827?style=flat-square" alt="version 1.1.1" />
   </p>
   <p>
     <a href="#what-it-does">它能做什么</a> ·
@@ -179,16 +179,17 @@ python3 scripts/net_guard.py --uninstall        # 卸载
 
 看门狗还带一个可选的出口锁定：`--init-lock --expected-ip <住宅出口IP>` 之后，每 30 秒顺带查一次真实出口 IP，变了或判成机房就写日志 + 发系统通知。判定用 [`scripts/ip_judge.py`](scripts/ip_judge.py) 多源交叉（ip-api / ipinfo / ipwho.is），判不准返回 `UNKNOWN` 而不是猜，结果缓存一周。它只告警不改配置。
 
-**Claude 出口体检**：2026-10-30 实测踩过——Claude 组里只放了一条线路，那条挂掉后 claude.ai 与 claude.com 全断，而别的站点照常，因为它们走的是别的组。
+**Claude 出口体检**：2026-10-30 实测踩过——Claude 组里只放了一条线路，那条挂掉后 claude.ai 与 claude.com 全断，而别的站点照常，因为它们走的是别的组。**现在的口径是：Claude 组里放订阅的全部线路，不是只放一条**；订阅换了线路跑一次 `--fix-members --all` 重新同步。
 
 ```bash
-python3 scripts/proxy_guard.py --check        # 规则指向哪个组、几条线路、选中的节点是否活着
+python3 scripts/proxy_guard.py --check        # 规则指向哪个组、几条线路、选中的节点是否活着、订阅缺哪几条
 python3 scripts/proxy_guard.py --fix          # 组内有活节点时，就地切过去
-python3 scripts/proxy_guard.py --fix-members --nodes "线路1,线路2,线路3,线路4"
+python3 scripts/proxy_guard.py --fix-members --all              # 把订阅里的全部线路同步进 Claude 组
+python3 scripts/proxy_guard.py --fix-members --all --dry-run    # 先看会改什么，不写文件
 python3 scripts/proxy_guard.py --emit sing-box   # 给 mihomo / sing-box / Surge / Shadowrocket 生成片段
 ```
 
-单点组、死节点、规则缺失三种情况分别给结论；能探测的只有本机的 mihomo 系（Clash Verge Rev / FlClash / Mihomo Party / ClashX），其余只出片段。事故复盘与各客户端贴法见 [`references/client-adapters.md`](references/client-adapters.md)。
+单点组、死节点、规则缺失、订阅没同步齐四种情况分别给结论；能探测的只有本机的 mihomo 系（Clash Verge Rev / FlClash / Mihomo Party / ClashX），其余只出片段。事故复盘与各客户端贴法见 [`references/client-adapters.md`](references/client-adapters.md)。
 
 **住宅链路锁定**：比看门狗更重的一层——Clash 规则自愈、pf 防火墙挡住物理网卡直连、代理不健康时 Claude 域名直接 NXDOMAIN。整套脚本收在 [`scripts/residential/`](scripts/residential/)，统一入口是 `scripts/residential_lock.py`：
 
@@ -338,7 +339,7 @@ export CLAUDE_GUARD_EXPECTED_EXIT_IP="203.0.113.10" # 可选：把出口 IP 也�
 
 - **单测**：`python3 -m unittest discover -s tests` 目前 800+ 个用例（以 `Ran N tests` 那行为准），覆盖判据、结果表对齐、备份优先于写入、非 TTY 拒绝、结果表缺字段不得默认成干净、bash 3.2 的多字节变量回归、各客户端片段格式等。全部跑在合成夹具上，不碰真实配置、真实代理或真实浏览器权限。
 - **CI**：macOS + Python 3.11/3.13，跑编译检查、全量单测、命令帮助、可复现打包（同一个 zip 两次构建必须字节一致）。
-- **真机实测过**：本机 macOS 27.0 上验证过 mihomo / Clash Verge Rev 的规则与组判据、TUN 接管与 fake-ip、sing-box 真实例重载、浏览器复核页回传、2026-10-30 的单点组事故与修复、出口切换后的复验。
+- **真机实测过**：本机 macOS 27.0 上验证过 mihomo / Clash Verge Rev 的规则与组判据、TUN 接管与 fake-ip、sing-box 真实例重载、浏览器复核页回传、2026-10-30 的单点组事故与修复、出口切换后的复验，以及 2026-11-02 的订阅同步（本机订阅 4 条线路全部在 Claude 组里，`--check` 比对无缺失）。
 - **没有验证、也不打算假装验证的**：Windows 与 Linux、Chromium 之外的浏览器、用户手工装的每一条代理客户端版本、服务端风控的因果关系。
 - 逐项证据等级和最后真机日期见 [`references/verification-status.md`](references/verification-status.md)；测试覆盖与不覆盖见 [`tests/README.md`](tests/README.md)。
 

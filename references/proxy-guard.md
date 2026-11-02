@@ -1,18 +1,23 @@
-# 出口体检：Claude 规则指向谁，那个组还活着吗
+# 出口体检：Claude 规则指向谁，那个组里放了什么
 
-`scripts/proxy_guard.py` 回答三个问题：
+`scripts/proxy_guard.py` 回答四个问题：
 
 1. Claude 规则的目标组是什么？
 2. 组里有几个成员？选中的那个还活着吗？
 3. 如果选中的挂了、但组里还有活的，能不能就地切过去？
+4. 组里是不是包含了**当前订阅的全部线路**？缺哪几条？
+
+第 4 条是 2026-11-02 补的。2026-10-30 的事故现场是「Claude 组只有一条线路」；修的时候手工把四条入口线路贴了进去。手工贴的问题是订阅换了线路就会漏——所以现在改成从订阅同步，并且体检时会比对。
 
 ## 用法
 
 ```bash
 python3 scripts/proxy_guard.py --check          # 只体检，退出码 1 表示有问题
-python3 scripts/proxy_guard.py --json           # 机器可读
+python3 scripts/proxy_guard.py --json           # 机器可读（含订阅比对结果）
 python3 scripts/proxy_guard.py --fix            # 在组内切到可用成员（不改配置）
-python3 scripts/proxy_guard.py --fix-members --nodes "线路1,线路2,线路3,线路4"
+python3 scripts/proxy_guard.py --fix-members --all            # 把订阅里的全部线路同步进组
+python3 scripts/proxy_guard.py --fix-members --all --dry-run  # 先看会改什么，不写文件
+python3 scripts/proxy_guard.py --fix-members --nodes "线路1,线路2"   # 手工列名字
 python3 scripts/proxy_guard.py --emit sing-box  # 生成某家客户端的片段
 python3 scripts/proxy_guard.py --clients        # 这台机器上检测到哪些客户端
 ```
@@ -22,14 +27,40 @@ python3 scripts/proxy_guard.py --clients        # 这台机器上检测到哪些
 - 第一条覆盖 Claude 域名的规则决定目标组；找不到 → 报「会走 MATCH 兜底」。
 - 组里成员 ≤ 1 → 报「单点组」：这条线路挂了 Claude 就整体不可用。
 - 选中节点 `alive=false` 或延迟为 0，但组里还有健康成员 → 标记「可切换修复」。
+- 订阅有 N 条、组里只有 M 条（N > M）→ 列出缺的那几条，标记「可用同步修复」。
+- 组里有不在当前订阅里的名字 → 提醒那可能是换订阅后的旧名字，选中会连不上。
 - 组里一个健康成员都没有 → 让你先查订阅/住宅线路本身。
+
+## Claude 组里应该放什么
+
+**放订阅里的全部线路，不是只放一条。** 理由：
+
+- 组类型是 `select`：它不做健康检查、不自动切换，选中哪条就是哪条。所以放多条**不会**让它自己换走，也不会削弱「绝不直连」。
+- 只放一条，那条线路一挂 Claude 就整体不可用，而别的网站全正常——这就是 10-30 那次最难排查的地方。
+- 放齐所有入口线路（同一个住宅出口 IP）之后，某条挂了可以在界面上手动切，或者 `--fix` 自动切。
+
+`--all` 读的是「当前订阅 profile 的 `proxies:` 列表」，按订阅顺序取全部节点名；组名（`proxy-groups` 里的）、`DIRECT` / `REJECT` 不会被当成线路。是**只补不删**：订阅里删掉的旧名字会留在组里，并由 `--check` 报成「不在当前订阅里」，让你决定怎么清。
 
 ## --fix-members 改了什么
 
 只支持 Clash Verge Rev：
 
-- 往 `clash-verge.yaml` 和 `profiles/*.yaml` 里含有该组的文件补节点（原文件备份成 `.bak-20261031`）
-- 用 `PUT /configs` 把改后的配置热载进内核
-- 提醒你去「订阅 → 编辑 → 全局扩展」确认，否则订阅更新会覆盖
+- 只改两份文件：运行时 `clash-verge.yaml`，以及**当前订阅**的「组增强文件」（`profiles.yaml` 里该订阅 `option.groups` 指向的那一份）。
+- 其它订阅/模板里即使也有同名组，一律跳过并打印文件名——把当前订阅的线路名写进别的订阅的模板，那个订阅没有这些节点，真用起来就是坏配置（第一版犯过这个错）。
+- 原文件备份成 `.bak-20261102`；`--dry-run` 下不写任何文件、也不建备份。
+- 写完用 `PUT /configs` 热载进内核。
+- 当前订阅没有组增强文件时，只改运行时会明确提示：**订阅一更新就会被覆盖**。想要持久，就在 Clash Verge 里给这个订阅建「全局扩展 → 组」。
+
+热载之后还要注意：订阅更新会重新生成运行时配置。组定义放在该订阅的组增强文件里，才会在更新后保留下来——`--fix-members --all` 写的就是那里。
 
 其它客户端（Sing-box / Surge / Shadowrocket）不写文件，只用 `--emit` 生成片段。
+
+## 什么时候跑哪条
+
+| 现场 | 命令 |
+| --- | --- |
+| 换订阅 / 换线路后 | `--check`，看订阅条数与组内条数对不对得上 |
+| 组里缺线路 | `--fix-members --all --dry-run` 看一眼，再去掉 `--dry-run` 写入 |
+| 选中的线路挂了、组里有活的 | `--fix` |
+| 组里全是死的 | 先查订阅与住宅线路本身，工具不替你换订阅 |
+| 别的客户端 | `--emit <client>`，把片段贴到它自己的组/规则里 |
