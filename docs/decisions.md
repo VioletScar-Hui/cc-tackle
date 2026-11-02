@@ -67,12 +67,12 @@
 
 证据：[`SKILL.md`](../SKILL.md)「手工核对清单与检测网站」的 Clash 入口段、[`tests/test_account_guard.py`](../tests/test_account_guard.py) 中 `TestRedactCredentials`。
 
-## ADR-008 · 常驻程序只列清单，不计分
+## ADR-008 · 常驻保护全量列清单：相关项都展示，不计分
 
-**状态**：已采纳（2026-10）
-**背景**：把整机 LaunchAgent 都倒到报告里，会让人以为这个 skill 在管别的软件；把常驻状态算进分数，也会让「体检」和「装没装保护」两件事混在一起。
-**决定**：只列本 skill 自己装出来的后台任务，按功能分组（网络防护 / 报告服务 / 体检与清理），显示在不在跑、有没有设开机自启、有没有被禁用；不进 28 行、不计分、不写 plist、不启动任何东西。
-**后果**：看门狗与住宅锁定是可选运行时保护，不是体检结论；「在跑」只证明 launchd 认为它活着，所以页面还显示 uptime 与最后一次扫描时间。
+**状态**：已采纳（2026-10），2026-11-02 扩为全量相关项
+**背景**：只列本 skill 自己装的任务，会让人以为别的在跑的守护不存在——2026-11-02 本机就同时有三个文章早期手工装的任务、住宅锁定还没装而报告只字未提。反过来把整机 LaunchAgent 都倒进来，又会让人以为这个 skill 在管别的软件；把常驻状态算进分数则会把「体检」和「装没装保护」混成一件事。
+**决定**：按命名空间白名单列所有和保护 Claude 环境相关的后台项——本 skill 的、文章早期手工装的（clash-mode-guard / clash-dns-guard / proxy-residue-cleanup）、住宅链路锁定各层（含 `/Library/LaunchDaemons` 的 root 层）、代理客户端自启；每项标出来源、状态、自启、运行时长与「这个进程保护什么」；**未安装的防护层也列出来**并给安装命令。无关的系统/App agent 不列；不进 28 行、不计分、不写 plist、不启动任何东西。
+**后果**：报告页能回答「这台机器上到底有哪些守护在跑、还有哪层没开」，而不只是「这个 skill 留了什么」；「在跑」仍然只证明 launchd 认为它活着，所以页面继续显示 uptime 与最后一次扫描时间。
 
 证据：[`references/report-page.md`](../references/report-page.md)、[`SKILL.md`](../SKILL.md)「直连看门狗」、[`tests/test_resident.py`](../tests/test_resident.py)。
 

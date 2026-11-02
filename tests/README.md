@@ -35,7 +35,7 @@ CI 在 `macos-latest` 上用 Python 3.11 与 3.13 各跑一遍（配置见 [`.gi
 | [`test_account_guard.py`](../tests/test_account_guard.py) | 主体脚本：28 项判据与结果表对齐（显示宽度、截断、缺字段一律「未测到」）、ASN 归类、写操作安全边界（非 TTY 拒绝、备份先于写入、清理后不得变成启用、受保护文件、并发锁、备份恢复）、时区与钥匙串解析、「绝不直连」按模式分判、CLI 安装方式与签名、登录方式 A29、代理后端分派、浏览器缓存的 24 小时 / `profileScope` / `openedBy` 三项条件、报告页与本地服务（零外部资源、静态页无 JS 无按钮、修复按钮先备份、令牌路由）、`--fix-auto` 与 `selfcheck` 的收尾行为。 |
 | [`test_net_guard.py`](../tests/test_net_guard.py) | 看门狗：Claude 进程识别（排除 `cc-tackle`、DSH 与参数里带 `claude.ai` 的 curl）、`lsof` 两种地址格式解析、直连 / 隧道 / 本机判定表、误杀保护（不杀自己、父进程链、pid 1，每分钟击杀上限）、LaunchAgent plist 形状、出口锁定状态。 |
 | [`test_proxy_guard.py`](../tests/test_proxy_guard.py) | Claude 出口体检：六种客户端片段格式、单点组 / 死节点 / 规则缺失三种诊断、组内切换与补成员、CLI 动作映射；2026-10-30 单点组事故的症状固化成用例。 |
-| [`test_resident.py`](../tests/test_resident.py) | 常驻任务清单：`launchctl` 的在跑 / 被禁用 / 未加载三种状态要分清；报告页常驻区块按 `<li>` 渲染短句，且只列本 skill 自己的任务。 |
+| [`test_resident.py`](../tests/test_resident.py) | 常驻保护清单：`launchctl` 的在跑 / 被禁用 / 未加载三种状态要分清；文章早期手工装的任务与住宅锁定 root 层要按来源列进来、无关 agent 不列、未安装的层要带安装命令；报告页按 `<li>` 渲染每项「保护什么」。 |
 | [`test_residential_lock.py`](../tests/test_residential_lock.py) | 住宅链路锁定：吸收进来的脚本还在且可执行、动作到命令的映射（`--root-*` 必须带 sudo、`--dry-run` 要透传）、参数文件允许用环境变量覆盖、`--status` 输出；另有 bash 3.2 多字节变量回归。 |
 | [`test_ip_judge.py`](../tests/test_ip_judge.py) | 住宅 / 机房判定：任一源 `hosting=True` 即判机房、家宽关键词兜底、都认不出返回 `UNKNOWN`；缓存读写与版本失效。数据源全部注入假 fetcher，不联网。 |
 | [`test_package_skill.py`](../tests/test_package_skill.py) | 可复现打包：只含运行时文件、排除项不误入、两遍构建字节一致、清单 sha256 与 zip 一致、输出落进包内或软链外指要被拒绝。 |

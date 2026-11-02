@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.1.2-111827?style=flat-square" alt="version 1.1.2" />
+    <img src="https://img.shields.io/badge/version-1.2.0-111827?style=flat-square" alt="version 1.2.0" />
   </p>
   <p>
     <a href="#what-it-does">它能做什么</a> ·
@@ -142,7 +142,7 @@ python3 scripts/account_guard.py --audit \
 
 完整加固与 `--fix-auto` 都在收尾**生成一份**自包含的 HTML 报告，落在 `~/ClaudeGuardBackups/report-<时间戳>.html`——那一页就是前后对照：顶上是「修复前 → 修复后」的分数，下面逐项列出两次真读数。分数是**加分制**：27 个基础项合计 100 分（每项 100/27，通过拿满、待处理拿一半、未通过 0 分），「没测到」也按 0 分计，分母固定 27 项；「登录方式」是第 28 行但不在 27 项里，通过再加 5 分，所以页面满分 105。
 
-页面里另有一节「本 skill 的常驻程序」：只列这个 skill 自己装出来的后台任务，按功能分组（网络防护 / 报告服务 / 体检与清理），标出在不在跑、有没有设开机自启、有没有被禁用。别的软件和系统的 agent 不往里塞。它只是清单，不计分，也不改任何 plist。整页不引用任何外部资源（没有 CDN、没有 web font、没有 JS），页面上的数字全部来自报告本身——判定与终端输出同源，都是 `build_summary`。
+页面里另有一节「常驻保护」：列出**所有和保护 Claude 环境相关的后台项**，按功能分组（网络防护 / 住宅链路锁定 / 代理客户端 / 报告服务 / 体检与清理），每项标出来源（本 skill / 文章早期手工装 / 住宅链路锁定 / 代理客户端）、在不在跑、有没有设开机自启、有没有被禁用，以及「这个进程保护什么」。**没安装的防护层也列出来**，并给安装命令和注意事项；无关的系统与其它 App 的 agent 仍然不往里塞。它只是清单，不计分，也不改任何 plist。整页不引用任何外部资源（没有 CDN、没有 web font、没有 JS），页面上的数字全部来自报告本身——判定与终端输出同源，都是 `build_summary`。
 
 ```bash
 python3 scripts/report_html.py --open              # 用最新那份报告重渲染

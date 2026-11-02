@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.1.2-111827?style=flat-square" alt="version 1.1.2" />
+    <img src="https://img.shields.io/badge/version-1.2.0-111827?style=flat-square" alt="version 1.2.0" />
   </p>
   <p>
     <a href="#what-it-does">What it does</a> ·
@@ -144,7 +144,7 @@ You can also do it in two steps: first run `--audit --preflight` for a read-only
 
 Full hardening and `--fix-auto` both **generate one** self-contained HTML report at the end, saved to `~/ClaudeGuardBackups/report-<timestamp>.html` — that page is the before/after comparison: the top shows the "before fix → after fix" score, and below it lists the two real readings for each item. The score is **additive**: 27 base items total 100 points (each item is worth 100/27; full marks for a pass, half for pending, 0 for fail), "not measured" also counts as 0, and the denominator is fixed at 27 items; "login method" is row 28 but is not one of the 27 items, and adds 5 points when it passes, so the page maximum is 105.
 
-The page also has a section, "This skill's persistent programs": it lists only background tasks that this skill installed itself, grouped by function (network protection / report service / checkup and cleanup), and marks whether they are running, whether they are set to launch at login, and whether they are disabled. Agents from other software and the system are not included. It is only a list; it does not count toward the score or modify any plist. The entire page references no external resources (no CDN, no web font, no JS); every number on the page comes from the report itself — judgments and terminal output share the same source, `build_summary`.
+The page also has a section, "Persistent protection": it lists **every background item related to protecting the Claude environment**, grouped by function (network protection / residential route lock / proxy client / report service / checkup and cleanup). Each item is labelled with its source (this skill / installed manually with the early article / residential route lock / proxy client), whether it is running, whether it launches at login, whether it is disabled, and what that process actually protects. **Layers that are not installed are listed too**, with the install command and caveats. Unrelated system and third-party agents are still not included. It is only a list; it does not count toward the score or modify any plist. The entire page references no external resources (no CDN, no web font, no JS); every number on the page comes from the report itself — judgments and terminal output share the same source, `build_summary`.
 
 ```bash
 python3 scripts/report_html.py --open              # re-render with the latest report

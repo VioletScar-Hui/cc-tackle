@@ -625,13 +625,14 @@ def render(report: dict, before: dict = None, report_path=None,
             f"<div class='tiny'>{_esc('；'.join(notes) or '全部通过')}</div></div>"
         )
 
-    # ── 常驻程序（只列本 skill 自己的，按功能分组；不计分）──
+    # ── 常驻保护（和保护 Claude 环境相关的全部后台项；不计分）──
     resident = report.get("A30_resident") or {}
     resident_html = ""
-    if resident.get("items"):
+    absent = resident.get("absent") or []
+    if resident.get("items") or absent:
         by_label = {item["label"]: item for item in resident.get("items") or []}
-        groups = resident.get("groups") or [
-            {"name": "常驻程序", "labels": list(by_label)}]
+        groups = resident.get("groups") or (
+            [{"name": "常驻程序", "labels": list(by_label)}] if by_label else [])
         cards = []
         for group in groups:
             members = [by_label[label] for label in (group.get("labels") or [])
@@ -652,7 +653,8 @@ def render(report: dict, before: dict = None, report_path=None,
                 state_txt = item.get("state") or ""
                 if item.get("elapsed"):
                     state_txt += f"，已跑 {item['elapsed']}"
-                detail = f"{state_txt} · {item.get('autostart') or ''}"
+                detail = (f"来源：{item.get('source') or '未标注'} · {state_txt}"
+                          f" · {item.get('autostart') or ''}")
                 if item.get("scan_age_seconds") is not None:
                     detail += f" · 最近扫描 {_age_text(item['scan_age_seconds'])}前"
                 if program:
@@ -669,25 +671,46 @@ def render(report: dict, before: dict = None, report_path=None,
                 entries.append(
                     f"<div class='item {kind}'><div class='dot'>{mark}</div>"
                     f"<div style='flex:1'><div class='name-row'>"
-                    f"<div class='name'>{_esc(item.get('label') or '')}</div></div>"
+                    f"<div class='name'>{_esc(item.get('label') or '')}</div>"
+                    f"<div class='tiny'>{_esc(item.get('source') or '')}</div></div>"
                     f"<div class='detail'>{_esc(detail)}</div>{protect_line}</div></div>"
                 )
             cards.append(
                 f"<div class='card'><h3>{_esc(group.get('name') or '')}"
                 f"<em>{len(members)} 个</em></h3>{''.join(entries)}</div>")
-        hint = (f"{resident.get('total', len(by_label))} 个，"
+        # 没装的那几层也列出来：用户得知道还有哪一层没开、怎么开。
+        if absent:
+            entries = []
+            for layer in absent:
+                detail = f"{layer.get('why') or ''} · 装：{layer.get('install') or ''}"
+                if layer.get("note"):
+                    detail += f" · {layer['note']}"
+                entries.append(
+                    f"<div class='item warn'><div class='dot'>·</div>"
+                    f"<div style='flex:1'><div class='name-row'>"
+                    f"<div class='name'>{_esc(layer.get('name') or '')}</div></div>"
+                    f"<div class='detail'>{_esc(detail)}</div></div></div>"
+                )
+            cards.append(
+                f"<div class='card'><h3>未安装 / 按需"
+                f"<em>{len(absent)} 项</em></h3>{''.join(entries)}</div>")
+        hint = (f"{resident.get('total', len(by_label))} 个在清单里，"
                 f"{resident.get('autostart', 0)} 个设了开机自启")
+        if resident.get("running"):
+            hint += f"，{resident['running']} 个在跑"
         if resident.get("disabled"):
             hint += f"，{resident['disabled']} 个被禁用"
         if resident.get("not_loaded"):
             hint += f"，{resident['not_loaded']} 个未加载"
+        if absent:
+            hint += f"；另有 {len(absent)} 层未安装 / 按需"
         resident_html = (
-            f"<section><h2>本 skill 的常驻程序 <span class='hint'>{_esc(hint)}</span></h2>"
+            f"<section><h2>常驻保护 <span class='hint'>{_esc(hint)}</span></h2>"
             f"<div class='grid g2'>{''.join(cards)}</div></section>"
         )
     elif "A30_resident" in report and resident.get("note"):
         resident_html = (
-            "<section><h2>本 skill 的常驻程序</h2>"
+            "<section><h2>常驻保护</h2>"
             f"<div class='card'>{_esc(resident['note'])}</div></section>"
         )
 

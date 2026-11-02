@@ -5277,7 +5277,10 @@ def _read_agent_plist(path: pathlib.Path) -> dict:
 
 
 RESIDENT_FUNCTIONS = (
-    ("网络防护", ("net_guard.py",)),
+    ("网络防护", ("net_guard.py", "clash-mode-guard", "clash-dns-guard",
+                  "proxy-residue-cleanup", "clear-proxy-residue")),
+    ("住宅链路锁定", ("claude-residential",)),
+    ("代理客户端", ("clash-verge", "Clash Verge")),
     ("报告服务", ("report_serve.py",)),
     ("体检与清理", ("account_guard.py", "selfcheck.py")),
 )
@@ -5311,12 +5314,115 @@ RESIDENT_PROTECTS = {
 }
 
 
-def _is_skill_owned(label: str, program: str) -> bool:
-    """只认这个 skill 自己的常驻程序，别的软件的 agent 不往报告里塞。"""
+# 每一项自己保护什么（组级那三条是给同类进程的通用说明；这些是逐项写死的）。
+RESIDENT_PROTECTS_BY_LABEL = {
+    "local.clash-mode-guard": [
+        "每 30 秒看一次运行时 mode",
+        "被推回 global 就恢复 rule",
+        "不碰你的节点选择",
+    ],
+    "local.clash-dns-guard": [
+        "每 60 秒检查解析器是否干净",
+        "订阅更新后重新应用 DNS 配置",
+        "只修解析器，不改分流规则",
+    ],
+    "local.proxy-residue-cleanup": [
+        "每 5 分钟清一次系统代理残留",
+        "只清「未启用但存了值」的服务",
+        "不碰正在启用的代理",
+    ],
+    "io.github.clash-verge-rev.clash-verge-rev": [
+        "随登录启动代理客户端",
+        "TUN 内核的前置进程",
+        "它本身不做任何检查",
+    ],
+    "local.claude-residential-guard": [
+        "规则被订阅覆盖时自愈（30 秒 + WatchPaths）",
+        "要求 Claude 规则直指单个住宅节点",
+        "多入口组模型下与它互斥",
+    ],
+    "local.claude-residential-pf": [
+        "pf 挡物理网卡直连 Anthropic/CDN",
+        "内核层 fail-closed",
+    ],
+    "local.claude-residential-dns": [
+        "代理不健康时 Claude 域名 NXDOMAIN",
+        "只影响 Claude 域名，其余照常转发",
+    ],
+}
+
+# 允许出现在报告页上的常驻项命名空间。不是全机扫描：其它 App / 系统的 agent
+# （Google 更新、brew 等）仍然不列。
+RESIDENT_RELATED_PREFIXES = (
+    "com.violetscarhui.claude-",
+    "local.claude-",
+    "local.clash-",
+    "local.proxy-residue-cleanup",
+)
+RESIDENT_SOURCES = {
+    "local.clash-mode-guard": "文章早期手工装",
+    "local.clash-dns-guard": "文章早期手工装",
+    "local.proxy-residue-cleanup": "文章早期手工装",
+    "io.github.clash-verge-rev.clash-verge-rev": "代理客户端",
+    "local.claude-residential-guard": "住宅链路锁定",
+    "local.claude-residential-pf": "住宅链路锁定（root）",
+    "local.claude-residential-dns": "住宅链路锁定（root）",
+}
+ROOT_DAEMONS_DIR = pathlib.Path("/Library/LaunchDaemons")
+
+# 没装的那几层也要列出来：用户得知道「还有哪一层没开、怎么开」。
+RESIDENT_ABSENT_LAYERS = (
+    {
+        "labels": ["local.claude-residential-guard"],
+        "name": "住宅链路锁定 · 用户级规则自愈",
+        "why": "规则被订阅覆盖时自愈；要求 Claude 规则直指单个住宅节点",
+        "install": "python3 scripts/residential_lock.py --init && "
+                   "python3 scripts/residential_lock.py --install",
+        "note": "用「Claude 组放全部线路」的多入口模型时不要装：它会把规则改回单节点",
+    },
+    {
+        "labels": ["local.claude-residential-pf", "local.claude-residential-dns"],
+        "name": "住宅链路锁定 · root 层（pf 防火墙 + DNS 守卫）",
+        "why": "物理网卡上禁止直连 Anthropic/CDN；代理不健康时 Claude 域名 NXDOMAIN",
+        "install": "python3 scripts/residential_lock.py --init && "
+                   "sudo python3 scripts/residential_lock.py --root-install",
+        "note": "需要管理员密码；与多入口组兼容",
+    },
+    {
+        "labels": [],
+        "skip_if_function": "报告服务",
+        "name": "报告服务（按需，不常驻）",
+        "why": "带修复按钮的本地页面只在 report_serve.py 运行时存在，空闲 30 分钟自动退出",
+        "install": "python3 scripts/report_serve.py",
+        "note": "不是常驻进程，所以不在上面的运行清单里",
+    },
+)
+
+
+def _related_source(label: str, program: str) -> str | None:
+    """这个常驻项和保护 Claude 环境有没有关系；有就返回「谁装的」。"""
     marker = str(SKILL_DIR)
     if marker and marker in (program or ""):
-        return True
-    return label.startswith(("com.violetscarhui.claude-", "local.claude-"))
+        return "本 skill"
+    if label in RESIDENT_SOURCES:
+        return RESIDENT_SOURCES[label]
+    if label.startswith(RESIDENT_RELATED_PREFIXES):
+        return "相关"
+    return None
+
+
+def _root_daemon_state(label: str) -> tuple[bool, str, str]:
+    """root 层 LaunchDaemon 的状态：装没装、加载没、pid；读不到就如实说读不到。"""
+    plist = ROOT_DAEMONS_DIR / f"{label}.plist"
+    if not plist.exists():
+        return False, "未安装", ""
+    code, body = run(["launchctl", "print", f"system/{label}"], timeout=20)
+    if code != 0:
+        return True, "已安装，未加载", ""
+    match = re.search(r"\bpid = (\d+)", body or "")
+    if match:
+        return True, f"运行中（pid {match.group(1)}）", match.group(1)
+    return True, "已加载，未运行", ""
 
 
 def _human_elapsed(raw: str) -> str:
@@ -5366,14 +5472,16 @@ def _watchdog_last_scan(now: dt.datetime | None = None) -> tuple[str | None, flo
 
 
 def check_resident_tasks() -> dict:
-    """A30 本 skill 装出来的常驻程序：谁在跑、谁设了开机自启、谁被禁用。
+    """A30 和保护 Claude 环境相关的常驻项：谁在跑、谁自启、谁被禁用、哪层还没装。
 
-    只读 `launchctl list`、`launchctl print-disabled` 与 `~/Library/LaunchAgents/*.plist`，
-    不改任何 plist、也不启动任何东西。系统与其它 App 的 agent 一律不列——报告页只回答
-    「这个 skill 自己留了什么在后台跑」。
+    读 `launchctl list`、`launchctl print-disabled`、`~/Library/LaunchAgents/*.plist`
+    和 `/Library/LaunchDaemons/local.claude-*.plist`，只读不改。
+
+    列的是「和保护 Claude 环境相关的一切」：本 skill 装的、文章早期手工装的、
+    住宅链路锁定各层、代理客户端自启；无关的系统与其它 App 的 agent 仍然不列。
     """
     out = {"items": [], "groups": [], "total": 0, "autostart": 0, "running": 0,
-           "not_loaded": 0, "disabled": 0, "failing": [], "note": ""}
+           "not_loaded": 0, "disabled": 0, "failing": [], "absent": [], "note": ""}
     code, body = run(["launchctl", "list"], timeout=20)
     if code != 0:
         out["note"] = "launchctl list 读不到，无法清点常驻程序"
@@ -5404,28 +5512,45 @@ def check_resident_tasks() -> dict:
         for plist in sorted(agents_dir.glob("*.plist")):
             info = _read_agent_plist(plist)
             labels.add(info.get("label") or plist.stem)
+    # root 层的 LaunchDaemon 不在 gui 域的 launchctl list 里，按命名空间单独点名收。
+    for plist in sorted(ROOT_DAEMONS_DIR.glob("local.claude-*.plist")):
+        labels.add(plist.stem)
 
     for label in sorted(labels):
         plist = agents_dir / f"{label}.plist"
-        info = _read_agent_plist(plist) if plist.exists() else {}
+        root_plist = ROOT_DAEMONS_DIR / f"{label}.plist"
+        info: dict = {}
+        if plist.exists():
+            info = _read_agent_plist(plist)
+        elif root_plist.exists():
+            info = _read_agent_plist(root_plist)
         program = info.get("program", "")
-        if not _is_skill_owned(label, program):
+        source = _related_source(label, program)
+        if source is None:
             continue
-        pid, status = loaded.get(label, ("-", "-"))
-        running = pid.isdigit()
-        if label in disabled:
-            state = "已禁用（重启也不会自启）"
-            out["disabled"] += 1
-        elif running:
-            state = f"运行中（pid {pid}）"
-        elif label in loaded:
-            state = "已加载，未运行"
-            if status not in ("0", "-") and status:
-                state += f"；上次退码 {status}"
-                out["failing"].append(label)
+        if root_plist.exists() and not plist.exists():
+            installed, state, pid = _root_daemon_state(label)
+            if not installed:
+                continue
+            running = bool(pid)
+            loaded_here = state.startswith(("运行中", "已加载"))
         else:
-            state = "未加载（不会自启）"
-            out["not_loaded"] += 1
+            pid, status = loaded.get(label, ("-", "-"))
+            running = pid.isdigit()
+            loaded_here = label in loaded
+            if label in disabled:
+                state = "已禁用（重启也不会自启）"
+                out["disabled"] += 1
+            elif running:
+                state = f"运行中（pid {pid}）"
+            elif label in loaded:
+                state = "已加载，未运行"
+                if status not in ("0", "-") and status:
+                    state += f"；上次退码 {status}"
+                    out["failing"].append(label)
+            else:
+                state = "未加载（不会自启）"
+                out["not_loaded"] += 1
         flags = []
         if info.get("run_at_load"):
             flags.append("登录时启动")
@@ -5451,33 +5576,45 @@ def check_resident_tasks() -> dict:
         scan_age = None
         if "net_guard.py" in program:
             last_scan, scan_age = _watchdog_last_scan()
-        function = resident_function(program)
+        function = resident_function(program or label)
         out["items"].append({
             "label": label,
+            "source": source,
             "function": function,
-            "protects": RESIDENT_PROTECTS.get(function, []),
+            "protects": (RESIDENT_PROTECTS_BY_LABEL.get(label)
+                         or RESIDENT_PROTECTS.get(function, [])),
             "state": state,
             "running": running,
-            "loaded": label in loaded,
+            "loaded": loaded_here,
             "disabled": label in disabled,
             "autostart": autostart,
             "program": program,
-            "plist": str(plist) if plist.exists() else None,
+            "plist": (str(plist) if plist.exists()
+                      else (str(root_plist) if root_plist.exists() else None)),
             "elapsed": elapsed,
             "last_scan": last_scan,
             "scan_age_seconds": scan_age,
         })
 
+    installed = {item["label"] for item in out["items"]}
+    installed_functions = {item["function"] for item in out["items"]}
+    for layer in RESIDENT_ABSENT_LAYERS:
+        if layer.get("labels") and any(lbl in installed for lbl in layer["labels"]):
+            continue
+        if layer.get("skip_if_function") in installed_functions:
+            continue
+        out["absent"].append({k: v for k, v in layer.items()
+                              if k not in ("labels", "skip_if_function")})
+
     out["total"] = len(out["items"])
-    if not out["items"]:
-        out["note"] = "这个 skill 目前没有常驻程序"
+    if not out["items"] and not out["absent"]:
+        out["note"] = "没有找到和保护 Claude 环境相关的常驻项"
         return out
     for name, _needles in RESIDENT_FUNCTIONS + (("其他", ()),):
         members = [i for i in out["items"] if i["function"] == name]
         if members:
             out["groups"].append({"name": name, "labels": [m["label"] for m in members]})
     return out
-
 
 def check_claude_storage() -> dict:
     """A25 系统级 Claude 占用里**可清理**的部分。

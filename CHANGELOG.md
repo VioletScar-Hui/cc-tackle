@@ -2,6 +2,18 @@
 
 本文件按交付批次记录变化，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。版本号与 `SKILL.md` frontmatter 里的 `metadata.version` 保持一致；`1.0.4` 及更早的版本号是事后回填的，依据见文末「版本号说明」。
 
+## [1.2.0] - 2026-11-02
+
+### Added
+
+- 报告页「常驻保护」改成全量展示：不再只列本 skill 自己装的任务，而是列出所有和保护 Claude 环境相关的后台项——本 skill 的看门狗、文章早期手工装的 `clash-mode-guard` / `clash-dns-guard` / `proxy-residue-cleanup`、住宅链路锁定各层、Clash Verge 自启。每项标来源、状态、自启、运行时长与「这个进程保护什么」；住宅锁定的 root 层 LaunchDaemon 也从 system 域读进来。
+- 未安装的防护层单独一栏列出（用户级规则自愈 / root pf + DNS 守卫 / 按需报告服务），带安装命令与注意事项，不再「没装就什么都不显示」。
+
+### Changed
+
+- 报告页常驻区块标题从「本 skill 的常驻程序」改为「常驻保护」；`local.proxy-residue-cleanup` 归到「网络防护」，不再落到「其他」。
+- README（中英）、`references/report-page.md`、`docs/decisions.md` ADR-008 同步改写：从「只列本 skill 自己的」改为「相关项全量列出，无关 agent 仍不列」。
+
 ## [1.1.2] - 2026-11-02
 
 ### Changed

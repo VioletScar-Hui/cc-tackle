@@ -48,6 +48,13 @@ class TestResidentTasks(unittest.TestCase):
         (agents / "local.every.plist").write_bytes(
             _plist("local.every", run_at_load=False, keep_alive=False, interval=60,
                    argv=("/usr/bin/python3", checker)))
+        # 报告页现在也会列 /Library/LaunchDaemons 里的住宅锁定 root 层；
+        # 用例必须把它指到临时目录，否则开发机真装过之后测试结果会跟环境走。
+        root_daemons = self.tmp / "Library" / "LaunchDaemons"
+        root_daemons.mkdir(parents=True)
+        patcher = mock.patch.object(g, "ROOT_DAEMONS_DIR", root_daemons)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         old_home = g.HOME
         g.HOME = self.tmp
         self.addCleanup(setattr, g, "HOME", old_home)
@@ -116,6 +123,59 @@ class TestResidentTasks(unittest.TestCase):
         names = [group["name"] for group in out["groups"]]
         self.assertEqual(names, ["网络防护", "体检与清理"])
 
+    def test_legacy_guards_are_included_with_their_source(self):
+        agents = self.tmp / "Library" / "LaunchAgents"
+        (agents / "local.clash-mode-guard.plist").write_bytes(_plist(
+            "local.clash-mode-guard", keep_alive=False, interval=30,
+            argv=("/bin/bash", str(self.tmp / "bin" / "clash-mode-guard.sh"))))
+        out = self._check("PID\tStatus\tLabel\n-\t0\tlocal.clash-mode-guard\n")
+        item = [i for i in out["items"] if i["label"] == "local.clash-mode-guard"][0]
+        self.assertEqual(item["source"], "文章早期手工装")
+        self.assertEqual(item["function"], "网络防护")
+        self.assertIn("每 30 秒", item["autostart"])
+        self.assertTrue(any("30 秒" in p for p in item["protects"]))
+
+    def test_unrelated_agents_stay_out_of_the_report(self):
+        agents = self.tmp / "Library" / "LaunchAgents"
+        (agents / "com.google.keystone.agent.plist").write_bytes(
+            _plist("com.google.keystone.agent", argv=("/usr/bin/true",)))
+        (agents / "local.unrelated.plist").write_bytes(
+            _plist("local.unrelated", argv=("/usr/bin/true",)))
+        out = self._check("PID\tStatus\tLabel\n")
+        labels = [i["label"] for i in out["items"]]
+        self.assertNotIn("com.google.keystone.agent", labels)
+        self.assertNotIn("local.unrelated", labels)
+
+    def test_uninstalled_layers_are_listed_with_an_install_command(self):
+        out = self._check("PID\tStatus\tLabel\n")
+        names = [a["name"] for a in out["absent"]]
+        self.assertTrue(any("用户级" in n for n in names), names)
+        self.assertTrue(any("root" in n for n in names), names)
+        self.assertTrue(any("报告服务" in n for n in names), names)
+        self.assertTrue(all(a.get("install") for a in out["absent"]))
+        self.assertTrue(all(a.get("why") for a in out["absent"]))
+
+    def test_installed_layer_disappears_from_the_absent_list(self):
+        agents = self.tmp / "Library" / "LaunchAgents"
+        (agents / "local.claude-residential-guard.plist").write_bytes(_plist(
+            "local.claude-residential-guard", keep_alive=True,
+            argv=("/bin/bash", "/Users/someone/Library/Scripts/guard.sh")))
+        out = self._check("PID\tStatus\tLabel\n")
+        names = [a["name"] for a in out["absent"]]
+        self.assertFalse(any("用户级" in n for n in names), names)
+
+    def test_root_daemons_are_read_from_the_system_domain(self):
+        root = self.tmp / "Library" / "LaunchDaemons"
+        (root / "local.claude-residential-pf.plist").write_bytes(_plist(
+            "local.claude-residential-pf", keep_alive=True,
+            argv=("/bin/bash", "/usr/local/libexec/claude-residential-pf.sh")))
+        out = self._check("PID\tStatus\tLabel\n")
+        item = [i for i in out["items"] if i["label"] == "local.claude-residential-pf"][0]
+        self.assertEqual(item["source"], "住宅链路锁定（root）")
+        self.assertEqual(item["function"], "住宅链路锁定")
+        self.assertIn("已安装", item["state"])
+        self.assertTrue(any("pf" in p for p in item["protects"]))
+
 
 class TestRuntimeState(unittest.TestCase):
     """「在跑」不能只写 pid：还要能看出跑了多久、看门狗上一轮扫描是什么时候。"""
@@ -154,9 +214,12 @@ class TestResidentSectionInHtml(unittest.TestCase):
             "A30_resident": {
                 "total": 2, "autostart": 1, "running": 1, "not_loaded": 0, "disabled": 1,
                 "groups": [{"name": "网络防护", "labels": ["local.a", "local.b"]}],
+                "absent": [{"name": "住宅链路锁定 · root 层", "why": "pf 挡直连",
+                           "install": "sudo python3 scripts/residential_lock.py --root-install",
+                           "note": "需要管理员密码"}],
                 "items": [
-                    {"label": "local.a", "state": "运行中（pid 7）", "autostart": "登录时启动",
-                     "function": "网络防护",
+                    {"label": "local.a", "source": "本 skill", "state": "运行中（pid 7）",
+                     "autostart": "登录时启动", "function": "网络防护",
                      "protects": ["每 5 秒扫一遍直连", "出口漂移每 30 秒告警"],
                      "program": "/bin/sh /a.sh", "running": True, "loaded": True, "disabled": False},
                     {"label": "local.b", "state": "已禁用（重启也不会自启）", "autostart": "登录时启动",
@@ -167,11 +230,14 @@ class TestResidentSectionInHtml(unittest.TestCase):
         rows = [("a", g.S_OK, "")] * rh.BASE_ITEMS
         with mock.patch.object(g, "build_summary", return_value=rows):
             page = rh.render(report)
-        self.assertIn("本 skill 的常驻程序", page)
+        self.assertIn("常驻保护", page)
         self.assertIn("local.a", page)
         self.assertIn("已禁用", page)
         self.assertIn("1 个被禁用", page)
         self.assertIn("网络防护", page)
+        self.assertIn("来源：本 skill", page)
+        self.assertIn("未安装 / 按需", page)
+        self.assertIn("root-install", page)
         self.assertIn("这个进程保护什么", page)
         self.assertIn("protects-box", page)
         self.assertIn("<li>每 5 秒扫一遍直连</li>", page)
