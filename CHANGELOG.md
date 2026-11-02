@@ -2,6 +2,15 @@
 
 本文件按交付批次记录变化，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。版本号与 `SKILL.md` frontmatter 里的 `metadata.version` 保持一致；`1.0.4` 及更早的版本号是事后回填的，依据见文末「版本号说明」。
 
+## [1.1.2] - 2026-11-02
+
+### Changed
+
+- 澄清「住宅链路锁定」与「Claude 多入口组」是两个互斥模型：用户级 `guard.sh` 的健康标准是
+  Claude 规则直指单个住宅节点，装上之后会把多入口组 30 秒一次地改回单点；用多入口组时只装
+  root 层（pf 防火墙 + DNS 守卫），它不关心规则指向组还是节点。`SKILL.md` 与
+  `references/residential-lock.md` 各补一小节。
+
 ## [1.1.1] - 2026-11-02
 
 ### Added
