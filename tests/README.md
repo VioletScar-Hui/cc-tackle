@@ -25,6 +25,7 @@ CI 在 `macos-latest` 上用 Python 3.11 与 3.13 各跑一遍（配置见 [`.gi
 - `tests/test_account_guard.py` 的 `setUpModule()` 会摘掉所有 `CLAUDE_GUARD_*` 环境变量，`tearDownModule()` 再放回；需要某个变量才能测的用例自己用 `mock.patch.dict` 设。这样开发机 `export` 了什么都不会影响用例结果（2026-10-14 出过一次「环境串味」，见 [`references/maintenance-notes.md`](../references/maintenance-notes.md)「测试的环境隔离」）。
 - 交互流程按**提示语**作答（`prompt_answering()`），不按顺序。改 `main()` 的问句顺序不会炸出看不懂的 `StopIteration`；认不出的提示语会直接失败并带上原文。
 - 页面类用例用 `CLAUDE_GUARD_NO_REPORT=1` 关掉自动报告，并有用例专门断言整套测试不会往真实 `~/ClaudeGuardBackups` 写文件。写路径的用例一律把输出指到临时目录。
+- 开发机上真的声明过预期出口（`~/.local/state/claude-guard/expected-exit.json`）之后，`TestDeclaredExpected` 会显式 mock 掉「上次声明」；「什么都没声明」的用例不能读开发机的真实状态。记住声明本身由 `TestRememberedExpectedExit` 用临时 HOME 覆盖。
 - 夹具里的 IP、凭据一律用文档保留地址或假值（例如 `203.0.113.10`），不写真实出口 IP、不写真实 token。
 
 ## 覆盖什么

@@ -11,6 +11,13 @@
   root 层（pf 防火墙 + DNS 守卫），它不关心规则指向组还是节点。`SKILL.md` 与
   `references/residential-lock.md` 各补一小节。
 
+### Fixed
+
+- 单测与开发机的「上次声明」解耦：用 `--save-audit` 声明过预期出口后，状态文件会被
+  `TestDeclaredExpected` 读进来，五个「什么都没声明」的用例一起红（2026-11-02 踩到）。
+  该组用例现在显式 mock 掉 `load_declared_expected`；记住声明本身仍由
+  `TestRememberedExpectedExit` 用临时 HOME 覆盖。
+
 ## [1.1.1] - 2026-11-02
 
 ### Added

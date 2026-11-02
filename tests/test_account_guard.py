@@ -6079,6 +6079,13 @@ class TestDeclaredExpected(unittest.TestCase):
         for name in (g.EXPECTED_COUNTRY_ENV, g.EXPECTED_EXIT_IP_ENV):
             self.addCleanup(os.environ.pop, name, None)
             os.environ.pop(name, None)
+        # 这一组测的是「什么都没声明」。开发机上真的用 --save-audit 声明过一次预期出口
+        # 之后，状态文件会落在 ~/.local/state/claude-guard/expected-exit.json，再跑单测
+        # 就会被当成默认声明读进来，五个用例一起红（2026-11-02 实际踩到）。
+        # 记住声明这件事单独由 TestRememberedExpectedExit 用临时 HOME 覆盖。
+        saved = mock.patch.object(g, "load_declared_expected", return_value={})
+        saved.start()
+        self.addCleanup(saved.stop)
 
     def _fake_ip(self):
         return {"ip": "198.51.100.10", "country": "US", "city": "Springfield",
