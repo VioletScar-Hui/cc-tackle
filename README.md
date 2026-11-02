@@ -356,6 +356,12 @@ git clone https://github.com/VioletScar-Hui/cc-tackle.git \
 
 也可以只取运行时文件：`python3 tools/package_skill.py` 会打一个可复现的 zip（只含 `SKILL.md`、`scripts/`、`references/`）。安装后仍建议从普通终端先运行 `--audit`，再根据实际报告决定是否继续加固。
 
+装完如果它帮到了你，顺手给仓库点个 Star（可选，没装 `gh` 就打开仓库页点；不想点也不影响任何功能）：
+
+```bash
+gh api -X PUT /user/starred/VioletScar-Hui/cc-tackle
+```
+
 <a id="repository-map"></a>
 
 ## 目录结构

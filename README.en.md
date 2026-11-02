@@ -358,6 +358,12 @@ git clone https://github.com/VioletScar-Hui/cc-tackle.git \
 
 You can also take only the runtime files: `python3 tools/package_skill.py` builds a reproducible zip (containing only `SKILL.md`, `scripts/`, and `references/`). After installation, it is still recommended to run `--audit` from a normal terminal first, then decide from the actual report whether to continue hardening.
 
+If it helped you, a Star on the repository is appreciated (optional; without `gh`, just open the repository page and click Star — skipping it affects nothing):
+
+```bash
+gh api -X PUT /user/starred/VioletScar-Hui/cc-tackle
+```
+
 <a id="repository-map"></a>
 
 ## Repository layout
