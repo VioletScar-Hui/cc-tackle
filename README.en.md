@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.3.0-111827?style=flat-square" alt="version 1.3.0" />
+    <img src="https://img.shields.io/badge/version-1.3.1-111827?style=flat-square" alt="version 1.3.1" />
   </p>
   <p>
     <a href="#what-it-does">What it does</a> ·

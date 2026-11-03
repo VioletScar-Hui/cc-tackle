@@ -49,7 +49,7 @@ python3 scripts/tailscale_hosts.py --sync               # 写 merge（先备份�
 - **限制**：依赖 Clash Verge 在运行；换订阅/切 profile 之后要重跑一次 `--sync`
   （新 profile 的 merge 是另一份文件）；只映射 IPv4 对端。
 
-merge 文件长这样（`hosts:` 与 `dns:` 同级）：
+merge 文件长这样（`hosts:` 与 `dns:` 同级；下面的 tailnet 名与地址都是占位，不是本机真实值）：
 
 ```yaml
 hosts:

@@ -129,3 +129,12 @@
 **后果**：Clash 不在跑时 `*.ts.net` 仍解析不了（方案 B 可解）；换订阅/切 profile 后要重跑一次 `--sync`；只映射 IPv4 对端。体检在 DNS 行遇到 Tailscale 解析器时会直接给出这两步。
 
 证据：[`references/tailscale.md`](../references/tailscale.md)、[`scripts/tailscale_hosts.py`](../scripts/tailscale_hosts.py)、[`tests/test_tailscale_hosts.py`](../tests/test_tailscale_hosts.py)、[`tests/test_account_guard.py`](../tests/test_account_guard.py) 的 `TestTailscaleDnsHint`。
+
+## ADR-015 · 公开仓库不留本机标识，泄露已发布历史时重写
+
+**状态**：已采纳（2026-11-03）
+**背景**：Tailscale 适配那一版把真实 tailnet 名、节点名、`100.x` 地址与本机观察到的城市写进了公开文档和测试（用户同日要求「不要泄露我本地的信息在 GitHub 中」）。这些值本身不构成账号凭据，但能定位到具体机器与网络。
+**决定**：文档与测试一律用占位（文档保留地址、`tail-example.ts.net`、`node-a`/`node-b`）；`tests/test_privacy.py` 守这条线；泄露已进入公开历史时，允许一次受控的历史重写 + 强推，并删除能暴露旧 SHA 的 Actions run。GitHub 对旧提交的缓存副本不在我们控制范围内，需联系 Support。
+**后果**：后续提交不能再把真实出口 IP、tailnet、内网网段、家目录、token 写进仓库；示例值必须来自保留段或明确的占位。历史重写不可逆，做之前先留本地备份分支。
+
+证据：[`AGENTS.md`](../AGENTS.md)「隐私与本地信息」、[`tests/test_privacy.py`](../tests/test_privacy.py)、[`references/tailscale.md`](../references/tailscale.md)。

@@ -2,6 +2,24 @@
 
 本文件按交付批次记录变化，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。版本号与 `SKILL.md` frontmatter 里的 `metadata.version` 保持一致；`1.0.4` 及更早的版本号是事后回填的，依据见文末「版本号说明」。
 
+## [1.3.1] - 2026-11-03
+
+### Security
+
+- 从公开仓库移除本机标识：把 `tailscale.md`、`tailscale_hosts.py` 文档与测试里的
+  tailnet 名、节点名、Tailscale `100.x` 地址、真实出口观察城市，统一换成占位
+  （`tail-example.ts.net`、`node-a`/`node-b`、`100.64.0.x`、`Example City`）。
+- 已发布历史做了受控重写并强推：泄露只出现在两个提交里，重写后 `main` 上已不存在；
+  对应的两个 GitHub Actions run 已删除，避免旧 SHA 被轻易翻到。
+  仍未清除的部分：GitHub 对「不可达旧提交」的缓存副本（按 SHA 直接访问 `raw.githubusercontent.com`
+  仍可能读到），需要联系 GitHub Support 清理。
+
+### Added
+
+- `tests/test_privacy.py`：扫描仓库文本里的本机信息形状（绝对家目录、真实 tailnet 名、
+  非占位的 Tailscale 地址、`192.168.31.x`、真实 token 形状），防止再次写进公开仓库。
+  `AGENTS.md` 增加「隐私与本地信息」一节。
+
 ## [1.3.0] - 2026-11-03
 
 ### Added
