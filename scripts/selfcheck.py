@@ -91,6 +91,8 @@ def check_files() -> None:
         "tests/test_account_guard.py",
         "tests/test_net_guard.py",
         "references/article-mapping.md",
+        "references/tailscale.md",
+        "scripts/tailscale_hosts.py",
         "references/manual-checklist.md",
         "references/scripts-index.md",
         "references/verification-status.md",

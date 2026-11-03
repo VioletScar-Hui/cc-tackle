@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.2.1-111827?style=flat-square" alt="version 1.2.1" />
+    <img src="https://img.shields.io/badge/version-1.3.0-111827?style=flat-square" alt="version 1.3.0" />
   </p>
   <p>
     <a href="#what-it-does">它能做什么</a> ·
@@ -382,6 +382,7 @@ gh api -X PUT /user/starred/VioletScar-Hui/cc-tackle
 │   ├── proxy_guard.py            # Claude 出口体检与单点组修复
 │   ├── client_adapters.py        # 六种客户端片段生成
 │   ├── residential_lock.py       # 住宅链路锁定的统一入口
+│   ├── tailscale_hosts.py        # Tailscale 对端写进 Clash 本地 hosts
 │   └── residential/              # 吸收自 claude-residential-lock 的脚本
 ├── references/                   # 按主题拆开的判据与排错（见「文档导航」）
 ├── tests/                        # 合成夹具单测（见 tests/README.md）
@@ -422,6 +423,7 @@ python3 tools/package_skill.py --check
 | 六种客户端的组与规则片段、10-30 事故复盘 | [`references/client-adapters.md`](references/client-adapters.md)、[`references/proxy-guard.md`](references/proxy-guard.md) |
 | 别家代理读什么、怎么重载 | [`references/proxy-backends.md`](references/proxy-backends.md) |
 | WebRTC 判据与实测 | [`references/webrtc.md`](references/webrtc.md) |
+| 本机接了 Tailscale、DNS 被接管 / `*.ts.net` 解析不了 | [`references/tailscale.md`](references/tailscale.md)、[`scripts/tailscale_hosts.py`](scripts/tailscale_hosts.py) |
 | 报告页与可点修复的安全边界 | [`references/report-page.md`](references/report-page.md) |
 | 历史判断背景、缓存与工作树边界 | [`references/maintenance-notes.md`](references/maintenance-notes.md) |
 | 脚本清单与「什么时候用哪条」 | [`references/scripts-index.md`](references/scripts-index.md) |

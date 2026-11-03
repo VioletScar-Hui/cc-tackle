@@ -2462,6 +2462,10 @@ def fake_ip_prefixes() -> tuple:
     return _FAKE_IP_CACHE
 
 
+# Tailscale MagicDNS 的解析器地址（v4 与 v6）。
+TAILSCALE_DNS_SERVERS = ("100.100.100.100", "fd7a:115c:a1e0::53")
+
+
 def check_dns() -> dict:
     """A6 DNS 泄漏。文章 2.5③。
 
@@ -2470,7 +2474,7 @@ def check_dns() -> dict:
     所以这里按域名分别记录，把解析到真实 IP 的域名单独列出来。
     """
     out = {"resolved": [], "fake_ip": False, "real_ip_hosts": [], "system_dns": [],
-           "probe_ok": True, "probe_errors": []}
+           "tailscale_dns": False, "probe_ok": True, "probe_errors": []}
     for host in ("example.com", "api.anthropic.com", "claude.ai"):
         code, body = run(["dig", "+short", host], timeout=10)
         if code:
@@ -2496,6 +2500,11 @@ def check_dns() -> dict:
     for m in re.finditer(r"nameserver\[\d+\]\s*:\s*(\S+)", body):
         if m.group(1) not in out["system_dns"]:
             out["system_dns"].append(m.group(1))
+    # Tailscale 的 MagicDNS 解析器。看到它就说明系统 DNS 被 Tailscale 接管了，
+    # mihomo 的 dns-hijack 看不到查询——2026-11-03 真机踩过：整项 DNS 泄漏变红，
+    # 域名解析回真实公网 IP。这里只标记，不替用户改 Tailscale 配置。
+    out["tailscale_dns"] = any(server in TAILSCALE_DNS_SERVERS
+                               for server in out["system_dns"])
     return out
 
 
@@ -4446,7 +4455,12 @@ def build_summary(report: dict) -> list:
     elif dn.get("probe_ok") is False:
         add("DNS 泄漏", S_NA, "DNS 探测失败或输出不完整，未判定为干净：" + "; ".join(dn.get("probe_errors") or []))
     elif (dn.get("real_ip_hosts") or []):
-        add("DNS 泄漏", S_BAD, f"这些域名解析到了真实公网 IP：{(dn.get('real_ip_hosts') or [])[:3]}")
+        detail = f"这些域名解析到了真实公网 IP：{(dn.get('real_ip_hosts') or [])[:3]}"
+        if dn.get("tailscale_dns"):
+            detail += ("；系统 DNS 正被 Tailscale（100.100.100.100）接管，mihomo 的劫持被绕过——"
+                       "先 `tailscale set --accept-dns=false`，再跑 `scripts/tailscale_hosts.py --sync` "
+                       "补 *.ts.net 的本地 hosts")
+        add("DNS 泄漏", S_BAD, detail)
     elif cdc.get("leaking") or cdc.get("leaking_fallback"):
         bad = list(cdc.get("leaking") or []) + list(cdc.get("leaking_fallback") or [])
         where = "主解析器" if cdc.get("leaking") else "fallback"

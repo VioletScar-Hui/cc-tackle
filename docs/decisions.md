@@ -120,3 +120,12 @@
 **后果**：订阅换了线路要再跑一次同步；没有组增强文件的订阅只能改运行时，会在订阅更新后被覆盖，脚本必须明确提示。
 
 证据：[`references/proxy-guard.md`](../references/proxy-guard.md)、[`SKILL.md`](../SKILL.md)「Claude 出口体检」、[`tests/test_proxy_guard.py`](../tests/test_proxy_guard.py) 的 `TestSubscriptionSync`。
+
+## ADR-014 · 接了 Tailscale 时：DNS 归 mihomo，`*.ts.net` 由 Clash 本地回答
+
+**状态**：已采纳（2026-11-03）
+**背景**：Tailscale 默认接管系统 DNS（MagicDNS 解析器 `100.100.100.100`），mihomo 的 `dns-hijack` 就看不到查询了——Claude 域名解析回真实公网 IP，体检「DNS 泄漏」变红。把 Tailscale 的 DNS 接管关掉（`--accept-dns=false`）之后，`*.ts.net` 又失去系统解析器：Rex 等工具拿到 Clash 的 fake-ip，连过去 EOF。
+**决定**：DNS 一律归 mihomo（`tailscale set --accept-dns=false` 是前提）；内网 MagicDNS 名字由 Clash 在本地回答——`scripts/tailscale_hosts.py` 把 Tailscale 对端的 `名字 → 100.x` 写进当前订阅 merge 文件的 `hosts:` 块（先备份、只动 hosts、热载并 dig 复验）。不依赖 Clash 的替代方案是 `/etc/resolver/ts.net` 指向 `100.100.100.100`，代价是要 root，写进文档但不默认执行。
+**后果**：Clash 不在跑时 `*.ts.net` 仍解析不了（方案 B 可解）；换订阅/切 profile 后要重跑一次 `--sync`；只映射 IPv4 对端。体检在 DNS 行遇到 Tailscale 解析器时会直接给出这两步。
+
+证据：[`references/tailscale.md`](../references/tailscale.md)、[`scripts/tailscale_hosts.py`](../scripts/tailscale_hosts.py)、[`tests/test_tailscale_hosts.py`](../tests/test_tailscale_hosts.py)、[`tests/test_account_guard.py`](../tests/test_account_guard.py) 的 `TestTailscaleDnsHint`。

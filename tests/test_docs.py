@@ -44,6 +44,7 @@ REQUIRED_DOCS = [
     "references/residential-lock.md",
     "references/residential-pitfalls.md",
     "references/scripts-index.md",
+    "references/tailscale.md",
     "references/verification-status.md",
     "references/webrtc.md",
 ]

@@ -7863,6 +7863,50 @@ class TestIPv6AddressClassification(unittest.TestCase):
         self.assertEqual(out["global_addresses"], ["2606:4700:4700::1111"])
 
 
+class TestTailscaleDnsHint(unittest.TestCase):
+    """Tailscale 接管系统 DNS 时，DNS 泄漏那一行要直接说清原因和解法。
+
+    2026-11-03 真机：装了 Tailscale 之后第一个解析器变成 100.100.100.100，
+    mihomo 的劫持看不到查询，Claude 域名解析回真实公网 IP，整行变红。
+    """
+
+    def _fake_run(self):
+        def fake(cmd, *a, **k):
+            if cmd[0] == "dig":
+                return 0, "203.0.113.5\n"
+            if cmd[0] == "scutil":
+                return 0, ("resolver #1\n  nameserver[0] : 100.100.100.100\n"
+                           "  nameserver[1] : fd7a:115c:a1e0::53\n")
+            return 1, ""
+        return fake
+
+    def test_check_flags_tailscale_as_the_system_resolver(self):
+        with mock.patch.object(g, "run", side_effect=self._fake_run()):
+            out = g.check_dns()
+        self.assertTrue(out["tailscale_dns"])
+        self.assertTrue(out["real_ip_hosts"])
+
+    def test_row_names_tailscale_and_the_fix(self):
+        report = {"A6_dns": {
+            "real_ip_hosts": ["claude.ai", "api.anthropic.com"],
+            "tailscale_dns": True,
+            "system_dns": ["100.100.100.100"],
+            "probe_ok": True,
+        }}
+        rows = dict((name, (status, detail)) for name, status, detail in g.build_summary(report))
+        status, detail = rows["DNS 泄漏"]
+        self.assertIs(status, g.S_BAD)
+        self.assertIn("Tailscale", detail)
+        self.assertIn("accept-dns=false", detail)
+        self.assertIn("tailscale_hosts.py", detail)
+
+    def test_no_tailscale_hint_when_resolvers_are_normal(self):
+        report = {"A6_dns": {"real_ip_hosts": ["claude.ai"], "tailscale_dns": False,
+                             "system_dns": ["114.114.114.114"], "probe_ok": True}}
+        rows = dict((name, (status, detail)) for name, status, detail in g.build_summary(report))
+        self.assertNotIn("Tailscale", rows["DNS 泄漏"][1])
+
+
 if __name__ == "__main__":
     # 这个块必须待在文件最末尾。2026-10-10 发现它一度停在中间（第 2403 行），
     # 于是它后面定义的 6 个类、40 个用例从来没被执行过——`unittest.main()` 在第 2403

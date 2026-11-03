@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.2.1-111827?style=flat-square" alt="version 1.2.1" />
+    <img src="https://img.shields.io/badge/version-1.3.0-111827?style=flat-square" alt="version 1.3.0" />
   </p>
   <p>
     <a href="#what-it-does">What it does</a> ·
@@ -424,6 +424,7 @@ Tests should run in isolated fixtures; real devices, real proxies, real browser 
 | Group and rule snippets for six clients; 10-30 incident review | [`references/client-adapters.md`](references/client-adapters.md), [`references/proxy-guard.md`](references/proxy-guard.md) |
 | What third-party proxies read and how to reload them | [`references/proxy-backends.md`](references/proxy-backends.md) |
 | WebRTC criteria and real-world measurements | [`references/webrtc.md`](references/webrtc.md) |
+| Tailscale attached locally, DNS taken over / `*.ts.net` not resolving | [`references/tailscale.md`](references/tailscale.md), [`scripts/tailscale_hosts.py`](scripts/tailscale_hosts.py) |
 | Security boundaries of the report page and click-to-fix | [`references/report-page.md`](references/report-page.md) |
 | Background for historical judgments, cache and worktree boundaries | [`references/maintenance-notes.md`](references/maintenance-notes.md) |
 | Script inventory and "which one to use when" | [`references/scripts-index.md`](references/scripts-index.md) |

@@ -38,6 +38,7 @@ CI 在 `macos-latest` 上用 Python 3.11 与 3.13 各跑一遍（配置见 [`.gi
 | [`test_resident.py`](../tests/test_resident.py) | 常驻保护清单：`launchctl` 的在跑 / 被禁用 / 未加载三种状态要分清；文章早期手工装的任务与住宅锁定 root 层要按来源列进来、无关 agent 不列、未安装的层要带安装命令；报告页按 `<li>` 渲染每项「保护什么」。 |
 | [`test_residential_lock.py`](../tests/test_residential_lock.py) | 住宅链路锁定：吸收进来的脚本还在且可执行、动作到命令的映射（`--root-*` 必须带 sudo、`--dry-run` 要透传）、参数文件允许用环境变量覆盖、`--status` 输出；另有 bash 3.2 多字节变量回归。 |
 | [`test_ip_judge.py`](../tests/test_ip_judge.py) | 住宅 / 机房判定：任一源 `hosting=True` 即判机房、家宽关键词兜底、都认不出返回 `UNKNOWN`；缓存读写与版本失效。数据源全部注入假 fetcher，不联网。 |
+| [`test_tailscale_hosts.py`](../tests/test_tailscale_hosts.py) | Tailscale 共存：`status --json` 解析、hosts 块原地更新/新建/幂等、merge 文件从 profiles.yaml 解析、dry-run 不落盘、写入前备份、dig 复验（内网名字→100.x、公共域名→fake-ip）。 |
 | [`test_package_skill.py`](../tests/test_package_skill.py) | 可复现打包：只含运行时文件、排除项不误入、两遍构建字节一致、清单 sha256 与 zip 一致、输出落进包内或软链外指要被拒绝。 |
 | [`test_docs.py`](../tests/test_docs.py) | 仓库地图与文档导航：必需文档存在、README 提到每份 reference 与顶层脚本、相对链接与锚点可解析、`SKILL.md` 行数上限、版本号在 `SKILL.md` / README / CHANGELOG 三处一致。 |
 

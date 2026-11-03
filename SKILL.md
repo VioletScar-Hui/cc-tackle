@@ -1,7 +1,7 @@
 ---
 name: cc-tackle
 metadata:
-  version: "1.2.1"
+  version: "1.3.0"
 description: >-
   检测并按用户选择修复 Claude Code 的本机环境——出口 IP 与 ASN 归属、用户指定的预期国家/IP、系统代理与 shell/npm/git 残留、Clash 的 DNS 解析器与 WebRTC 泄漏、IPv6、时区分层与两道闸、`settings.json` 里的中转端点、钥匙串条目、第三方客户端痕迹、CLI 完整性、多账号痕迹与 CLI 登录凭据（长期 token 还是网页授权登录）。默认审计只读且不落盘；加固先展示完整计划，确认后备份优先、失败即停、每项写入后复验；恢复必须使用显式备份目录并逐项验证。
   Use when 用户说「Claude 环境自检 / 保号体检 / 登录 Claude 前先检查环境 / 系统代理残留又出现了 / DNS 泄漏 / WebRTC 泄漏 / 出口 IP 是机房还是住宅 / 时区对不对 / settings.json 有没有中转残留 / 换订阅后 Claude 线路还通不通 / 换机器后 Claude Code 又要求重新登录」，或换环境、换代理订阅、被封后重开之前要做环境排查时。
@@ -29,6 +29,7 @@ description: >-
 | 别家代理读什么、怎么重载 | `references/proxy-backends.md` |
 | 报告页与可点修复的安全边界 | `references/report-page.md` |
 | WebRTC 判据与实测 | `references/webrtc.md` |
+| 本机接了 Tailscale、DNS 被它接管 / `*.ts.net` 解析不了 | `references/tailscale.md`；`scripts/tailscale_hosts.py --status/--sync` |
 | 每项检查的证据等级、最后真机日期 | `references/verification-status.md` |
 | 每个脚本、参数的一行说明 | `references/scripts-index.md` |
 | 维护约定、决策记录、版本变化 | `AGENTS.md`、`docs/decisions.md`、`CHANGELOG.md` |
@@ -45,6 +46,7 @@ description: >-
 | `scripts/proxy_guard.py` | Claude 出口体检、单点组修复、片段生成 |
 | `scripts/client_adapters.py` | 六种客户端片段生成 |
 | `scripts/residential_lock.py` | 住宅链路锁定统一入口 |
+| `scripts/tailscale_hosts.py` | 把 Tailscale 对端名字写进 Clash 本地 hosts（`--status` / `--sync` / `--dry-run`） |
 
 参数、依赖和「什么时候用哪条」见 `references/scripts-index.md`。
 
@@ -339,6 +341,17 @@ python3 scripts/proxy_guard.py --emit sing-box  # 生成某家客户端的组+�
 - 和 A12 的分工：A12 判「会不会漏」，这里判「挂掉一条还剩不剩」。所以体检表里 A12 打 ✓ 的同时，
   组里也可能只有一条线路——那是单点组，不是泄漏，改动与否由用户决定。
 - 适配写法、贴哪里、事故复盘：`references/client-adapters.md`、`references/proxy-guard.md`
+
+## 本机接了 Tailscale（MagicDNS）时
+
+Tailscale 默认会接管系统 DNS（解析器 `100.100.100.100`），mihomo 的 `dns-hijack` 就看不到查询了——Claude 域名解析回真实公网 IP，体检「DNS 泄漏」变红。顺序是：
+
+1. `tailscale set --accept-dns=false` 把 DNS 还给 mihomo；
+2. 代价是 `*.ts.net` 不再有系统解析器（Rex 等会拿到 fake-ip 连不上），跑
+   `python3 scripts/tailscale_hosts.py --sync` 把 Tailscale 对端写进当前订阅 merge 的 `hosts:`，Clash 本地回答这些内网名字；
+3. 不想依赖 Clash 就改用 `/etc/resolver/ts.net`（要 root）。
+
+体检遇到这个场景会在 DNS 那一行直接给提示。完整排查、两条路线的取舍、常见误判见 `references/tailscale.md`。
 
 ## 不只认 Clash
 

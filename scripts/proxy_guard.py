@@ -135,7 +135,7 @@ def parse_profiles(text: str) -> dict:
             continue
         if cur is None:
             continue
-        for key in ("groups", "file", "type", "name"):
+        for key in ("groups", "merge", "script", "rules", "proxies", "file", "type", "name"):
             if stripped.startswith(key + ":"):
                 cur[key] = stripped.split(":", 1)[1].strip() or None
                 break
@@ -152,6 +152,8 @@ def verge_profile() -> dict:
     item = doc.get("items", {}).get(uid) or {}
     groups_uid = item.get("groups")
     groups_item = doc.get("items", {}).get(groups_uid) or {}
+    merge_uid = item.get("merge")
+    merge_item = doc.get("items", {}).get(merge_uid) or {}
     profiles_dir = VERGE_DIR / "profiles"
 
     def _p(name):
@@ -165,6 +167,8 @@ def verge_profile() -> dict:
         "profile_path": _p(item.get("file")),
         "groups_uid": groups_uid,
         "groups_file": _p(groups_item.get("file")),
+        "merge_uid": merge_uid,
+        "merge_file": _p(merge_item.get("file")),
     }
 
 

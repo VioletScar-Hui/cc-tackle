@@ -2,6 +2,18 @@
 
 本文件按交付批次记录变化，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。版本号与 `SKILL.md` frontmatter 里的 `metadata.version` 保持一致；`1.0.4` 及更早的版本号是事后回填的，依据见文末「版本号说明」。
 
+## [1.3.0] - 2026-11-03
+
+### Added
+
+- `scripts/tailscale_hosts.py`：本机接 Tailscale 时的 DNS 共存适配。读 `tailscale status --json` 的对端 IPv4，写进当前订阅 merge 文件的 `hosts:` 块（先备份、只动 hosts、可热载、用 dig 复验），让 Clash 在本地回答 `*.ts.net`，公共域名继续走 fake-ip。
+- `references/tailscale.md`：为什么 Tailscale MagicDNS 会顶掉 mihomo 的 DNS 劫持、两种解法（Clash 本地 hosts / `/etc/resolver/ts.net`）、限制、常见误判与 2026-11-03 真机记录。
+- 体检「DNS 泄漏」行检测到 Tailscale 解析器时，直接给出 `--accept-dns=false` 与 `tailscale_hosts.py --sync` 的提示，不再只报「解析到了真实公网 IP」。
+
+### Changed
+
+- `proxy_guard.parse_profiles` / `verge_profile()` 额外暴露当前订阅的 merge 文件（`option.merge`），供 Tailscale 适配脚本定位要写的那份文件。
+
 ## [1.2.1] - 2026-11-03
 
 ### Fixed

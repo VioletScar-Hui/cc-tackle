@@ -64,6 +64,16 @@ scutil --dns | grep 'nameserver\[0\]' | head -3
 
 关掉之后 `dig example.com +short` 应重新落回 `198.18.x`。
 
+代价是 `*.ts.net` 这类 MagicDNS 名字也没解析器了。用 Clash 本地 hosts 补上，别把 DNS 还回 Tailscale：
+
+```bash
+python3 scripts/tailscale_hosts.py --status
+python3 scripts/tailscale_hosts.py --sync --dry-run
+python3 scripts/tailscale_hosts.py --sync
+```
+
+完整取舍（含 `/etc/resolver/ts.net` 的免 Clash 方案）见 [`tailscale.md`](tailscale.md)。
+
 第二件是**谁在解析**，`check_clash_dns()` 查的就是它。只看第一件会漏：2026-10-09 换成住宅代理订阅后，profile 自带的主解析器是阿里 `223.5.5.5` 且 `respect-rules` 整个丢了，`dig` 依然返回 fake-IP（劫持是好的），但国外域名的解析请求全交给了国内解析器，而且因为缺 `respect-rules`，Clash 自己的 DNS 查询还是从真实 IP 直发的。三个站点实测都看到了中国解析器。
 
 - 五条判据：`leaking`、`leaking_fallback`、`respect_rules`、`enabled`、`hijack`。后两条读的是 `dns.enable` 与 `tun.dns-hijack`（后者在 `tun` 底下、不在 `dns` 块里），只在 TUN 开着时才要求；任一成立即待处理，逐条解释见 `references/article-mapping.md`。
