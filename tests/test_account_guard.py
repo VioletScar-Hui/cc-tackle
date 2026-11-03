@@ -7465,6 +7465,17 @@ class TestCliLogin(unittest.TestCase):
     哪种凭据，并把 setup-token 的做法指出来。
     """
 
+    def setUp(self):
+        # 开发机上真的用 setup-token 写过长期 token 之后，真实的 settings.json 会被
+        # 读进来，「只有环境变量一个来源」之类的断言就多出一项（2026-11-03 踩到）。
+        # 这组用例自带临时 HOME 与 settings，不读开发机的真实凭据。
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="guard-login-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name, value in (("SETTINGS", tmp / "settings.json"), ("HOME", tmp)):
+            patcher = mock.patch.object(g, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _env(self, **extra):
         base = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_GUARD_")}
         base.pop(g.CLI_LOGIN_TOKEN_ENV, None)
@@ -7804,6 +7815,52 @@ class TestReportOpenFailure(unittest.TestCase):
         self.assertIn(str(page), stderr.getvalue())
         self.assertIn("没能自动打开", stderr.getvalue())
         self.assertTrue(page.exists())
+
+
+class TestIPv6AddressClassification(unittest.TestCase):
+    """公网 IPv6 才要报；链路本地、回环、Tailscale 的 ULA 都不算泄漏。
+
+    2026-11-03 踩过：装了 Tailscale 之后设备拿到 fd7a:…（fc00::/7 唯一本地地址），
+    旧判据只要不是 fe80/::1 就当成全局地址，报告里凭空多出一条、还扣分。
+    """
+
+    def test_non_public_addresses_are_ignored(self):
+        for token in ("fd00::10", "fe80::1%en0", "::1",
+                      "inet6", "", "not-an-address"):
+            self.assertFalse(g._is_public_ipv6(token), token)
+
+    def test_really_public_address_is_kept(self):
+        self.assertTrue(g._is_public_ipv6("2606:4700:4700::1111"))
+        self.assertTrue(g._is_public_ipv6("2401:4900:1:2::3"))
+
+    def _fake_run(self, ifconfig_body: str):
+        def fake(cmd, *a, **k):
+            if cmd[0] == "ifconfig":
+                return 0, ifconfig_body
+            if cmd[:2] == ["networksetup", "-listallnetworkservices"]:
+                return 0, "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n"
+            if cmd[:2] == ["networksetup", "-getinfo"]:
+                return 0, "IPv6: Automatic\n"
+            return 1, ""
+        return fake
+
+    def test_tailscale_ula_is_not_a_global_address(self):
+        body = (
+            "lo0: flags=8049<UP,LOOPBACK>\n"
+            "\tinet6 ::1 prefixlen 128\n"
+            "utun6: flags=8051<UP,POINTOPOINT>\n"
+            "\tinet6 fd00::10 prefixlen 48\n"
+            "\tinet 100.64.0.10 --> 100.64.0.10\n"
+        )
+        with mock.patch.object(g, "run", side_effect=self._fake_run(body)):
+            out = g.check_ipv6()
+        self.assertEqual(out["global_addresses"], [])
+
+    def test_public_address_is_reported_with_the_address_not_the_keyword(self):
+        body = "en0: flags=8863<UP>\n\tinet6 2606:4700:4700::1111 prefixlen 64 autoconf\n"
+        with mock.patch.object(g, "run", side_effect=self._fake_run(body)):
+            out = g.check_ipv6()
+        self.assertEqual(out["global_addresses"], ["2606:4700:4700::1111"])
 
 
 if __name__ == "__main__":

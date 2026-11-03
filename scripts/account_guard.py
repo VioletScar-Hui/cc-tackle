@@ -2373,6 +2373,21 @@ def check_anthropic_base_url() -> dict:
     return out
 
 
+def _is_public_ipv6(token: str) -> bool:
+    """这个 inet6 地址值不值得当成「公网 IPv6 泄漏」报出来。
+
+    只认真正能路由到公网的地址：链路本地（fe80::/10）、回环（::1）、唯一本地地址
+    （fc00::/7，Tailscale 的 fd7a:… 就落在这里）都不算。2026-11-03 踩过：
+    Tailscale 给设备发的 fd7a: ULA 被旧判据当成公网地址，报告里凭空多出一条
+    「IPv6 全局地址」，扣分还误导人。
+    """
+    try:
+        addr = ipaddress.IPv6Address(token.split("%", 1)[0])
+    except ValueError:
+        return False
+    return bool(addr.is_global)
+
+
 def check_ipv6() -> dict:
     """A5 IPv6 泄漏。文章 2.5 可选加固。"""
     out = {"global_addresses": [], "services": {}, "probe_ok": True, "probe_errors": []}
@@ -2381,9 +2396,12 @@ def check_ipv6() -> dict:
         out["probe_ok"] = False
         out["probe_errors"].append("ifconfig 失败")
     for line in body.splitlines():
-        s = line.strip()
-        if s.startswith("inet6") and "fe80" not in s and "::1" not in s:
-            out["global_addresses"].append(s.split()[0])
+        parts = line.strip().split()
+        if len(parts) < 2 or parts[0] != "inet6":
+            continue
+        # 记地址本身，不是 "inet6" 这个词——旧版 append 的是 split()[0]。
+        if _is_public_ipv6(parts[1]):
+            out["global_addresses"].append(parts[1])
     svc_code, svc_body = run(["networksetup", "-listallnetworkservices"])
     if svc_code:
         out["probe_ok"] = False

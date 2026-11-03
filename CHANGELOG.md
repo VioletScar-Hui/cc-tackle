@@ -2,6 +2,18 @@
 
 本文件按交付批次记录变化，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。版本号与 `SKILL.md` frontmatter 里的 `metadata.version` 保持一致；`1.0.4` 及更早的版本号是事后回填的，依据见文末「版本号说明」。
 
+## [1.2.1] - 2026-11-03
+
+### Fixed
+
+- 「IPv6 全局地址」不再把 Tailscale 的 `fd7a:…` 当成公网地址。旧判据只排除 `fe80` 与 `::1`，
+  而 `fc00::/7` 唯一本地地址（含 Tailscale 给每台设备发的 ULA）本该不算；现在按地址类型判断
+  （`is_global`），并且报告里记的是地址本身，不再记成 `inet6` 这个词。回归用例覆盖 ULA、
+  链路本地、回环、真实公网地址与垃圾输入。
+- 手工清单补一条排查路径：装了会改系统 DNS 的 VPN（如 Tailscale 的 `100.100.100.100`）时，
+  mihomo 的 DNS 劫持会失效、解析出真实公网 IP；先看 `scutil --dns` 的第一个解析器，
+  用 `tailscale set --accept-dns=false` 把 DNS 还回去（设备互联不受影响）。
+
 ## [1.2.0] - 2026-11-02
 
 ### Added

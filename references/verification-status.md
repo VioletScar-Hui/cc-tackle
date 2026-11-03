@@ -27,7 +27,7 @@
 | 5 | DNS 泄漏 | `check_dns` / `check_clash_dns` | 实测·脚本 | 2026-10-09 | 只看配置与 fake-ip 结果，不自己发 DNS 探测 |
 | 6 | 浏览器 Intl 区域设置 | `check_browser_locale` | 用户回传 | 2026-10 | 只能证明「哪个资料打开过复核页」 |
 | 7 | WebRTC 泄漏 | `check_webrtc` | 用户回传 + 实测·脚本 | 2026-10 | 只测 Chromium 系；Firefox/Safari 未覆盖 |
-| 8 | IPv6 全局地址 | `check_ipv6` | 实测·脚本 | 2026-10 | 要排掉 `::1` 与 `fe80`，规则由夹具守 |
+| 8 | IPv6 全局地址 | `check_ipv6` | 实测·脚本 | 2026-11 | 只报真正公网的地址；`::1`、`fe80::/10`、`fc00::/7`（Tailscale 的 `fd7a:…` 落在这里）都不算，规则由夹具守 |
 | 9 | 时区是否锁在台北 | `check_timezone_layers` | 实测·脚本 | 2026-10 | 两个活读数 + `timed` 历史分开报 |
 | 10 | 时区两道闸 | `check_timezone_layers` | 实测·脚本 + 配置读取 | 2026-10 | 定位库要 root，非 root 只能报「读不到」 |
 | 11 | 代理后端 | `_proxy_backend_report` | 实测·脚本 | 2026-10 | mihomo 本机常态；sing-box 真实例；Surge / v2ray 仅合成 |
