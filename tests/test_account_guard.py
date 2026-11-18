@@ -42,10 +42,13 @@ import selfcheck as selfcheck_module  # noqa: E402
 
 
 _SAVED_GUARD_ENV: dict = {}
+_REAL_CLEAR_MEASUREMENTS = g.clear_previous_measurements
+_REAL_RUN_FRESH_MEASUREMENTS = g.run_fresh_measurements
+_REAL_CHECK_WEBRTC = g.check_webrtc
 
 
 def setUpModule() -> None:
-    """跑测试前把 CLAUDE_GUARD_* 环境变量摘掉。
+    """跑测试前把 CLAUDE_GUARD_* 环境变量摘掉，并屏蔽每轮强制实测。
 
     这套用例必须与开发机的环境无关。main() 是**按体检结果问不定数量的问题**的：
     多一项可清理就多一问，而 auto_clean_plan 里还有几项是现场读环境的
@@ -65,12 +68,25 @@ def setUpModule() -> None:
     global _TEST_REPORT_DIR
     _TEST_REPORT_DIR = pathlib.Path(tempfile.mkdtemp(prefix="guard-report-"))
     rh.BACKUP_DIR = _TEST_REPORT_DIR / "reports"
+    # 审计/加固现在每轮都强制实测浏览器并作废上一轮结果：用例里既不能真去开
+    # Chrome（会挂 240 秒），也不能删开发机 ~/.local/state 下的真实文件。
+    # 全局换成 no-op，要测这两个行为就单独 patch 回真函数（见 TestFreshMeasurements）。
+    global _FRESH_PATCHES
+    _FRESH_PATCHES = [mock.patch.object(g, "clear_previous_measurements"),
+                      mock.patch.object(g, "run_fresh_measurements"),
+                      mock.patch.object(g, "check_webrtc", return_value={})]
+    for patcher in _FRESH_PATCHES:
+        patcher.start()
 
 
 _TEST_REPORT_DIR = None
+_FRESH_PATCHES: list = []
 
 
 def tearDownModule() -> None:
+    for patcher in _FRESH_PATCHES:
+        patcher.stop()
+    _FRESH_PATCHES.clear()
     os.environ.update(_SAVED_GUARD_ENV)
     if _TEST_REPORT_DIR is not None:
         shutil.rmtree(_TEST_REPORT_DIR, ignore_errors=True)
@@ -868,7 +884,8 @@ class TestWebrtcClassification(unittest.TestCase):
         self.assertEqual(r["local_ips"], [])
 
     def test_no_browser_gives_manual_path(self):
-        with mock.patch.object(g, "find_chromium", return_value=None):
+        with mock.patch.object(g, "check_webrtc", _REAL_CHECK_WEBRTC), \
+             mock.patch.object(g, "find_chromium", return_value=None):
             r = g.check_webrtc()
         self.assertFalse(r["available"])
         self.assertIn("browserleaks.com/webrtc", r["note"])
@@ -898,7 +915,8 @@ class TestWebrtcClassification(unittest.TestCase):
             def server_close(self):
                 return None
 
-        with mock.patch.object(g, "find_chromium", return_value="/fake/chrome"), \
+        with mock.patch.object(g, "check_webrtc", _REAL_CHECK_WEBRTC), \
+             mock.patch.object(g, "find_chromium", return_value="/fake/chrome"), \
              mock.patch.object(g, "classify_webrtc_candidates", side_effect=fake_classify), \
              mock.patch.object(hs, "ThreadingHTTPServer", FakeServer), \
              mock.patch("subprocess.Popen", side_effect=OSError("不真的起浏览器")):
@@ -1620,7 +1638,7 @@ class TestSummaryTable(unittest.TestCase):
     def test_missing_webrtc_says_how_to_run_it(self):
         row = self._row(g.build_summary(self._report()), "WebRTC 泄漏")
         self.assertIs(row[1], g.S_NA)
-        self.assertIn("--webrtc", row[2])
+        self.assertIn("--no-browser", row[2])
 
     def test_local_ids_are_not_counted_as_accounts(self):
         r = self._report()
@@ -2871,15 +2889,16 @@ class TestWebrtcMediaPermissionExposure(unittest.TestCase):
         self.assertIs(row[1], g.S_NA)
         self.assertIn(g.now_stamp(), row[2])
 
-    def test_row_uses_the_media_cache_when_the_probe_was_not_run(self):
-        # 完整流程不带 --webrtc 时不跑探测，但复核过的结论该直接用来判这一行；
-        # 否则用户刚修好的项会在流程末尾的复检表里又退回成「未探测」。
+    def test_previous_media_cache_never_stands_in_for_a_probe(self):
+        # 每一轮都要自己实测：就算上一轮留下的媒体权限结果看着很新，
+        # 没有本轮探测时这一行也只能报未测到，不能拿旧结论顶成绿色。
         with mock.patch.object(g, "load_media_permission",
                                return_value={"ok": True, "checkedAt": g.now_stamp(),
-                                             "profileScope": "test-profile"}):
+                                             "profileScope": "test-profile",
+                                             "openedBy": "script"}):
             row = self._row({})
         self.assertIs(row[1], g.S_NA)
-        self.assertIn(g.now_stamp(), row[2])
+        self.assertIn("不会用上一轮的结果顶替", row[2])
 
     def test_row_stays_unmeasured_without_probe_and_without_cache(self):
         # setUp 已把缓存挡成空：既没跑探测、也没复核过，就只能如实说未测到
@@ -7317,7 +7336,10 @@ class TestSelfcheckParsesStdoutOnly(unittest.TestCase):
              mock.patch.object(selfcheck_module, "add") as add_row:
             _path, got = selfcheck_module.check_audit(browser=True)
         self.assertEqual(got, report)
-        self.assertIn("--verify-browser", seen[0])
+        # 浏览器实测现在由 account_guard 每轮强制跑：审计命令不再带可选开关，
+        # 也不能传 --no-browser（那会把两项降级成「未测到」）。
+        self.assertNotIn("--no-browser", seen[0])
+        self.assertNotIn("--verify-browser", seen[0])
         statuses = [call.args[1] for call in add_row.call_args_list if len(call.args) > 1]
         self.assertNotIn(selfcheck_module.BAD, statuses)
 
@@ -7327,42 +7349,139 @@ class TestSelfcheckParsesStdoutOnly(unittest.TestCase):
                               side_effect=self._fake_run(seen, "{}", "")), \
              mock.patch.object(selfcheck_module, "add"):
             selfcheck_module.check_audit(browser=False)
-        self.assertNotIn("--verify-browser", seen[0])
+        self.assertIn("--no-browser", seen[0])
 
 
 class TestJsonStdoutStaysClean(unittest.TestCase):
     """--json 的 stdout 只能是那一个 JSON 文档，别人靠它解析。
 
-    踩过的坑：--verify-browser 的复核进度是直接 print 的，自检脚本拿
-    `--audit --json --verify-browser` 调过去就解析不了，整项被判失败，
-    而退出码还是 0 —— 只能靠这条用例钉住。
+    踩过的坑：浏览器复核的进度是直接 print 的，自检脚本拿
+    `--audit --json` 调过去就解析不了，整项被判失败，而退出码还是 0 ——
+    现在复核每轮强制跑，只能靠这条用例钉住。
     """
 
     def _run(self, argv):
         report = {"A1_export_ip": {"ip": "203.0.113.10", "country": "US"}}
         out = io.StringIO()
+        def noisy():
+            print("噪音：复核页已打开 http://127.0.0.1:1/x")
+            print("噪音：结果已存")
         with mock.patch.object(sys, "argv", ["account_guard.py"] + argv), \
              mock.patch.object(g, "audit", return_value=report), \
              mock.patch.object(g, "check_webrtc", return_value={}), \
-             mock.patch.object(g, "verify_browser_locale") as locale_probe, \
-             mock.patch.object(g, "verify_media_permission") as media_probe, \
+             mock.patch.object(g, "run_fresh_measurements", side_effect=noisy), \
              mock.patch.object(g, "running_under_claude", return_value=False), \
              contextlib.redirect_stdout(out):
-            locale_probe.side_effect = lambda *a, **k: print("噪音：复核页已打开 http://127.0.0.1:1/x")
-            media_probe.side_effect = lambda *a, **k: print("噪音：结果已存")
             code = g.main()
         return code, out.getvalue()
 
     def test_json_mode_emits_only_json_even_when_the_probes_are_chatty(self):
-        code, out = self._run(["--audit", "--json", "--verify-browser"])
+        # 现在每一轮都强制实测；复核进度必须走 stderr，stdout 只能有 JSON。
+        code, out = self._run(["--audit", "--json"])
         self.assertEqual(code, 0)
         parsed = json.loads(out)          # 解析不了就是回归
         self.assertEqual(parsed["A1_export_ip"]["ip"], "203.0.113.10")
 
-    def test_human_mode_still_shows_the_progress_on_stdout(self):
-        code, out = self._run(["--audit", "--json"])
+    def test_no_browser_mode_still_emits_clean_json(self):
+        code, out = self._run(["--audit", "--json", "--no-browser"])
         self.assertEqual(code, 0)
-        json.loads(out)                   # 不带复核时本来也干净
+        json.loads(out)
+
+
+class TestFreshMeasurements(unittest.TestCase):
+    """每一轮审计/加固都必须自己实测；上一轮的浏览器 / 定位闸结果一律作废。
+
+    这是用户 2026-11-18 的口径：每一项都必须真的跑，不能用缓存替本轮下结论。
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.paths = {}
+        for name in ("MEDIA_CACHE", "LOCALE_CACHE", "LOCATION_GATE_CACHE"):
+            path = self.tmp / (name.lower() + ".json")
+            patcher = mock.patch.object(g, name, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+            self.paths[name] = path
+
+    def _write(self, path, payload="{}"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(payload, encoding="utf-8")
+
+    def test_clear_previous_measurements_removes_last_rounds_evidence(self):
+        for path in self.paths.values():
+            self._write(path)
+        with mock.patch.object(g, "clear_previous_measurements",
+                               _REAL_CLEAR_MEASUREMENTS):
+            g.clear_previous_measurements()
+        for path in self.paths.values():
+            self.assertFalse(path.exists(), path)
+
+    def test_audit_clears_then_measures_then_reads(self):
+        calls = []
+        report = {"A1_export_ip": {"ip": "203.0.113.10", "country": "US"}}
+        def fake_audit(**kwargs):
+            calls.append("audit")
+            return report
+        with mock.patch.object(sys, "argv", ["account_guard.py", "--audit", "--json"]), \
+             mock.patch.object(g, "clear_previous_measurements",
+                               side_effect=lambda: calls.append("clear")), \
+             mock.patch.object(g, "run_fresh_measurements",
+                               side_effect=lambda: calls.append("measure")), \
+             mock.patch.object(g, "audit", side_effect=fake_audit), \
+             mock.patch.object(g, "check_webrtc",
+                               side_effect=lambda: calls.append("webrtc") or {}), \
+             mock.patch.object(g, "running_under_claude", return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            code = g.main()
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[:2], ["clear", "measure"],
+                         "必须先作废上一轮结果，再重新实测")
+        self.assertLess(calls.index("measure"), calls.index("audit"),
+                        "实测必须在 audit() 读结果之前完成")
+        self.assertIn("webrtc", calls, "WebRTC 探测每轮都要跑")
+
+    def test_no_browser_clears_but_skips_every_probe(self):
+        calls = []
+        report = {"A1_export_ip": {"ip": "203.0.113.10", "country": "US"}}
+        with mock.patch.object(
+                sys, "argv",
+                ["account_guard.py", "--audit", "--json", "--no-browser"]), \
+             mock.patch.object(g, "clear_previous_measurements",
+                               side_effect=lambda: calls.append("clear")), \
+             mock.patch.object(g, "run_fresh_measurements",
+                               side_effect=lambda: calls.append("measure")), \
+             mock.patch.object(g, "audit", return_value=report), \
+             mock.patch.object(g, "check_webrtc",
+                               side_effect=lambda: calls.append("webrtc") or {}), \
+             mock.patch.object(g, "running_under_claude", return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            code = g.main()
+        self.assertEqual(code, 0)
+        self.assertIn("clear", calls, "就算跳过实测，也要作废上一轮结果")
+        self.assertNotIn("measure", calls)
+        self.assertNotIn("webrtc", calls)
+
+    def test_old_measurement_is_not_used_even_if_it_looks_fresh(self):
+        old = {"intlLocale": "zh-CN", "checkedAt": g.now_stamp(),
+               "profileScope": "default", "openedBy": "script"}
+        self._write(self.paths["LOCALE_CACHE"], json.dumps(old))
+        with mock.patch.object(g, "clear_previous_measurements",
+                               _REAL_CLEAR_MEASUREMENTS):
+            g.clear_previous_measurements()
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["defaults", "read", "-g"]:
+                return 0, json.dumps(["en-US", "zh-Hans-US"])
+            return 1, "does not exist"
+        with mock.patch.object(g, "run", side_effect=fake_run):
+            locale = g.check_browser_locale({"country": "US"})
+        row = [r for r in g.build_summary({"A27_browser_locale": locale})
+               if r[0] == "浏览器 Intl 区域设置"][0]
+        self.assertIs(row[1], g.S_NA)
+        self.assertIn("推定", locale.get("source") or "")
 
 
 class TestBrowserVerifyAutoOpen(unittest.TestCase):
@@ -7438,8 +7557,20 @@ class TestBrowserVerifyAutoOpen(unittest.TestCase):
         rows = dict((n, s) for n, s, _ in g.build_summary(report))
         self.assertIs(rows["浏览器 Intl 区域设置"], g.S_NA)
 
+    def _webrtc_probe(self, **extra):
+        probe = {"available": True, "candidates": 1, "mdns": True,
+                 "local_ips": [], "leaked_public": [],
+                 "browser": "/x/chrome-mac/Google Chrome for Testing",
+                 "media": "not-requested",
+                 "with_media": {"candidates": 5, "media": "granted",
+                                "local_ips": [{"ip": "198.18.0.1", "private": True}],
+                                "leaked_public": [], "tun_leak": [], "mdns": False}}
+        probe.update(extra)
+        return probe
+
     def test_webrtc_row_greens_for_a_script_opened_page(self):
-        report = {"A7_webrtc": {"available": False, "note": "未探测"}}
+        # 绿色前提：本轮跑过探测，且本轮的媒体权限复核显示摄像头/麦克风都拿不到。
+        report = {"A7_webrtc": self._webrtc_probe()}
         media = {"ok": True, "camera": "denied", "microphone": "denied",
                  "detail": "NotAllowedError", "checkedAt": "2026-10-15 13:00",
                  "openedBy": "script"}
@@ -7449,9 +7580,19 @@ class TestBrowserVerifyAutoOpen(unittest.TestCase):
         self.assertIs(rows["WebRTC 泄漏"], g.S_OK)
 
     def test_webrtc_row_stays_unknown_for_a_hand_opened_page(self):
-        report = {"A7_webrtc": {"available": False, "note": "未探测"}}
+        report = {"A7_webrtc": self._webrtc_probe()}
         media = {"ok": True, "camera": "denied", "microphone": "denied",
                  "checkedAt": "2026-10-15 13:00", "openedBy": "user"}
+        with mock.patch.object(g, "load_media_permission", return_value=media), \
+             mock.patch.object(g, "cache_is_fresh", return_value=(True, "")):
+            rows = dict((n, s) for n, s, _ in g.build_summary(report))
+        self.assertIs(rows["WebRTC 泄漏"], g.S_NA)
+
+    def test_webrtc_row_without_a_probe_never_borrows_last_rounds_result(self):
+        # 没有本轮探测时，就算上一轮媒体权限缓存看着新鲜也不能判绿。
+        report = {"A7_webrtc": {"available": False, "note": "未探测"}}
+        media = {"ok": True, "camera": "denied", "microphone": "denied",
+                 "checkedAt": "2026-10-15 13:00", "openedBy": "script"}
         with mock.patch.object(g, "load_media_permission", return_value=media), \
              mock.patch.object(g, "cache_is_fresh", return_value=(True, "")):
             rows = dict((n, s) for n, s, _ in g.build_summary(report))
@@ -7644,30 +7785,33 @@ class TestFixAuto(unittest.TestCase):
         backup.assert_not_called()
         self.assertEqual(len(written), 1, "取消时也要把改动前那份页面给出来")
 
-    def test_preflight_asks_before_the_audit_and_only_once(self):
-        args = mock.Mock(verify_browser=False, webrtc=False, expected_country=None,
-                         expected_exit_ip=None, json=False)
-        with mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=True), \
-             mock.patch.dict(os.environ, {}, clear=False), \
-             mock.patch("builtins.input", side_effect=["", "", "", "n"]):
-            g.run_preflight(args)
-        self.assertTrue(args.verify_browser, "空的默认回答应当按「要测」处理")
-        self.assertTrue(args.webrtc, "WebRTC 探测也要在体检之前问，否则这一项必然未测到")
-
-    def test_preflight_records_the_profile_answer_up_front(self):
-        # 资料名提前问、写进环境变量：复核缓存与后续判定用的是同一份声明。
-        args = mock.Mock(verify_browser=False, webrtc=False, expected_country=None,
+    def test_preflight_no_longer_asks_whether_to_probe(self):
+        # 浏览器实测与 WebRTC 探测现在每轮强制跑，前置提问只剩资料名与预期出口。
+        args = mock.Mock(no_browser=False, expected_country=None,
                          expected_exit_ip=None, json=False)
         env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_GUARD_")}
         with mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=True), \
              mock.patch.dict(os.environ, env, clear=True), \
-             mock.patch("builtins.input", side_effect=["", "", "Profile 1", "n"]):
+             mock.patch("builtins.input", side_effect=["Profile 1", "n"]) as ask:
             g.run_preflight(args)
             self.assertEqual(os.environ.get(g.BROWSER_PROFILE_DIR_ENV), "Profile 1")
             self.assertEqual(os.environ.get(g.BROWSER_PROFILE_ENV), "Profile 1")
+        self.assertIsNone(args.expected_country)
+        self.assertEqual(ask.call_count, 2, "只问资料名和预期出口，不再问要不要测")
+
+    def test_preflight_records_the_profile_answer_up_front(self):
+        # 资料名提前问、写进环境变量：本轮复核结果与后续判定用的是同一份声明。
+        args = mock.Mock(no_browser=False, expected_country=None,
+                         expected_exit_ip=None, json=False)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_GUARD_")}
+        with mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=True), \
+             mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch("builtins.input", side_effect=["Profile 1", "n"]):
+            g.run_preflight(args)
+            self.assertEqual(os.environ.get(g.BROWSER_PROFILE_DIR_ENV), "Profile 1")
 
     def test_preflight_stays_out_of_the_way_without_a_tty(self):
-        args = mock.Mock(verify_browser=False, webrtc=False, expected_country=None,
+        args = mock.Mock(no_browser=False, expected_country=None,
                          expected_exit_ip=None, json=False)
         stderr = io.StringIO()
         with mock.patch.object(g.sys.stdin, "isatty", create=True, return_value=False), \
@@ -7675,8 +7819,7 @@ class TestFixAuto(unittest.TestCase):
              contextlib.redirect_stderr(stderr):
             g.run_preflight(args)
         ask.assert_not_called()
-        self.assertFalse(args.verify_browser)
-        self.assertIn("--verify-browser", stderr.getvalue())
+        self.assertIn("--no-browser", stderr.getvalue())
 
 
 class TestShellResidueMatcher(unittest.TestCase):

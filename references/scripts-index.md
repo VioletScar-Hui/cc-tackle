@@ -6,7 +6,7 @@
 
 | 脚本 | 一行说明 | 主要参数 |
 | --- | --- | --- |
-| [`account_guard.py`](../scripts/account_guard.py) | 主体：28 项只读体检、确认后加固、显式恢复、HTML 报告 | `--audit`、`--audit --json`、`--audit --save-audit`、`--preflight`、`--fix-auto`、`--yes`（只配 `--fix-auto`）、`--verify-browser`、`--webrtc`、`--check-media`、`--check-locale`、`--install-webrtc-limiter`、`--expected-country`、`--expected-exit-ip`、`--fix-unverified`、`--manual`、`--commands`、`--report`（兼容写法）、`--restore`、`--restore-preview`、`--restore-item` |
+| [`account_guard.py`](../scripts/account_guard.py) | 主体：28 项只读体检、确认后加固、显式恢复、HTML 报告 | `--audit`、`--audit --json`、`--audit --save-audit`、`--preflight`、`--fix-auto`、`--yes`（只配 `--fix-auto`）、`--no-browser`、`--verify-browser` / `--webrtc`（兼容保留）、`--check-media`、`--check-locale`、`--install-webrtc-limiter`、`--expected-country`、`--expected-exit-ip`、`--fix-unverified`、`--manual`、`--commands`、`--report`（兼容写法）、`--restore`、`--restore-preview`、`--restore-item` |
 | [`selfcheck.py`](../scripts/selfcheck.py) | 七项串联自检：技能文件 → 编译 → 单测 → 守护脚本 → Clash → 系统代理 → 完整体检；只读，不出 HTML | `--fast`（跳过单测）、`--no-audit`（跳过体检）、`--no-browser`（不弹复核页，浏览器两项改为未测到） |
 | [`report_html.py`](../scripts/report_html.py) | 把审计 JSON 重渲染成自包含 HTML；页面数字来自 `build_summary`，不在这里另写判定 | `[报告.json]`（默认取最新）、`--out`、`--open` |
 | [`report_serve.py`](../scripts/report_serve.py) | 回环服务 + 页面上的修复按钮；URL 带令牌、POST 需自定义头、动作白名单；空闲自动退出 | `--no-open`、`--timeout`（默认 1800 秒）、`--roots` |
@@ -41,7 +41,7 @@
 ## 什么时候用哪条
 
 - 先看整体环境、不做任何改动：`python3 scripts/account_guard.py --audit`（判定口径见 `SKILL.md`「跑完看什么：结果总表」）。
-- 一条命令体检 + 修四类残留 + 复检 + 一份 HTML：`--preflight --fix-auto`；agent 没有 TTY 时用 `--audit --verify-browser --webrtc --fix-auto --yes`，但 `--yes` 必须先拿到用户明确同意。
+- 一条命令体检 + 修四类残留 + 复检 + 一份 HTML：`--preflight --fix-auto`；agent 没有 TTY 时用 `--audit --fix-auto --yes`，但 `--yes` 必须先拿到用户明确同意。
 - 只要机器可读结果：`--audit --json`；要多留一份审计 JSON：`--audit --save-audit`。
 - 想在页面上点着修：`python3 scripts/report_serve.py`（边界见 [`references/report-page.md`](report-page.md)）。
 - 要恢复某次改动：先 `--restore <备份目录> --restore-preview` 看能恢复什么，确认后再 `--restore`。
@@ -57,7 +57,7 @@
 | 变量 | 作用 |
 | --- | --- |
 | `CLAUDE_GUARD_PROJECT_ROOTS` | 项目根列表（冒号分隔），决定 A9 / A14 / A24 扫哪些目录；不设时按 git 仓 / 家目录候选推断 |
-| `CLAUDE_GUARD_BROWSER_PROFILE` / `CLAUDE_GUARD_BROWSER_PROFILE_DIR` | 复核页开在哪个 Chrome 资料，以及缓存 `profileScope` 的匹配依据 |
+| `CLAUDE_GUARD_BROWSER_PROFILE` / `CLAUDE_GUARD_BROWSER_PROFILE_DIR` | 复核页开在哪个 Chrome 资料，以及本轮复核结果的 `profileScope` 归属 |
 | `CLAUDE_GUARD_EXPECTED_COUNTRY` / `CLAUDE_GUARD_EXPECTED_EXIT_IP` | 预期出口声明；命令行优先，其次是环境变量，最后是 `--save-audit` 记下的那份 |
 | `CLAUDE_GUARD_NO_REPORT` / `CLAUDE_GUARD_NO_OPEN` | 不落 / 不打开 HTML 报告，脚本化与 CI 用 |
 | `CLASH_SECRET` | Clash 控制接口的 secret；只在内存里组装请求头，不交给外部命令参数 |

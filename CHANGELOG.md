@@ -2,6 +2,33 @@
 
 本文件按交付批次记录变化，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。版本号与 `SKILL.md` frontmatter 里的 `metadata.version` 保持一致；`1.0.4` 及更早的版本号是事后回填的，依据见文末「版本号说明」。
 
+## [1.4.0] - 2026-11-18
+
+### Changed
+
+- **每一项体检都必须本轮实测，不再接受跨轮缓存结论**（用户口径 2026-11-18）。
+  审计与加固开始时先作废上一轮的浏览器复核暂存（`browser-locale.json`、
+  `media-permission.json`、`location-gate.json`），再强制重开复核页并跑一次真实
+  ICE 探测；上一轮的结果不会替本轮判绿，没测成的项如实报「未测到」。
+- 浏览器 Intl / 媒体权限 / WebRTC 探测由「可选开关」变成默认动作：
+  `--verify-browser`、`--webrtc` 只作兼容保留；新增 `--no-browser` 显式跳过
+  （相关项报未测到，仍不回退上一轮结果）。
+- `scripts/selfcheck.py` 不再替审计传 `--verify-browser --webrtc`；需要跳过时改传
+  `--no-browser`。
+- `--preflight` 从问四件事缩到问两件：复核页开在哪个 Chrome 资料、有没有预期出口
+  要声明。
+- 定位服务的 root 读数不再落 24 小时缓存供后续审计使用：只有本轮以 root 读过
+  才给结论，非 root 审计如实显示「读不到（要 root）」。
+- `--check-media` / `--check-locale` 只用于单独人工复核并显示结论，不再作为下一轮
+  审计的证据。
+
+### Tests
+
+- 新增 `TestFreshMeasurements`：钉住「先作废上一轮 → 再实测 → 才 audit」、
+  「`--no-browser` 跳过实测但仍作废旧结果」、「旧结果再新也不能替本轮判绿」；
+  同步更新自检参数、前置提问、WebRTC 行等受影响用例。
+- 本机 `/usr/bin/python3` 3.9.6 全量 861 个用例通过。
+
 ## [1.3.1] - 2026-11-03
 
 ### Security

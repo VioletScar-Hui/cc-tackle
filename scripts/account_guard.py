@@ -43,7 +43,9 @@ HOME = pathlib.Path.home()
 SETTINGS = HOME / ".claude" / "settings.json"
 BACKUP_ROOT = HOME / "ClaudeGuardBackups"
 # Audit state is intentionally opt-in.  A normal ``--audit`` must not leave an
-# export history, cache, or report behind on disk.
+# export history or report behind on disk.  Browser measurements are re-taken
+# in every run (see clear_previous_measurements); the files under
+# ~/.local/state/claude-guard/ only carry this run's results between steps.
 CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
@@ -3386,10 +3388,12 @@ def load_media_permission() -> dict:
 
 def cache_is_fresh(data: dict, *, require_profile_scope: bool = True,
                    expected_profile_scope: str | None = None) -> tuple[bool, str]:
-    """Return whether a cached browser measurement is bounded and attributable.
+    """Return whether this run's browser measurement is bounded and attributable.
 
-    The cache is evidence from one browser profile at one point in time.  A
-    missing timestamp or profile scope is therefore unknown, never green.
+    Every run clears the previous measurement first (see
+    `clear_previous_measurements`), so this only separates a fresh same-run
+    result from a malformed one.  A missing timestamp or profile scope is
+    therefore unknown, never green.
     """
     if not isinstance(data, dict):
         return False, "缓存不是对象"
@@ -4012,7 +4016,7 @@ def check_browser_locale(ip: dict | None = None, expected: dict | None = None) -
     if out["measured"]:
         out["facts"].append(f"Intl 区域设置 {out['measured']}（{out['source']}）")
     else:
-        out["facts"].append("既没跑过浏览器复核，也读不到 AppleLanguages，这一项没测到")
+        out["facts"].append("既没有本轮的浏览器复核结果，也读不到 AppleLanguages，这一项没测到")
     if out["app_override"]:
         out["facts"].append("Chrome 应用语言已被设为 " + "、".join(out["app_override"]))
         out["needs_restart"] = chrome_needs_restart(locale_change_time(out["app_override"]))
@@ -4494,7 +4498,8 @@ def build_summary(report: dict) -> list:
         add("浏览器 Intl 区域设置", S_NA, "未检测")
     elif not bl.get("measured"):
         add("浏览器 Intl 区域设置", S_NA,
-            "没测到：既没跑过 --check-locale，也读不到 AppleLanguages")
+            "没测到：本轮没有浏览器复核结果（--no-browser 或复核页没回传），"
+            "也读不到 AppleLanguages")
     elif bl.get("target_blocked"):
         add("浏览器 Intl 区域设置", S_NA,
             "预期出口不符，已禁止按当前实测国家修改 Chrome Intl")
@@ -4570,27 +4575,10 @@ def build_summary(report: dict) -> list:
         else:
             add("WebRTC 泄漏", S_NA, wr.get("note") or "探测未取到候选，结论不可用")
     else:
-        # 没跑探测时，如果用户在真实浏览器里复核过（--check-media --webrtc 之外的那条路），
-        # 就以那次结论为准。这一行要的东西其实是「网站能不能拿到摄像头/麦克风」，
-        # 那次复核已经答了；再挂一个「未探测」等于让人以为必须重跑两分钟的探测。
-        # 注意：这条分支只在**没有**探测结果时走，探测跑过时以探测为准。
-        mp = load_media_permission()
-        media_cache_ok, media_cache_note = cache_is_fresh(mp)
-        if mp.get("ok") and media_cache_ok and mp.get("openedBy") == "script":
-            # 复核页由脚本自己按声明的资料打开：网站拿不到摄像头/麦克风 → mDNS
-            # 混淆一直生效 → 这条链路不泄漏。这跟「没测到」是两回事。
-            add("WebRTC 泄漏", S_OK,
-                f"这次没跑探测；{mp.get('checkedAt')} 那次由脚本打开的复核页显示摄像头与麦克风"
-                f"都拿不到（{mp.get('detail') or 'NotAllowedError'}）→ mDNS 混淆生效，不泄漏")
-        elif mp.get("ok") and media_cache_ok:
-            add("WebRTC 泄漏", S_NA,
-                f"这次没跑探测；缓存显示摄像头与麦克风都拿不到（复核于 {mp.get('checkedAt')}），"
-                f"但资料身份只有用户声明、未由脚本验证，不能据此报绿")
-        else:
-            note = wr.get("note") or "未探测；加 --webrtc 参数可跑"
-            if mp.get("ok") and not media_cache_ok:
-                note += "；已有媒体权限缓存不可用：" + media_cache_note
-            add("WebRTC 泄漏", S_NA, note)
+        # 没有本轮的探测结果就只报未测到：每一轮都要自己实测，上一轮的复核结论
+        # 不能替本轮下判断（--no-browser 会走到这里，且上一轮结果已在开始时作废）。
+        note = wr.get("note") or "本轮没有做 WebRTC 探测（--no-browser 显式关闭）"
+        add("WebRTC 泄漏", S_NA, note + "；不会用上一轮的结果顶替")
 
     v6g = v6.get("global_addresses") or []
     if missing("A5_ipv6"):
@@ -8477,29 +8465,53 @@ def _auto_fix_inventory(plan: dict, defer_settings: bool) -> list[str]:
     return items
 
 
-def run_preflight(args) -> None:
-    """体检之前一次性问清「要不要测浏览器」「要不要探 WebRTC」「有没有预期出口」。
+def clear_previous_measurements() -> None:
+    """作废上一轮的浏览器 / 定位闸实测结果。
 
-    只问一屏，问完不再为同一件事打断。--json 与非真实终端不问，同样的授权
-    改用 --verify-browser / --webrtc / --expected-country / --expected-exit-ip 表达。
+    审计与加固每一轮都必须自己实测每个可测项；这几个文件只是本轮复核页回传结果
+    的暂存，不是跨轮结论。清掉之后，本轮没测成的项会如实报「未测到」，而不是被
+    上一轮的结果顶成绿色。出口历史（`export-ip.json`）与预期出口声明是台账与
+    意图，不参与「本轮实测」判定，保留。
+    """
+    for path in (MEDIA_CACHE, LOCALE_CACHE, LOCATION_GATE_CACHE):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            print(f"清掉上一轮实测结果失败：{path}（{error}）；本轮仍会重新实测",
+                  file=sys.stderr)
+
+
+def run_fresh_measurements() -> None:
+    """本轮强制实测浏览器类项目：Intl 区域、媒体权限（WebRTC 探测在 audit 之后跑）。
+
+    每一轮都必须重新打开复核页，不读上一轮留下的结果；结果只写本轮暂存文件。
+    进度行由调用方按 --json 决定走 stdout 还是 stderr。
+    """
+    print("本轮强制实测（上一轮结果已作废）：打开浏览器复核页……")
+    verify_browser_locale(auto_open=True)
+    verify_media_permission(auto_open=True)
+
+
+def run_preflight(args) -> None:
+    """体检之前一次性问清「复核页开在哪个资料」「有没有预期出口」。
+
+    浏览器实测与 WebRTC 探测现在每一轮都强制执行（`--no-browser` 才能关掉），
+    所以这里不再问「要不要测」；能问的只剩资料名与预期出口声明。
+    --json 与非真实终端不问，同样的授权用 --no-browser / --expected-country /
+    --expected-exit-ip 表达。
     """
     if args.json:
         return
     if not sys.stdin.isatty():
         print("提示：当前不是真实终端，已跳过前置提问；同样的授权请用 "
-              "--verify-browser / --webrtc / --expected-country / --expected-exit-ip 表达。",
+              "--no-browser / --expected-country / --expected-exit-ip 表达。",
               file=sys.stderr)
         return
     print("── 体检前先确认这一次要测什么（只问这一屏）──")
-    if not args.verify_browser:
-        if ask_yes("现在打开浏览器复核页，把 Intl 区域设置与媒体权限测回来？", default=True):
-            args.verify_browser = True
-    if not args.webrtc:
-        if ask_yes("顺带跑一次 WebRTC 泄漏探测？会临时起一个浏览器资料，结束后清理",
-                   default=True):
-            args.webrtc = True
-    if args.verify_browser and not browser_profile_dir():
-        # 资料名提前问：不声明的话复核页开在默认资料，换了资料以后缓存会对不上，
+    if not args.no_browser and not browser_profile_dir():
+        # 资料名提前问：不声明的话复核页开在默认资料，换了资料以后就认不出来源，
         # 那两项又退回「未测到」。这里问一次，答案直接进环境变量，后面所有入口一致。
         try:
             answer = input("  复核页开在哪个 Chrome 资料？留空=默认资料（例如 Profile 1）：").strip()
@@ -8663,23 +8675,31 @@ def main(argv: list[str] | None = None) -> int:
                     help="只预览备份恢复计划，不写任何文件")
     ap.add_argument("--restore-item", action="append", default=[], metavar="PATH",
                     help="恢复备份中的指定文件，可重复；默认恢复全部可恢复文件")
-    ap.add_argument("--webrtc", action="store_true", help="附加 WebRTC 泄漏探测（直接启动可用 Chromium）")
+    ap.add_argument("--webrtc", action="store_true",
+                    help="兼容保留：审计与加固现在默认强制做 WebRTC 探测；"
+                         "不想做请用 --no-browser")
     ap.add_argument("--check-media", action="store_true",
-                    help="起一个本地页面，用你日常浏览器确认摄像头/麦克风权限（WebRTC 那一项靠它转正）")
+                    help="单独做一次媒体权限复核并显示结论；审计每轮都会自己强制复核，"
+                         "不会读取这里留下的结果")
     ap.add_argument("--check-locale", action="store_true",
-                    help="起一个本地页面，用你日常浏览器把 Intl 区域设置回传回来")
+                    help="单独做一次浏览器 Intl 复核并显示结论；审计每轮都会自己强制复核，"
+                         "不会读取这里留下的结果")
     ap.add_argument("--install-webrtc-limiter", action="store_true",
                     help="下载 WebRTC Network Limiter 扩展包并打开商店页"
                          "（安装那一下仍要你自己点，Chrome 不允许脚本代装）")
     ap.add_argument("--verify-browser", action="store_true",
-                    help="配合 --audit：体检前脚本自己打开复核页，把 Intl 与媒体权限收回来（会写复核缓存）")
+                    help="兼容保留：审计与加固现在默认强制打开复核页（Intl / 媒体权限），"
+                         "无需再传；要跳过用 --no-browser")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="显式跳过浏览器类实测（Intl / 媒体权限 / WebRTC）；"
+                         "相关项会如实报「未测到」，绝不回退到上一轮的结果")
     ap.add_argument("--fix-auto", action="store_true",
                     help="体检后直接处理可自动修的残留（系统代理残留、shell 代理行、npm/git 全局代理、"
                          "settings.json 端点与代理变量）：先备份再改、改完复检，并出一份前后对照 HTML")
     ap.add_argument("--yes", action="store_true",
                     help="配合 --fix-auto：跳过动手前的确认（用于 agent 已经拿到用户授权的非交互运行）")
     ap.add_argument("--preflight", action="store_true",
-                    help="体检前在终端里先问一次：是否现在开浏览器复核页、是否跑 WebRTC 探测、"
+                    help="体检前在终端里先问一次：复核页开在哪个 Chrome 资料、"
                          "有没有预期出口要声明")
     ap.add_argument("--commands", action="store_true", help="只打印手工核对用的终端命令清单，不体检")
     ap.add_argument("--manual", action="store_true", help="只打印必须人工做的行动清单（带点击路径），不体检")
@@ -8707,11 +8727,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.fix_auto and (args.commands or args.manual or args.install_webrtc_limiter):
         print("拒绝组合：--fix-auto 不能和 --commands / --manual / "
               "--install-webrtc-limiter 混用——那三个是只说不做的模式。", file=sys.stderr)
-        return 2
-
-    if args.verify_browser and not args.audit:
-        print("拒绝组合：--verify-browser 只配合 --audit 使用；单独复核用 --check-locale 或 --check-media。",
-              file=sys.stderr)
         return 2
 
     if args.restore_preview and not args.restore:
@@ -8774,7 +8789,13 @@ def main(argv: list[str] | None = None) -> int:
         # 「Claude Code 里只放行只读」那条限制（安装那一下仍旧只能你自己点）。
         return 0 if install_webrtc_limiter()["ok"] else 2
 
-    # --verify-browser 只开一个本机复核页、写自己的复核缓存，不动 Claude 的状态；
+    # 每一轮审计/加固都必须自己实测每个可测项：先作废上一轮的浏览器与定位闸结果，
+    # 再强制重跑浏览器类实测。--no-browser 是唯一出口，且只让相关项显示「未测到」，
+    # 不会拿上一轮的结果顶替。
+    args.verify_browser = not args.no_browser
+    args.webrtc = not args.no_browser
+
+    # 浏览器实测只开本机复核页、写自己的本轮暂存，不动 Claude 的状态；
     # --fix-auto 只碰有备份、改完能就地复验的四类残留，并在 Claude Code 里跳过
     # 它正在使用的 settings.json。真正会改系统状态的是完整加固，那条仍旧只许普通终端。
     under_claude = running_under_claude()
@@ -8802,16 +8823,19 @@ def main(argv: list[str] | None = None) -> int:
         # 也不会因为少给了预期出口而在收尾时补问一次。
         run_preflight(args)
 
+    # 顺序不能反：audit() 读的正是本轮实测结果，先体检再复核等于白跑一次。
+    # --json 模式下 stdout 只能是那一个 JSON 文档（自检脚本靠它解析），
+    # 复核过程打的进度行必须让到 stderr，否则整份 JSON 解析不了。
     if args.verify_browser:
-        # 顺序不能反：audit() 读的正是这两份复核缓存，先体检再复核等于白跑一次。
-        # --json 模式下 stdout 只能是那一个 JSON 文档（自检脚本靠它解析），
-        # 复核过程打的进度行必须让到 stderr，否则整份 JSON 解析不了。
         sink = (contextlib.redirect_stdout(sys.stderr) if args.json
                 else contextlib.nullcontext())
         with sink:
-            verify_browser_locale(auto_open=True)
-            verify_media_permission(auto_open=True)
+            clear_previous_measurements()
+            run_fresh_measurements()
             print()
+    else:
+        # 显式 --no-browser：照样作废上一轮结果，让相关项如实报「未测到」。
+        clear_previous_measurements()
 
     try:
         # Full repair cannot persist audit state before CONFIRM; --save-audit is
@@ -8859,7 +8883,7 @@ def main(argv: list[str] | None = None) -> int:
             # 脚本化场景（CI、二次解析）设 CLAUDE_GUARD_NO_REPORT=1 关掉。
             write_html_only(report, note="只有这一次体检，没有改动对照")
             if getattr(args, "verify_browser", False):
-                print("  浏览器复核结果已存进 ~/.local/state/claude-guard/ 下的两份缓存。")
+                print("  浏览器复核结果只作为本轮暂存；下一轮开始前会作废并重新实测。")
         else:
             print("\n只读审计没有写页面（CLAUDE_GUARD_NO_REPORT=1）；"
                   "去掉这个环境变量就会自动落一份并打开。")

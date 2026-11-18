@@ -8,8 +8,8 @@
 这里重写一遍，免得两处各说各话）。
 
 用法：
-    python3 scripts/selfcheck.py            全部跑，约 1.5 分钟
-    python3 scripts/selfcheck.py --fast     跳过单元测试，约 20 秒
+    python3 scripts/selfcheck.py            全部跑，约 2-3 分钟
+    python3 scripts/selfcheck.py --fast     跳过单元测试，约 1 分钟
     python3 scripts/selfcheck.py --no-audit 跳过最后的环境体检（也就没有展开表）
 
 退出码：0 全过（可能带 ! 提示）；1 有项目失败；2 脚本自己的运行环境有问题。
@@ -275,11 +275,10 @@ def check_audit(project_roots: str = "", browser: bool = True):
     else:
         env.pop("CLAUDE_GUARD_PROJECT_ROOTS", None)
     cmd = [sys.executable, str(HERE / "account_guard.py"), "--audit", "--json"]
-    if browser:
-        # 让脚本自己弹出浏览器复核页并做一次 WebRTC 探测：不跑的话
-        # 「浏览器 Intl」和「WebRTC 泄漏」两项必然没结论，自检就白称「测全」。
-        cmd.append("--verify-browser")
-        cmd.append("--webrtc")
+    if not browser:
+        # 审计默认强制重跑浏览器复核页与 WebRTC 探测；只有明确不要时才传
+        # --no-browser，让相关项如实显示「未测到」。上一轮的结果不会被采用。
+        cmd.append("--no-browser")
     code, out, err = sh_split(cmd, timeout=900, cwd=SKILL, env=env)
     try:
         report = json.loads(out)

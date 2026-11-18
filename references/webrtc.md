@@ -34,7 +34,7 @@
 
 代价要说清楚：任何有效设置都会让网页视频通话建不起来（候选数为 0，P2P 建立不了），**可用性和不泄漏在这个网络结构下不可兼得**，所以要按资料分别决定，别一刀切。
 
-复核这一项要用户配合：脚本读不了 Chrome 的资料文件（TCC 挡着 `open()`），所以 `--check-media` 起一个本地页面，让用户在他真实的浏览器里打开，页面把权限状态 POST 回来并缓存到 `~/.local/state/claude-guard/media-permission.json`。**必须用那个资料打开**，用别的资料读到的是别的资料的权限。顺带一个已经踩过的坑：用 sudo 跑过之后这个状态目录可能是 root 的，写入会静默失败（`except OSError: pass` 吞掉），所以 `hand_back_ownership()` 会在 sudo 之下把属主交还给 `SUDO_UID`。
+复核这一项要用户配合：脚本读不了 Chrome 的资料文件（TCC 挡着 `open()`），所以审计与加固每一轮都会自己起一个本地复核页（按 `CLAUDE_GUARD_BROWSER_PROFILE_DIR` 指定的资料打开），页面把权限状态 POST 回来，结果只写本轮暂存文件（`~/.local/state/claude-guard/media-permission.json`），下一轮开始前作废。`--check-media` 只是单独做一次复核并显示结论，它的结果不会被下一轮审计读取。**必须用那个资料打开**，用别的资料读到的是别的资料的权限。顺带一个已经踩过的坑：用 sudo 跑过之后这个状态目录可能是 root 的，写入会静默失败（`except OSError: pass` 吞掉），所以 `hand_back_ownership()` 会在 sudo 之下把属主交还给 `SUDO_UID`。
 
 这里面有个坑值得记下来：**探测用哪个浏览器会决定结论真假**。同样给了媒体权限，headless shell 只给 1 个候选、看不到任何 IP，完整 Chromium 给 4 个、露出真实地址。也就是说用 headless shell 测，「授权后会不会露」这个问题永远答「不会」——一个看起来干净的假阴性。所以 `find_chromium()` 现在把完整版排在前面，结果里也会标明用的是哪个。
 

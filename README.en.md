@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.3.1-111827?style=flat-square" alt="version 1.3.1" />
+    <img src="https://img.shields.io/badge/version-1.4.0-111827?style=flat-square" alt="version 1.3.1" />
   </p>
   <p>
     <a href="#what-it-does">What it does</a> ·
@@ -34,7 +34,7 @@
 
 > **Scope**: This is an environment inspection and maintenance tool for a local macOS machine. It helps you find visible problems in network egress, proxy leftovers, time zones, browser measurements, and local Claude Code configuration; it cannot explain server-side risk controls, and it cannot guarantee that an account is usable or that it will pass any service's review.
 
-CC tackle puts detection, evidence, backup, and re-verification in one command chain. By default it looks at the environment first, then decides whether to act. A plain `--audit` **writes and opens an HTML page by default** (a newcomer cannot tell the next step from the terminal table), but it still does not write audit JSON, egress history, or caches; for scripted use, set `CLAUDE_GUARD_NO_REPORT=1` to turn off the page, and add `--audit --save-audit` if you want to keep JSON. Full hardening first shows the execution checklist, and only after confirmation does it lock the targets, back up, and modify.
+CC tackle puts detection, evidence, backup, and re-verification in one command chain. By default it looks at the environment first, then decides whether to act. A plain `--audit` **writes and opens an HTML page by default** (a newcomer cannot tell the next step from the terminal table), but it still does not write audit JSON or egress history; browser recheck results are only this run's scratch files and are discarded before the next run; for scripted use, set `CLAUDE_GUARD_NO_REPORT=1` to turn off the page, and add `--audit --save-audit` if you want to keep JSON. Full hardening first shows the execution checklist, and only after confirmation does it lock the targets, back up, and modify.
 
 It is a set of scripts and also a skill for agents: `SKILL.md` states the criteria and execution boundaries, and the agent follows them; a person can also just type a single command in the terminal.
 
@@ -106,14 +106,14 @@ One screen of questions → checkup → fix → re-check → one HTML report:
 python3 scripts/account_guard.py --preflight --fix-auto
 ```
 
-- `--preflight` asks four things before the checkup: whether to open the browser verification page now (Intl and media permissions become conclusive only through it), whether to run a WebRTC probe at the same time, which Chrome profile to open the verification page in (leave blank for the default profile), and whether there is a fixed egress country and IP to declare. Items answered "yes" are measured in this run; items answered "no" remain truthfully at `·`, without pretending to pass.
+- `--preflight` asks two things before the checkup: which Chrome profile to open the verification page in (leave blank for the default profile), and whether there is a fixed egress country and IP to declare. Browser Intl, media permissions, and the WebRTC probe are now forced in every run; pass `--no-browser` to skip them, in which case those items stay truthfully at `·` without borrowing last run's result.
 - `--fix-auto` lists the auto-fixable leftovers on the spot — system proxy leftovers, shell proxy lines, npm / git global proxies, and endpoints and proxy variables in `settings.json` — and after one confirmation it backs up, then changes them; it does not request root and does not delete anything that cannot be rolled back exactly.
 - After fixes it re-checks automatically, writes and opens a before/after HTML page. If there is nothing to fix, or you cancel at the confirmation, you still get a page.
 
 When the agent has no real terminal, express the same authorizations with flags and finish in one turn:
 
 ```bash
-python3 scripts/account_guard.py --audit --verify-browser --webrtc --fix-auto --yes
+python3 scripts/account_guard.py --audit --fix-auto --yes
 ```
 
 `--yes` is valid only for `--fix-auto`; it is equivalent to the user having agreed to that checklist in the conversation, so you must ask first and only then pass it.
@@ -126,7 +126,7 @@ python3 scripts/account_guard.py --audit --save-audit   # also save a JSON copy
 python3 scripts/account_guard.py --audit --json         # machine-readable results only
 ```
 
-A read-only audit still calls `claude` and `npm` to read state, and those two CLIs write things themselves; it does not write audit JSON, egress history, or caches unless you explicitly add `--save-audit`. To disable the automatically opened report page: `CLAUDE_GUARD_NO_REPORT=1`.
+A read-only audit still calls `claude` and `npm` to read state, and those two CLIs write things themselves; it does not write audit JSON or egress history unless you explicitly add `--save-audit`; browser recheck results are only this run's scratch files and are discarded before the next run. To disable the automatically opened report page: `CLAUDE_GUARD_NO_REPORT=1`.
 
 If you have an explicit route target, write the target country and egress IP into the audit together:
 
@@ -215,16 +215,16 @@ python3 scripts/selfcheck.py --fast    # skip unit tests
 ```bash
 python3 scripts/account_guard.py --manual       # print the manual verification checklist
 python3 scripts/account_guard.py --commands     # print detection sites and commands
-python3 scripts/account_guard.py --audit --webrtc        # add a WebRTC probe to the audit
-python3 scripts/account_guard.py --audit --verify-browser # the script opens the verification page itself; a single run leaves nothing unmeasured
+python3 scripts/account_guard.py --audit                  # forces a fresh verification page + a real ICE probe every run
 python3 scripts/account_guard.py --install-webrtc-limiter # download the WebRTC Network Limiter extension package and open its store page
-python3 scripts/account_guard.py --check-media            # run alone: open the verification page and wait for the media permission callback
-python3 scripts/account_guard.py --check-locale           # run alone: open the verification page and wait for the Intl locale callback
+python3 scripts/account_guard.py --no-browser             # explicitly skip browser-based checks (those items report not measured)
+python3 scripts/account_guard.py --check-media            # run alone: recheck media permissions and show the result (audits do not read it)
+python3 scripts/account_guard.py --check-locale           # run alone: recheck Intl locale and show the result (audits do not read it)
 ```
 
 `--install-webrtc-limiter` only downloads and reports; it does not change local configuration, so it needs no TTY: it downloads the extension package from the store's official distribution endpoint to `~/.local/state/claude-guard/extensions/`, verifies the extension ID computed from the signing public key, and reports whether it is installed in each Chrome profile. **You still have to click Install yourself**: Chrome on macOS does not accept script-installed extensions.
 
-`--audit --webrtc` starts a temporary browser profile for probing and cleans it up afterward; it does not modify your everyday browser profile. `--check-media` and `--check-locale` save callback caches locally and open the verification page themselves — to specify which Chrome profile it opens in (the one you use for Claude every day), set `CLAUDE_GUARD_BROWSER_PROFILE_DIR`, for example `Profile 1`. A verification page opened by the script records `openedBy` as `script` in the cache, and only then are these two items judged; pages opened manually by someone else are recorded as `user`, used only for reference and not as evidence of passing.
+Every audit opens the verification page itself (in the profile given by `CLAUDE_GUARD_BROWSER_PROFILE_DIR`, for example `Profile 1`) and starts a temporary browser profile for the ICE probe; the results live only in that run and are discarded before the next one. `--check-media` and `--check-locale` only recheck and display; later audits never read their results. To skip browser-based checks use `--no-browser`, and those items truthfully report "not measured".
 
 ### 6. When local state needs to change
 
@@ -232,7 +232,7 @@ python3 scripts/account_guard.py --check-locale           # run alone: open the 
 python3 scripts/account_guard.py
 ```
 
-Full hardening requires a real terminal. The script first shows the final execution checklist, and only after you explicitly type `CONFIRM` does it lock the targets, create backups, and change state. Items such as Clash DNS, Chrome Intl, old versions and caches, invalid permissions, stale worktrees, and project junk are asked one by one, with No as the default. The two steps that require administrator privileges (disable IPv6, Location Services "Set time zone") first go through a `[0/6] Administrator authorization` step after you type CONFIRM: the terminal asks for the login password once with hidden input, and this one authorization covers all later root steps; if it expires midway, it asks only once more. During the same authorization it also reads the location database once and caches it for 24 hours, so the "two time-zone gates" item has a conclusion. Failure to obtain authorization does not fail the whole run; it only skips those two steps. Do not start an operation that changes local state from within a process that is currently using Claude Code.
+Full hardening requires a real terminal. The script first shows the final execution checklist, and only after you explicitly type `CONFIRM` does it lock the targets, create backups, and change state. Items such as Clash DNS, Chrome Intl, old versions and caches, invalid permissions, stale worktrees, and project junk are asked one by one, with No as the default. The two steps that require administrator privileges (disable IPv6, Location Services "Set time zone") first go through a `[0/6] Administrator authorization` step after you type CONFIRM: the terminal asks for the login password once with hidden input, and this one authorization covers all later root steps; if it expires midway, it asks only once more. During the same authorization it also reads the location database once; that reading is valid only for this run, and later non-root audits truthfully show "cannot read (root required)". Failure to obtain authorization does not fail the whole run; it only skips those two steps. Do not start an operation that changes local state from within a process that is currently using Claude Code.
 
 If you need to recover midway, use the explicit backup directory:
 
@@ -261,7 +261,7 @@ Restore requires a real terminal and another confirmation. The script restores o
 | ✗ | Anomaly detected |
 | · | Not measured under the current conditions |
 
-**"Not measured" does not mean a pass, and does not mean a failure**: it means there is not enough evidence to complete that check. Missing fields always count as "not measured" and never default to "clean". The two browser items are where `·` appears most often in the table — without opening the verification page, there is no browser callback.
+**"Not measured" does not mean a pass, and does not mean a failure**: it means there is not enough evidence to complete that check. Missing fields always count as "not measured" and never default to "clean". The two browser items are where `·` appears most often in the table — if this run could not open the verification page (for example with `--no-browser`), there is no callback and last run's callback is never reused.
 
 <a id="detection-scope"></a>
 
@@ -277,7 +277,7 @@ The checks are organized into five groups; exact counts and availability vary wi
 | Claude Code | `settings.json` endpoints and credentials, telemetry switches, third-party clients, CLI signature integrity, CLI login credentials |
 | Environment hygiene | Project-level `.claude`, invalid permissions, stale worktree registrations, reclaimable system space |
 
-A browser-cache-based result produces a conclusion only when three conditions are all met: no more than 24 hours old, `profileScope` matches the profile in which the verification page was actually opened this time, and `openedBy` in the cache is `script` (the verification page was launched by the script, not opened manually by someone else). Profile scope is recorded from the profile that was actually opened (the Chrome default profile when none is declared), so following the docs for one run is enough to get a conclusion; with multiple profiles, use `CLAUDE_GUARD_BROWSER_PROFILE` to pin it to a name. What the script can prove is "which profile opened this page"; it cannot independently prove that this is your everyday account, so the page writes the basis as "browser measurement (verification page opened by the script, profile Profile 1)" rather than a bare "passed".
+Browser results count only in the run that produced them: each audit/hardening run deletes the previous run's scratch files first, then forces a fresh verification page (profile scope is recorded from the profile actually opened — the Chrome default profile when none is declared; with multiple profiles, pin it with `CLAUDE_GUARD_BROWSER_PROFILE`). If this run cannot measure them, the items report not measured rather than falling back to old values; the page writes the basis as "browser measurement (verification page opened by the script, profile Profile 1)" rather than a bare "passed".
 
 ### Login method: do not log in inside Claude Code
 

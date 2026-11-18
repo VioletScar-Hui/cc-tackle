@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.3.1-111827?style=flat-square" alt="version 1.3.1" />
+    <img src="https://img.shields.io/badge/version-1.4.0-111827?style=flat-square" alt="version 1.3.1" />
   </p>
   <p>
     <a href="#what-it-does">它能做什么</a> ·
@@ -32,7 +32,7 @@
 
 > **用途边界**：这是一个面向 macOS 本机的环境检查与维护工具。它帮助你发现网络出口、代理残留、时区、浏览器测量和 Claude Code 本地配置中的可见问题；它不能解释服务端风控原因，也不能保证账号可用或通过任何服务的审核。
 
-CC tackle 把检测、证据、备份和复验放在同一条命令链里。默认先看清楚环境，再决定是否处理。普通 `--audit` **默认落一份 HTML 页面并打开**（终端那张表新人看不出下一步），但它仍然不写审计 JSON、出口历史或缓存；脚本化场景设 `CLAUDE_GUARD_NO_REPORT=1` 关掉页面，要留 JSON 再用 `--audit --save-audit`。完整加固会先展示执行清单，只有确认后才锁定目标、备份和修改。
+CC tackle 把检测、证据、备份和复验放在同一条命令链里。默认先看清楚环境，再决定是否处理。普通 `--audit` **默认落一份 HTML 页面并打开**（终端那张表新人看不出下一步），但它仍然不写审计 JSON 或出口历史；浏览器复核结果只作本轮暂存、每轮开始前作废；脚本化场景设 `CLAUDE_GUARD_NO_REPORT=1` 关掉页面，要留 JSON 再用 `--audit --save-audit`。完整加固会先展示执行清单，只有确认后才锁定目标、备份和修改。
 
 它是一组脚本，也是一个给 agent 用的 skill：`SKILL.md` 写明判据和执行边界，agent 照着跑；人也可以只在终端里敲一条命令。
 
@@ -104,14 +104,14 @@ flowchart LR
 python3 scripts/account_guard.py --preflight --fix-auto
 ```
 
-- `--preflight` 把四件事问在体检之前：要不要现在开浏览器复核页（Intl 与媒体权限就靠它转正）、要不要顺带跑一次 WebRTC 探测、复核页开在哪个 Chrome 资料（留空就是默认资料）、有没有固定出口国家与 IP 要声明。答「要」的项这一轮就会测到；答「不」的项如实留 `·`，不假装通过。
+- `--preflight` 把两件事问在体检之前：复核页开在哪个 Chrome 资料（留空就是默认资料）、有没有固定出口国家与 IP 要声明。浏览器 Intl、媒体权限与 WebRTC 探测现在每轮强制执行；想跳过用 `--no-browser`，相关项如实留 `·`，不假装通过、也不会拿上一轮结果顶替。
 - `--fix-auto` 把能自动修的残留当场列出来——系统代理残留、shell 代理行、npm / git 全局代理、`settings.json` 里的端点与代理变量——确认一次后先备份再改，不申请 root、不删不可原样回滚的东西。
 - 修完自动复检，落一份前后对照的 HTML 并打开。没有可修项、或者在确认处取消，同样给页面。
 
 agent 没有真实终端时，用参数带上同一组授权，一个回合跑完：
 
 ```bash
-python3 scripts/account_guard.py --audit --verify-browser --webrtc --fix-auto --yes
+python3 scripts/account_guard.py --audit --fix-auto --yes
 ```
 
 `--yes` 只对 `--fix-auto` 有效，等价于用户已在对话里同意那张清单，必须先问再带。
@@ -124,7 +124,7 @@ python3 scripts/account_guard.py --audit --save-audit   # 另外留一份 JSON
 python3 scripts/account_guard.py --audit --json         # 只要机器可读结果
 ```
 
-只读审计仍然会调用 `claude` 与 `npm` 读状态，这两个 CLI 自己会写东西；它不写审计 JSON、出口历史或缓存，除非你显式加 `--save-audit`。要关掉自动打开的报告页：`CLAUDE_GUARD_NO_REPORT=1`。
+只读审计仍然会调用 `claude` 与 `npm` 读状态，这两个 CLI 自己会写东西；它不写审计 JSON 或出口历史，除非你显式加 `--save-audit`；浏览器复核结果只作本轮暂存、每轮开始前作废。要关掉自动打开的报告页：`CLAUDE_GUARD_NO_REPORT=1`。
 
 如果你有明确的线路目标，把目标国家和出口 IP 一起写进审计：
 
@@ -213,16 +213,16 @@ python3 scripts/selfcheck.py --fast    # 跳过单测
 ```bash
 python3 scripts/account_guard.py --manual       # 打印人工核对清单
 python3 scripts/account_guard.py --commands     # 打印检测网站与命令
-python3 scripts/account_guard.py --audit --webrtc        # 审计里附加 WebRTC 探测
-python3 scripts/account_guard.py --audit --verify-browser # 脚本自己开复核页，一次跑完不留未测到
+python3 scripts/account_guard.py --audit                  # 每轮强制重开复核页 + 跑一次真实 ICE 探测
 python3 scripts/account_guard.py --install-webrtc-limiter # 下载 WebRTC Network Limiter 扩展包并打开商店页
-python3 scripts/account_guard.py --check-media            # 单独跑：开复核页并等回传媒体权限
-python3 scripts/account_guard.py --check-locale           # 单独跑：开复核页并等回传 Intl 区域
+python3 scripts/account_guard.py --no-browser             # 显式跳过浏览器类实测（相关项报未测到）
+python3 scripts/account_guard.py --check-media            # 单独复核媒体权限并显示结论（审计不读它的结果）
+python3 scripts/account_guard.py --check-locale           # 单独复核 Intl 区域并显示结论（审计不读它的结果）
 ```
 
 `--install-webrtc-limiter` 只下载与报告，不改本机配置，所以不需要 TTY：它把扩展包从商店的官方分发接口下到 `~/.local/state/claude-guard/extensions/`，核对签名公钥算出来的扩展 ID，并报出每个 Chrome 资料里装没装。**安装那一下仍然只能你自己点**：Chrome 在 macOS 上不接受脚本代装扩展。
 
-`--audit --webrtc` 会启动临时浏览器资料进行探测，并在结束后清理；它不会修改日常浏览器资料。`--check-media` 和 `--check-locale` 会在本机保存回传缓存，并且会自己把复核页打开——想指定开在哪个 Chrome 资料（就是你日常用 Claude 的那个）就设 `CLAUDE_GUARD_BROWSER_PROFILE_DIR`，例如 `Profile 1`。脚本自己打开的复核页写进缓存的 `openedBy` 是 `script`，这两项才判结论；别人手工打开的记 `user`，只当参考、不作通过证据。
+审计每轮都会自己打开复核页（用 `CLAUDE_GUARD_BROWSER_PROFILE_DIR` 指定的资料，例如 `Profile 1`）并启动临时浏览器资料做 ICE 探测；结果只作本轮暂存，下一轮开始前作废。`--check-media` 和 `--check-locale` 只是单独复核并显示结论，不会被下一轮审计读取；想跳过浏览器类实测就用 `--no-browser`，相关项如实报「未测到」。
 
 ### 6. 需要修改本机状态时
 
@@ -230,7 +230,7 @@ python3 scripts/account_guard.py --check-locale           # 单独跑：开复�
 python3 scripts/account_guard.py
 ```
 
-完整加固需要真实终端。脚本会先展示最终执行清单，只有在你明确输入 `CONFIRM` 后才锁定目标、创建备份和修改状态。Clash DNS、Chrome Intl、旧版本与缓存、失效权限、过期 worktree 和项目垃圾等项目会逐项询问，默认选择否。需要管理员权限的两步（关闭 IPv6、定位服务「设定时区」）在敲完 CONFIRM 之后先走一步 `[0/6] 管理员授权`：终端隐藏输入一次开机密码，这一次覆盖后面所有 root 步骤，中途过期只补问一次；同一次授权里还会把定位库读一遍并落 24 小时缓存，让「时区两道闸」这一项有结论。没拿到授权不会让整轮失败，只跳过那两步。不要在正在使用 Claude Code 的进程里发起会修改本机状态的操作。
+完整加固需要真实终端。脚本会先展示最终执行清单，只有在你明确输入 `CONFIRM` 后才锁定目标、创建备份和修改状态。Clash DNS、Chrome Intl、旧版本与缓存、失效权限、过期 worktree 和项目垃圾等项目会逐项询问，默认选择否。需要管理员权限的两步（关闭 IPv6、定位服务「设定时区」）在敲完 CONFIRM 之后先走一步 `[0/6] 管理员授权`：终端隐藏输入一次开机密码，这一次覆盖后面所有 root 步骤，中途过期只补问一次；同一次授权里还会把定位库当场读一遍；这个读数只在本轮有效，后续非 root 审计会如实显示「读不到（要 root）」。没拿到授权不会让整轮失败，只跳过那两步。不要在正在使用 Claude Code 的进程里发起会修改本机状态的操作。
 
 如果中途需要恢复，使用明确的备份目录：
 
@@ -259,7 +259,7 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 | ✗ | 检测到异常 |
 | · | 当前条件下没有测到 |
 
-**“未测到”不等于通过，也不等于失败**：它表示没有足够证据完成该项检查。缺字段一律当「未测到」，不默认成「干净」。表里出现 `·` 最多的情况是浏览器两项——没开复核页就没有浏览器回传。
+**“未测到”不等于通过，也不等于失败**：它表示没有足够证据完成该项检查。缺字段一律当「未测到」，不默认成「干净」。表里出现 `·` 最多的情况是浏览器两项——本轮没跑成复核页（比如用了 `--no-browser`）就没有浏览器回传，上一轮的回传不会被拿来用。
 
 <a id="detection-scope"></a>
 
@@ -275,7 +275,7 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 | Claude Code | `settings.json` 端点与凭据、遥测开关、第三方客户端、CLI 签名完整性、CLI 登录凭据 |
 | 环境卫生 | 项目级 `.claude`、失效权限、过期工作树登记、可回收系统体积 |
 
-浏览器缓存型结果要同时满足三件事才出结论：不超过 24 小时、`profileScope` 与这次复核页实际打开的资料一致、以及缓存里的 `openedBy` 是 `script`（复核页由脚本自己拉起，而不是别人手工打开）。资料范围默认按实际打开的那个资料记（没声明就是 Chrome 默认资料），所以你照文档跑一轮就能拿到结论；多资料时再用 `CLAUDE_GUARD_BROWSER_PROFILE` 把它钉到某个名字上。脚本能证明的是「哪个资料打开了这个页面」，不能独立证明它就是你的日常账号，所以页面上会把依据写成「浏览器实测（脚本打开的复核页，资料 Profile 1）」而不是一句「通过」。
+浏览器两类结果只在产生它的那一轮里算数：审计/加固开始前会删掉上一轮的复核暂存文件，再强制重开复核页（资料范围按实际打开的那个资料记，没声明就是 Chrome 默认资料；多资料时用 `CLAUDE_GUARD_BROWSER_PROFILE` 钉到某个名字上）。没测成本轮结果就报未测到，不会回退到旧值；页面上写的是「浏览器实测（脚本打开的复核页，资料 Profile 1）」而不是一句「通过」。
 
 ### 登录方式：不要在 Claude Code 里登录
 
