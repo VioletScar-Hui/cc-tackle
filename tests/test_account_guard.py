@@ -1198,7 +1198,16 @@ class TestAuditShape(unittest.TestCase):
     )
 
     def test_all_checks_present(self):
-        report = g.audit()
+        with mock.patch.object(g, "check_claude_exits",
+                               return_value={"exits": [
+                                   {"host": h, "ip": "203.0.113.10", "loc": "US",
+                                    "colo": "EWR", "error": None}
+                                   for h in g.CLAUDE_TRACE_HOSTS]}), \
+             mock.patch.object(g, "check_ip_purity",
+                               return_value={"status": "ok", "facts": []}), \
+             mock.patch.object(g, "check_cn_environment",
+                               return_value={"status": "unknown", "reason": "测试"}):
+            report = g.audit()
         for key in self.REQUIRED:
             self.assertIn(key, report, key)
 
@@ -5743,7 +5752,7 @@ class TestHtmlReport(unittest.TestCase):
         self.assertIn("&lt;img src=x", h)
 
     def test_unmeasured_counts_as_zero_points(self):
-        # 两个通过 + 一个没测到：分母仍是 27 项，所以是 2/27，
+        # 两个通过 + 一个没测到：分母仍是 31 项，所以是 2/31，
         # 而不是把已测到的两项折算成 100——「没测到」就是没拿到分。
         sc = rh._score([("a", g.S_OK, ""), ("b", g.S_NA, ""), ("c", g.S_OK, "")])
         self.assertEqual(sc["score"], round(100 * 2 / rh.BASE_ITEMS))
@@ -5757,7 +5766,7 @@ class TestHtmlReport(unittest.TestCase):
 
     def test_a_duplicated_row_cannot_offset_a_failure(self):
         rows = [("a", g.S_OK, ""), ("b", g.S_OK, ""), ("c", g.S_BAD, ""), ("a", g.S_OK, "")]
-        # a 重复一次不能把 c 的失败抵掉：27 项里只有 2 项通过就是 2/27。
+        # a 重复一次不能把 c 的失败抵掉：31 项里只有 2 项通过就是 2/31。
         self.assertEqual(rh._score(rows)["score"], round(100 * 2 / rh.BASE_ITEMS))
 
     def test_all_unmeasured_scores_zero(self):
@@ -5765,14 +5774,14 @@ class TestHtmlReport(unittest.TestCase):
         self.assertEqual(sc["score"], 0)
         self.assertEqual(sc["grade"], "F")
 
-    def test_base_is_27_items_worth_100(self):
-        """加分制：27 个基础项合计 100 分，登录方式不算在里面。"""
-        self.assertEqual(rh.BASE_ITEMS, 27)
+    def test_base_items_are_31_and_worth_100(self):
+        """加分制：31 个基础项合计 100 分，登录方式不算在里面。"""
+        self.assertEqual(rh.BASE_ITEMS, 31)
         self.assertEqual(rh.BASE_MAX, 100)
         self.assertAlmostEqual(rh._score([])["per_item"] * rh.BASE_ITEMS, 100)
 
     def test_every_summary_row_is_either_base_or_bonus(self):
-        """表里每一行都要有归属：要么进 27 项计分，要么是那个加分项。
+        """表里每一行都要有归属：要么进 31 项计分，要么是那个加分项。
 
         以后再加检查项，这条会先红——逼着做的人明确新项算基础分还是加分。
         """
@@ -5781,7 +5790,7 @@ class TestHtmlReport(unittest.TestCase):
         self.assertEqual(names.count(rh.BONUS_ROW), 1)
 
     def _full_base(self, over: str | None = None):
-        """27 项基础分全过的底稿；给 over 时把第一项替换成那个状态。"""
+        """31 项基础分全过的底稿；给 over 时把第一项替换成那个状态。"""
         rows = [(f"r{i}", g.S_OK, "") for i in range(rh.BASE_ITEMS)]
         if over:
             rows[0] = ("r0", over, "")
@@ -5790,13 +5799,13 @@ class TestHtmlReport(unittest.TestCase):
     def test_bonus_row_is_scored_on_top_of_the_base(self):
         rows = self._full_base() + [(rh.BONUS_ROW, g.S_OK, "")]
         sc = rh._score(rows)
-        self.assertEqual(sc["score"], 100)                 # 27 项基础分全过
+        self.assertEqual(sc["score"], 100)                 # 31 项基础分全过
         self.assertEqual(sc["bonus"], rh.BONUS_POINTS)
         self.assertEqual(sc["total"], 100 + rh.BONUS_POINTS)
         self.assertEqual(sc["grade"], "A+")
 
     def test_bonus_row_stays_out_of_the_base_denominator(self):
-        # 登录方式若被算进那 27 项，这里会变成 26/27 而不是 100
+        # 登录方式若被算进那 31 项，这里会变成 30/31 而不是 100
         rows = self._full_base() + [(rh.BONUS_ROW, g.S_OK, "")]
         self.assertEqual(rh._score(rows)["score"], 100)
 
@@ -6139,7 +6148,11 @@ class TestDeclaredExpected(unittest.TestCase):
     def test_audit_reads_the_environment_declaration(self):
         """守着「声明换个入口就没了」那个坑：命令行拿不到参数时也得认。"""
         os.environ[g.EXPECTED_COUNTRY_ENV] = "US"
-        with mock.patch.object(g, "check_export_ip", return_value=self._fake_ip()):
+        with mock.patch.object(g, "check_export_ip", return_value=self._fake_ip()), \
+             mock.patch.object(g, "check_claude_exits", return_value={"exits": []}), \
+             mock.patch.object(g, "check_ip_purity", return_value={"status": "unknown"}), \
+             mock.patch.object(g, "check_cn_environment",
+                               return_value={"status": "unknown", "reason": "测试"}):
             report = g.audit()
         got = report["A1_export_ip"].get("expected") or {}
         # 注意层级：这里是 expected_exit_result 的整个返回值，
@@ -6149,7 +6162,11 @@ class TestDeclaredExpected(unittest.TestCase):
 
     def test_audit_explicit_argument_beats_the_environment(self):
         os.environ[g.EXPECTED_COUNTRY_ENV] = "US"
-        with mock.patch.object(g, "check_export_ip", return_value=self._fake_ip()):
+        with mock.patch.object(g, "check_export_ip", return_value=self._fake_ip()), \
+             mock.patch.object(g, "check_claude_exits", return_value={"exits": []}), \
+             mock.patch.object(g, "check_ip_purity", return_value={"status": "unknown"}), \
+             mock.patch.object(g, "check_cn_environment",
+                               return_value={"status": "unknown", "reason": "测试"}):
             report = g.audit(expected_country="JP")
         self.assertEqual((report["A1_export_ip"].get("expected") or {}).get("status"), "bad")
 
@@ -8049,6 +8066,272 @@ class TestTailscaleDnsHint(unittest.TestCase):
         rows = dict((name, (status, detail)) for name, status, detail in g.build_summary(report))
         self.assertNotIn("Tailscale", rows["DNS 泄漏"][1])
 
+
+
+class TestCleanipDerivedChecks(unittest.TestCase):
+    """照 cleanip.io/claude 那页补的检查：支持地区、域名一致性、IP 纯净度、大陆环境特征。
+
+    这些是外部口径（CleanIP 页面 + Anthropic 官方支持地区政策），所以测试守的是
+    「我们照它的判据做」而不是「它的分数是多少」；拿不到的数据源必须如实报未确认。
+    """
+
+    # ── Claude 支持地区 ──
+    def test_supported_region_list_has_the_official_shape(self):
+        self.assertEqual(len(g.SUPPORTED_REGIONS), 185, "官方政策页 2026-11-12 版是 185 个")
+        for code in ("US", "JP", "TW", "SG", "GB", "CA", "AU"):
+            self.assertIn(code, g.SUPPORTED_REGIONS)
+        for code in g.KNOWN_UNSUPPORTED_REGIONS:
+            self.assertNotIn(code, g.SUPPORTED_REGIONS, code)
+
+    def test_region_ok_when_cloudflare_and_database_agree(self):
+        exits = {"exits": [{"host": "claude.ai", "ip": "203.0.113.9", "loc": "US",
+                            "colo": "EWR", "error": None}]}
+        region = g.check_region_eligibility({"country": "US"}, exits)
+        self.assertEqual(region["status"], "ok")
+        self.assertTrue(region["supported"])
+
+    def test_region_blocked_by_an_unsupported_cloudflare_country(self):
+        for code in ("CN", "HK", "MO", "RU"):
+            exits = {"exits": [{"host": "claude.ai", "ip": "203.0.113.9", "loc": code,
+                                "colo": "HKG", "error": None}]}
+            region = g.check_region_eligibility({"country": code}, exits)
+            self.assertEqual(region["status"], "blocked", code)
+            self.assertFalse(region["supported"], code)
+
+    def test_region_conflict_when_database_says_unsupported(self):
+        exits = {"exits": [{"host": "claude.ai", "ip": "203.0.113.9", "loc": "US",
+                            "colo": "EWR", "error": None}]}
+        region = g.check_region_eligibility({"country": "CN"}, exits)
+        self.assertEqual(region["status"], "conflict")
+        self.assertFalse(region["supported"])
+
+    def test_region_geo_disagreement_inside_the_allowlist(self):
+        # 两边都在名单内、只是国家不同：归属不稳，不是地区硬门槛。
+        exits = {"exits": [{"host": "claude.ai", "ip": "203.0.113.9", "loc": "JP",
+                            "colo": "NRT", "error": None}]}
+        region = g.check_region_eligibility({"country": "US"}, exits)
+        self.assertEqual(region["status"], "geo")
+        self.assertTrue(region["supported"])
+
+    def test_region_unknown_without_any_country(self):
+        self.assertEqual(g.check_region_eligibility({}, {"exits": []})["status"], "unknown")
+
+    # ── Claude 域名出口一致性 ──
+    def _exits(self, *pairs):
+        return {"exits": [{"host": host, "ip": ip, "loc": loc, "colo": "EWR", "error": None}
+                          for host, ip, loc in pairs]}
+
+    def test_consistency_same_exit_is_ok(self):
+        exits = self._exits(("claude.ai", "203.0.113.9", "US"),
+                            ("api.anthropic.com", "203.0.113.9", "US"),
+                            ("platform.claude.com", "203.0.113.9", "US"))
+        r = g.check_exit_consistency({"country": "US"}, exits)
+        self.assertEqual(r["status"], "ok")
+        self.assertTrue(r["all_same_ip"])
+
+    def test_consistency_split_exits_are_bad(self):
+        exits = self._exits(("claude.ai", "203.0.113.9", "US"),
+                            ("api.anthropic.com", "198.51.100.7", "US"))
+        self.assertEqual(g.check_exit_consistency({"country": "US"}, exits)["status"], "split")
+
+    def test_consistency_different_countries_count_as_split(self):
+        exits = self._exits(("claude.ai", "203.0.113.9", "US"),
+                            ("api.anthropic.com", "203.0.113.9", "JP"))
+        self.assertEqual(g.check_exit_consistency({"country": "US"}, exits)["status"], "split")
+
+    def test_consistency_geo_disagreement_is_a_warning(self):
+        exits = self._exits(("claude.ai", "203.0.113.9", "JP"),
+                            ("api.anthropic.com", "203.0.113.9", "JP"))
+        self.assertEqual(g.check_exit_consistency({"country": "US"}, exits)["status"], "geo")
+
+    def test_consistency_needs_two_traces(self):
+        exits = self._exits(("claude.ai", "203.0.113.9", "US"))
+        r = g.check_exit_consistency({"country": "US"}, exits)
+        self.assertEqual(r["status"], "unknown")
+        self.assertIn("至少", "；".join(r["facts"]))
+
+    def test_consistency_dual_stack_same_country_is_ok(self):
+        exits = self._exits(("claude.ai", "203.0.113.9", "US"),
+                            ("api.anthropic.com", "2001:db8::1", "US"))
+        r = g.check_exit_consistency({"country": "US"}, exits)
+        self.assertEqual(r["status"], "dual")
+        self.assertTrue(r["dual_stack"])
+
+    def test_consistency_ipv6_split_is_reported(self):
+        exits = self._exits(("claude.ai", "203.0.113.9", "US"),
+                            ("api.anthropic.com", "203.0.113.9", "US"))
+        body = "fl=1\nip=2001:db8::2\nloc=DE\ncolo=FRA\n"
+        with mock.patch.object(g, "run", return_value=(0, body)):
+            r = g.check_exit_consistency({"country": "US"}, exits,
+                                         {"global_addresses": ["2001:db8::1"]})
+        self.assertEqual(r["status"], "family")
+        self.assertEqual(r["ipv6"]["loc"], "DE")
+
+    # ── 出口 IP 纯净度 ──
+    def _clean_api(self):
+        return {"status": "success", "isp": "Example", "org": "Example",
+                "as": "AS64500", "asname": "EXAMPLE", "proxy": False,
+                "hosting": False, "mobile": False}
+
+    def _clean_pc(self):
+        return {"status": "ok", "203.0.113.9": {"proxy": "no", "type": "Residential",
+                                               "asn": "AS64500"}}
+
+    def _purity(self, api=None, pc=None, dnsbl=None, org="AS64500 Example"):
+        api = api if api is not None else self._clean_api()
+        pc = pc if pc is not None else self._clean_pc()
+
+        def fake_run(cmd, **kwargs):
+            url = cmd[-1]
+            if "ip-api.com" in url:
+                return (0, json.dumps(api))
+            if "proxycheck.io" in url:
+                return (0, json.dumps(pc))
+            raise AssertionError("未预期的请求：" + url)
+
+        dns = dnsbl if dnsbl is not None else [
+            {"zone": zone, "listed": False, "note": ""} for zone in g.DNSBL_ZONES]
+        with mock.patch.object(g, "run", side_effect=fake_run), \
+             mock.patch.object(g, "_dnsbl_answers", return_value=dns):
+            return g.check_ip_purity({"ip": "203.0.113.9", "country": "US", "org": org})
+
+    def test_ip_purity_clean_is_ok(self):
+        r = self._purity()
+        self.assertEqual(r["status"], "ok")
+        self.assertFalse(r["flags"]["proxy"])
+
+    def test_ip_purity_plain_hosting_is_not_penalised(self):
+        # CleanIP 与官方 FAQ 的口径：普通 IDC 标签本身不扣分，只报事实。
+        api = self._clean_api()
+        api["hosting"] = True
+        r = self._purity(api=api)
+        self.assertEqual(r["status"], "ok")
+        self.assertTrue(r["flags"]["hosting"])
+
+    def test_ip_purity_vpn_type_is_flagged(self):
+        pc = {"status": "ok", "203.0.113.9": {"proxy": "yes", "type": "VPN"}}
+        self.assertEqual(self._purity(pc=pc)["status"], "flagged")
+
+    def test_ip_purity_tor_is_the_heaviest(self):
+        pc = {"status": "ok", "203.0.113.9": {"proxy": "yes", "type": "TOR"}}
+        self.assertEqual(self._purity(pc=pc)["status"], "tor")
+
+    def test_ip_purity_known_vpn_name_in_org_is_flagged(self):
+        self.assertEqual(self._purity(org="Mullvad VPN AB").get("status"), "flagged")
+
+    def test_ip_purity_blacklist_listing_is_flagged(self):
+        dns = [{"zone": "bl.spamcop.net", "listed": True, "answers": ["127.0.0.2"]}]
+        self.assertEqual(self._purity(dnsbl=dns)["status"], "flagged")
+
+    def test_ip_purity_without_any_source_is_unknown(self):
+        def failing_run(cmd, **kwargs):
+            return (1, "")
+        dns = [{"zone": zone, "listed": None, "note": "查询失败"} for zone in g.DNSBL_ZONES]
+        with mock.patch.object(g, "run", side_effect=failing_run), \
+             mock.patch.object(g, "_dnsbl_answers", return_value=dns):
+            r = g.check_ip_purity({"ip": "203.0.113.9", "country": "US"})
+        self.assertEqual(r["status"], "unknown")
+
+    # ── 大陆环境特征 ──
+    def _cn_score(self, stale=False, **env):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        cache = tmp / "browser-locale.json"
+        stamp = "2020-01-01 00:00" if stale else g.now_stamp()
+        cache.write_text(json.dumps({"checkedAt": stamp, "profileScope": "default",
+                                     "cnEnv": env}), encoding="utf-8")
+        clean_env = {k: v for k, v in os.environ.items()
+                     if not k.startswith("CLAUDE_GUARD_")}
+        with mock.patch.object(g, "LOCALE_CACHE", cache), \
+             mock.patch.dict(os.environ, clean_env, clear=True):
+            return g.check_cn_environment()
+
+    def test_cn_env_unknown_without_this_runs_measurement(self):
+        with mock.patch.object(g, "load_browser_locale", return_value={}):
+            r = g.check_cn_environment()
+        self.assertEqual(r["status"], "unknown")
+
+    def test_cn_env_low_for_a_us_browser(self):
+        r = self._cn_score(
+            timeZone="America/New_York", languages=["en-US"], locale="en-US",
+            userAgent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+            fonts=[], vendorFonts=[], webdriver=False, cookieEnabled=True)
+        self.assertEqual(r["level"], "low")
+        self.assertLessEqual(r["score"], 30)
+        self.assertEqual(r["status"], "low")
+
+    def test_cn_env_high_for_mainland_signals(self):
+        r = self._cn_score(
+            timeZone="Asia/Shanghai", languages=["zh-CN", "en-US"], locale="zh-CN",
+            userAgent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36",
+            fonts=["SimSun", "SimHei", "KaiTi"],
+            vendorFonts=["MiSans", "HarmonyOS Sans SC"],
+            webdriver=False, cookieEnabled=True)
+        # 时区 30 + 语言 22 + locale 6 + 字体 14 + 国产字体 12 = 84
+        self.assertEqual(r["score"], 84)
+        self.assertEqual(r["level"], "high")
+        self.assertEqual(r["status"], "bad")
+
+    def test_cn_env_medium_for_partial_signals(self):
+        r = self._cn_score(
+            timeZone="Asia/Taipei", languages=["zh-CN"], locale="zh-CN",
+            userAgent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/131.0",
+            fonts=["SimSun"], vendorFonts=[], webdriver=False, cookieEnabled=True)
+        # 语言 22 + locale 6 + 一个非系统字体 11 = 39
+        self.assertEqual(r["score"], 39)
+        self.assertEqual(r["level"], "medium")
+
+    def test_cn_env_webdriver_is_bad_even_in_a_us_profile(self):
+        r = self._cn_score(
+            timeZone="America/New_York", languages=["en-US"], locale="en-US",
+            userAgent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            fonts=[], vendorFonts=[], webdriver=True, cookieEnabled=True)
+        self.assertEqual(r["status"], "bad")
+        self.assertTrue(r["automation"]["webdriver"])
+
+    def test_cn_env_stale_measurement_is_unknown_not_reused(self):
+        self.assertEqual(self._cn_score(stale=True, timeZone="Asia/Shanghai")["status"],
+                         "unknown")
+
+    def test_cn_language_scoring_keeps_taiwan_out(self):
+        self.assertEqual(g._cn_language_frac(["zh-TW"]), 0.0)
+        self.assertEqual(g._cn_language_frac(["zh-CN"]), 1.0)
+        self.assertEqual(g._cn_language_frac(["zh-HK"]), 0.5)
+        self.assertEqual(g._cn_language_frac(["en-US", "zh-CN"]), 0.7)
+        self.assertEqual(g._cn_language_frac(["en-US"]), 0.0)
+
+    def test_cn_fonts_scoring_is_platform_aware(self):
+        self.assertEqual(g._cn_fonts_frac("mac", ["PingFang SC"])[0], 0.0)
+        self.assertEqual(g._cn_fonts_frac("mac", ["SimSun"])[0], 0.8)
+        self.assertEqual(g._cn_fonts_frac("windows", ["SimSun"])[0], 0.0)
+        self.assertEqual(g._cn_fonts_frac("windows", ["SimHei", "KaiTi"])[0], 1.0)
+
+    def test_browser_page_collects_cn_environment(self):
+        self.assertIn("cnEnv", g.LOCALE_VERIFY_PAGE)
+        self.assertIn("vendorFonts", g.LOCALE_VERIFY_PAGE)
+        self.assertIn("hasFont", g.LOCALE_VERIFY_PAGE)
+
+    # ── 新行文案 ──
+    def test_summary_rows_use_measured_fields(self):
+        report = {
+            "A31_supported_region": {"status": "blocked", "country": "CN",
+                                     "cloudflare": "CN", "database": "CN"},
+            "A32_exit_consistency": {"status": "split", "exits": [
+                {"host": "claude.ai", "ip": "203.0.113.9", "loc": "US"},
+                {"host": "api.anthropic.com", "ip": "198.51.100.7", "loc": "US"}]},
+            "A33_ip_purity": {"status": "flagged",
+                              "facts": ["黑名单命中：bl.spamcop.net"]},
+            "A34_cn_env": {"status": "unknown", "reason": "本轮没有浏览器复核数据"},
+        }
+        rows = dict((name, (status, detail))
+                    for name, status, detail in g.build_summary(report))
+        self.assertIs(rows["Claude 支持地区"][0], g.S_BAD)
+        self.assertIn("硬门槛", rows["Claude 支持地区"][1])
+        self.assertIs(rows["Claude 域名出口一致性"][0], g.S_BAD)
+        self.assertIs(rows["出口 IP 纯净度"][0], g.S_FIX)
+        self.assertIs(rows["大陆环境特征（估算）"][0], g.S_NA)
+        self.assertIn("不会拿上一轮结果顶替", rows["大陆环境特征（估算）"][1])
 
 if __name__ == "__main__":
     # 这个块必须待在文件最末尾。2026-10-10 发现它一度停在中间（第 2403 行），

@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.4.0-111827?style=flat-square" alt="version 1.3.1" />
+    <img src="https://img.shields.io/badge/version-1.5.0-111827?style=flat-square" alt="version 1.3.1" />
   </p>
   <p>
     <a href="#what-it-does">What it does</a> ·
@@ -142,7 +142,7 @@ You can also do it in two steps: first run `--audit --preflight` for a read-only
 
 ### 3. Report page: static HTML and click-to-fix
 
-Full hardening and `--fix-auto` both **generate one** self-contained HTML report at the end, saved to `~/ClaudeGuardBackups/report-<timestamp>.html` — that page is the before/after comparison: the top shows the "before fix → after fix" score, and below it lists the two real readings for each item. The score is **additive**: 27 base items total 100 points (each item is worth 100/27; full marks for a pass, half for pending, 0 for fail), "not measured" also counts as 0, and the denominator is fixed at 27 items; "login method" is row 28 but is not one of the 27 items, and adds 5 points when it passes, so the page maximum is 105.
+Full hardening and `--fix-auto` both **generate one** self-contained HTML report at the end, saved to `~/ClaudeGuardBackups/report-<timestamp>.html` — that page is the before/after comparison: the top shows the "before fix → after fix" score, and below it lists the two real readings for each item. The score is **additive**: 31 base items total 100 points (each item is worth 100/31; full marks for a pass, half for pending, 0 for fail), "not measured" also counts as 0, and the denominator is fixed at 31 items; "login method" is row 32 but is not one of the 31 items, and adds 5 points when it passes, so the page maximum is 105.
 
 The page also has a section, "Persistent protection": it lists **every background item related to protecting the Claude environment**, grouped by function (network protection / residential route lock / proxy client / report service / checkup and cleanup). Each item is labelled with its source (this skill / installed manually with the early article / residential route lock / proxy client), whether it is running, whether it launches at login, whether it is disabled, and what that process actually protects. **Layers that are not installed are listed too**, with the install command and caveats. Unrelated system and third-party agents are still not included. It is only a list; it does not count toward the score or modify any plist. The entire page references no external resources (no CDN, no web font, no JS); every number on the page comes from the report itself — judgments and terminal output share the same source, `build_summary`.
 
@@ -271,11 +271,13 @@ The checks are organized into five groups; exact counts and availability vary wi
 
 | Group | Typical checks |
 | --- | --- |
-| Network identity | Egress IP and ownership, ASN type, egress consistency, DNS, WebRTC, IPv6, Claude domain routing |
+| Network identity | Egress IP and ownership, Claude supported region, egress IP purity, ASN type, Claude domain exit consistency, DNS, WebRTC, IPv6 |
 | Proxy chain | System proxy, shell configuration, npm/git global proxies, proxy backend mode and DNS |
 | Account environment | Time zone hierarchy, browser Intl, browser profile reuse, traces of multiple accounts, keychain entries |
 | Claude Code | `settings.json` endpoints and credentials, telemetry switches, third-party clients, CLI signature integrity, CLI login credentials |
 | Environment hygiene | Project-level `.claude`, invalid permissions, stale worktree registrations, reclaimable system space |
+
+We also folded four checks from [CleanIP's Claude IP risk check](https://cleanip.io/claude) that can be reproduced locally into the table: **Claude supported region** (against Anthropic's official 185-region allowlist), **egress IP purity** (public sources for proxy / VPN / Tor / blacklist signals), **Claude domain exit consistency** (Cloudflare traces for claude.ai / api.anthropic.com / platform.claude.com plus IPv4/IPv6 country), and **mainland-China environment features (estimate)** (seven browser-side signals). Its private reputation backend and account-level phone / payment card / ownership checks are not copied; see [`references/cleanip-checklist.md`](references/cleanip-checklist.md) for criteria, sources, and limits.
 
 Browser results count only in the run that produced them: each audit/hardening run deletes the previous run's scratch files first, then forces a fresh verification page (profile scope is recorded from the profile actually opened — the Chrome default profile when none is declared; with multiple profiles, pin it with `CLAUDE_GUARD_BROWSER_PROFILE`). If this run cannot measure them, the items report not measured rather than falling back to old values; the page writes the basis as "browser measurement (verification page opened by the script, profile Profile 1)" rather than a bare "passed".
 
@@ -426,6 +428,7 @@ Tests should run in isolated fixtures; real devices, real proxies, real browser 
 | WebRTC criteria and real-world measurements | [`references/webrtc.md`](references/webrtc.md) |
 | Tailscale attached locally, DNS taken over / `*.ts.net` not resolving | [`references/tailscale.md`](references/tailscale.md), [`scripts/tailscale_hosts.py`](scripts/tailscale_hosts.py) |
 | Security boundaries of the report page and click-to-fix | [`references/report-page.md`](references/report-page.md) |
+| How CleanIP's Claude check dimensions are implemented locally, and what was not copied | [`references/cleanip-checklist.md`](references/cleanip-checklist.md) |
 | Background for historical judgments, cache and worktree boundaries | [`references/maintenance-notes.md`](references/maintenance-notes.md) |
 | Script inventory and "which one to use when" | [`references/scripts-index.md`](references/scripts-index.md) |
 | Why it is designed this way (decision records) | [`docs/decisions.md`](docs/decisions.md) |

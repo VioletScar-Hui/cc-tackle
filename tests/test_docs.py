@@ -34,6 +34,7 @@ REQUIRED_DOCS = [
     "docs/decisions.md",
     "tests/README.md",
     "references/article-mapping.md",
+    "references/cleanip-checklist.md",
     "references/maintenance-notes.md",
     "references/manual-checklist.md",
     "references/net-guard.md",

@@ -113,7 +113,7 @@ class TestResidentTasks(unittest.TestCase):
         self.assertTrue(any("出口" in p for p in guard))
         self.assertTrue(all(len(p) < 60 for p in guard), "每条都要短")
         checker = by_label["local.every"]["protects"]
-        self.assertTrue(any("28 项" in p for p in checker))
+        self.assertTrue(any("32 项" in p for p in checker))
 
     def test_function_groups_are_derived_from_the_script(self):
         out = self._check("PID\tStatus\tLabel\n")

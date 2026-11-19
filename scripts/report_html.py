@@ -39,11 +39,12 @@ BACKUP_DIR = pathlib.Path.home() / "ClaudeGuardBackups"
 # 这里必须是全部行——漏掉的行在按项列表里还在，但不会进任何一组的通过率，
 # 页面就会显得比实际干净。有一条用例按 build_summary 的行名逐个核对。
 GROUPS = (
-    ("出口与线路", ("出口 IP 与归属", "预期出口是否符合", "出口 ASN 类型", "系统代理残留",
-                    "代理后端", "绝不直连", "IPv6 全局地址")),
+    ("出口与线路", ("出口 IP 与归属", "预期出口是否符合", "出口 ASN 类型",
+                    "出口 IP 纯净度", "Claude 支持地区", "Claude 域名出口一致性",
+                    "系统代理残留", "代理后端", "绝不直连", "IPv6 全局地址")),
     ("DNS 与泄漏", ("DNS 泄漏", "WebRTC 泄漏")),
     ("时区与作息", ("时区是否锁在台北", "时区两道闸", "作息与出口时区")),
-    ("浏览器与身份", ("浏览器 Intl 区域设置", "浏览器资料是否隔离", "多账号痕迹",
+    ("浏览器与身份", ("浏览器 Intl 区域设置", "大陆环境特征（估算）", "浏览器资料是否隔离", "多账号痕迹",
                      "钥匙串条目", "时区／出口／语言一致性", "登录方式")),
     ("Claude 本机数据", ("项目级 .claude 规模", "系统级可清理量", "settings 失效权限",
                         "settings.json 端点与凭据", "遥测三键", "CLI 完整性",
@@ -63,6 +64,7 @@ DETECTION_SITES = (
     )),
     ("针对 Claude 的区域指纹与线路", (
         ("https://ippure.com/claude.html", "六项区域指纹加权：时区、语言、中文字体、Intl 区域设置、时区偏移、Emoji"),
+        ("https://cleanip.io/claude", "Claude 视角的 IP 风险检测：支持地区、代理与黑名单、域名出口一致性、大陆环境特征"),
         ("https://ip.net.coffee/claude/", "Claude 相关域名实际的出口与纯净度"),
     )),
     ("分流有没有生效", (
@@ -120,6 +122,10 @@ ROW_SOURCE = {
     "钥匙串条目": ("E1_keychain",),
     "多账号痕迹": ("A13_multi_account",),
     "时区／出口／语言一致性": ("A15_consistency",),
+    "出口 IP 纯净度": ("A33_ip_purity",),
+    "Claude 支持地区": ("A31_supported_region",),
+    "Claude 域名出口一致性": ("A32_exit_consistency",),
+    "大陆环境特征（估算）": ("A34_cn_env", "A27_browser_locale"),
     "浏览器 Intl 区域设置": ("A27_browser_locale",),
 }
 
@@ -351,8 +357,8 @@ def _kind(status: str) -> str:
     return {"✓": "ok", "!": "warn", "✗": "bad"}.get((status or "").strip(), "na")
 
 
-# 计分口径：27 个基础项合计 100 分，每个 100/27 分；加分项通过再往上加。
-BASE_ITEMS = 27
+# 计分口径：31 个基础项合计 100 分，每个 100/31 分；加分项通过再往上加。
+BASE_ITEMS = 31
 BASE_MAX = 100
 BONUS_ROW = "登录方式"
 BONUS_POINTS = 5
@@ -360,14 +366,14 @@ MAX_SCORE = BASE_MAX + BONUS_POINTS
 
 
 def _score(rows) -> dict:
-    """加分制：27 个基础项合计 100 分，加分项（登录方式）另外加。
+    """加分制：31 个基础项合计 100 分，加分项（登录方式）另外加。
 
-    基础分：每项满分 100/27。通过拿满、待处理拿一半、未通过 0 分；
-    **「这次没测到」同样是 0 分**——分母固定 27，测不到就不拿分，既不折算成
+    基础分：每项满分 100/31。通过拿满、待处理拿一半、未通过 0 分；
+    **「这次没测到」同样是 0 分**——分母固定 31，测不到就不拿分，既不折算成
     剩下那几项的比例，也不会因为「测到的都过了」而显示接近满分。要么测到并
     通过，要么这一项就不给分。
 
-    加分项：登录方式通过时额外加 BONUS_POINTS 分，不计入那 27 项，总分最高 105。
+    加分项：登录方式通过时额外加 BONUS_POINTS 分，不计入那 31 项，总分最高 105。
     """
     w = {"ok": 1.0, "warn": 0.5, "bad": 0.0, "na": 0.0}
     counts = {"ok": 0, "warn": 0, "bad": 0, "na": 0}
@@ -386,7 +392,7 @@ def _score(rows) -> dict:
             continue
         seen.add(r[0])
         earned += w[_kind(r[1])]
-    # 分母固定为 27：以后真加了检查项而没有同步 BASE_ITEMS，宁可分数封顶，
+    # 分母固定为 31：以后真加了检查项而没有同步 BASE_ITEMS，宁可分数封顶，
     # 也不能让它靠多出来的行把总分撑过 100。
     score = min(BASE_MAX, round(BASE_MAX * earned / BASE_ITEMS))
     total = score + bonus
@@ -639,7 +645,7 @@ def render(report: dict, before: dict = None, report_path=None,
                        if label in by_label]
             if not members:
                 continue
-            entries = []          # 别叫 rows：外面那个 rows 是整张表的 28 行
+            entries = []          # 别叫 rows：外面那个 rows 是整张表的 32 行
             for item in members:
                 if item.get("running"):
                     kind, mark = "ok", "●"

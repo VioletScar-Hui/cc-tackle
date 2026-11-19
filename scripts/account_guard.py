@@ -721,7 +721,7 @@ def clash_config() -> pathlib.Path:
     return clash_dir() / "clash-verge.yaml"
 
 # ───────────────────────── 代理后端识别 ─────────────────────────
-# 2026-10-15 补。体检里原有 87 行是 Clash 专有的：28 项里「绝不直连」与「DNS 泄漏」
+# 2026-10-15 补。体检里原有 87 行是 Clash 专有的：32 项里「绝不直连」与「DNS 泄漏」
 # 直接读 mihomo 的 socket 与 clash-verge.yaml。用别的代理软件的人打开报告只会看到
 # 两行「未测到」，分不清是「脚本不认识你这家」还是「网络真有问题」。
 #
@@ -4059,6 +4059,26 @@ LOCALE_VERIFY_PAGE = """<!doctype html><meta charset="utf-8">
 <script>
 (() => {
   const d = Intl.DateTimeFormat().resolvedOptions();
+  const CJK_FONTS = ["Microsoft YaHei","Microsoft YaHei UI","SimSun","NSimSun","SimHei",
+    "KaiTi","FangSong","DengXian","PingFang SC","Hiragino Sans GB","STHeiti","STSong",
+    "Songti SC","Source Han Sans CN","Source Han Sans SC","Noto Sans CJK SC",
+    "Noto Serif CJK SC","WenQuanYi Micro Hei","WenQuanYi Zen Hei"];
+  const VENDOR_FONTS = ["MiSans","MIUI","HarmonyOS Sans SC","HarmonyOS Sans","HONOR Sans",
+    "OPPO Sans","vivo Sans","Alibaba PuHuiTi","Alibaba Sans","DingTalk JinBuTi",
+    "Douyin Sans","HYQiHei","FZShuSong-Z01S","FZKai-Z03S","FZHei-B01S","FZFangSong-Z02S"];
+  function hasFont(name) {
+    try {
+      const ctx = document.createElement("canvas").getContext("2d");
+      if (!ctx) return false;
+      const sample = "中文字体检测ABCabc012";
+      return ["monospace", "sans-serif", "serif"].some((fallback) => {
+        ctx.font = "72px " + fallback;
+        const width = ctx.measureText(sample).width;
+        ctx.font = '72px "' + name + '", ' + fallback;
+        return Math.abs(ctx.measureText(sample).width - width) > 0.5;
+      });
+    } catch (_) { return false; }
+  }
   const payload = {
     profileScope: null,
     intlLocale: d.locale,
@@ -4072,6 +4092,21 @@ LOCALE_VERIFY_PAGE = """<!doctype html><meta charset="utf-8">
     offsetMinutes: new Date().getTimezoneOffset(),
     sampleDate: new Date(Date.UTC(2026, 9, 9, 12, 0, 0)).toLocaleDateString(),
     sampleCurrency: (99).toLocaleString(undefined, {style:"currency", currency:"USD"}),
+    // 大陆环境特征：只在本机算、随复核结果一起回传本机脚本，不上传。
+    cnEnv: {
+      language: navigator.language || "",
+      languages: navigator.languages || [],
+      locale: d.locale,
+      timeZone: d.timeZone,
+      platform: navigator.platform || "",
+      userAgent: navigator.userAgent || "",
+      uaBrands: ((navigator.userAgentData && navigator.userAgentData.brands) || [])
+        .map((b) => b.brand).join(" "),
+      webdriver: navigator.webdriver === true,
+      cookieEnabled: navigator.cookieEnabled,
+      fonts: CJK_FONTS.filter(hasFont),
+      vendorFonts: VENDOR_FONTS.filter(hasFont),
+    },
   };
   document.getElementById("s").textContent =
     "Intl 区域设置 = " + payload.intlLocale + "    日期样例 = " + payload.sampleDate;
@@ -4345,6 +4380,546 @@ def scan_scope_brief(roots) -> str:
     return f"{names[0]} 等 {len(names)} 个目录"
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 照 CleanIP 那页补的检查（2026-11-19）
+#
+# 来源：https://cleanip.io/claude 的「Claude AI IP 风险检测」清单，以及
+# Anthropic 官方支持地区政策页
+# （https://www.anthropic.com/legal/supported-regions，2026-11-12 生效）。
+# 这里只把它的检查维度搬成本机实测：不调用它的接口，也不复刻它的评分——
+# 它的 IP 信誉 / 黑名单来自私有服务端，站外无法原样复现；本文件用公开数据源
+# 近似，并在结论里列出数据源与拿不到的部分。
+# ═══════════════════════════════════════════════════════════════════════
+
+# Anthropic 官方支持地区（185 个 ISO 3166-1 二位码，2026-11-12 生效版本）。
+# 判定以白名单为准：名单之外一律不支持（港澳不在名单里，台湾在）。
+# 这些代码也出现在 CleanIP 的页内数据里，和官方页逐项对过。
+SUPPORTED_REGIONS_TEXT = (
+    "AL DZ AD AO AG AR AM AU AT AZ BS BH BD BB BE BZ BJ BT BO BA BW BR BN BG BF BI "
+    "CV KH CM CA CF TD CL CO KM CD CG CR CI HR CY CZ DK DJ DM DO EC EG SV GQ ER EE SZ ET "
+    "FJ FI FR GA GM GE DE GH GR GD GT GN GW GY HT HN HU IS IN ID IQ IE IL IT JM JP JO KZ KE KI "
+    "KW KG LA LV LB LS LR LY LI LT LU MG MW MY MV ML MT MH MR MU MX FM MD MC MN ME MA MZ NA NR NP "
+    "NL NZ NI NE NG MK NO OM PK PW PS PA PG PY PE PH PL PT QA RO RW KN LC VC WS SM ST SA SN RS SC SL "
+    "SG SK SI SO SB ZA KR SS ES LK SD SR SE CH TW TJ TZ TH TL TG TO TT TN TR TM TV UG UA AE GB US UY "
+    "UZ VU VA VN ZM ZW"
+)
+SUPPORTED_REGIONS = frozenset(SUPPORTED_REGIONS_TEXT.split())
+# 官方政策点名的 14 个不支持国家 / 地区：只用于把报错说清楚，不参与判定。
+KNOWN_UNSUPPORTED_REGIONS = frozenset(
+    "CN HK MO RU BY IR KP SY CU VE AF MM YE XK".split()
+)
+# claude.ai 与 API / 控制台都在 Cloudflare 后面；trace 就是 Anthropic 实际看到的出口。
+CLAUDE_TRACE_HOSTS = ("claude.ai", "api.anthropic.com", "platform.claude.com")
+# 黑名单查询。Spamhaus 拒绝公共解析器（返回 127.255.255.x），所以不放进来；
+# 这几个源目前允许 DoH 公共查询，拿不到时如实标「未确认」。
+DNSBL_ZONES = ("dnsbl.sorbs.net", "bl.spamcop.net", "psbl.surriel.com", "dnsbl.zapbl.net")
+# 公开免费且无需 key 的 IP 情报源（CleanIP 自己的推荐数据来自私有服务端，
+# 这里只做近似：ip-api 的 proxy / hosting 标记 + proxycheck.io 的代理类型）。
+IP_PURITY_SOURCES = ("ip-api", "proxycheck.io")
+# 已知匿名网络 / VPN 厂商在 org / ASN 名里出现的词。命中只说明出口来自这类网络，
+# 不等于一定会被平台判定为违规；行里会写成「命中」而不是「违规」。
+VPN_ORG_KEYWORDS = (
+    "mullvad", "nordvpn", "expressvpn", "surfshark", "private internet access",
+    "ipvanish", "cyberghost", "purevpn", "windscribe", "protonvpn",
+    "cloudflare warp", "icloud private relay", "private relay",
+)
+
+# ── 浏览器侧的大陆环境特征 ────────────────────────────────────────────────
+# 权重取 CleanIP 页内 claudeScoring 的同一组（timezone 30 / language 22 /
+# fonts 14 / vendorFonts 12 / cnBrowser 10 / deviceVendor 6 / locale 6），
+# 这样两边口径一致；但评分仍是估算，不是 Anthropic 的官方判定。
+CN_ENV_WEIGHTS = {
+    "timezone": 30, "language": 22, "fonts": 14, "vendorFonts": 12,
+    "cnBrowser": 10, "deviceVendor": 6, "locale": 6,
+}
+CN_MAINLAND_ZONES = frozenset({
+    "Asia/Shanghai", "Asia/Urumqi", "Asia/Chongqing", "Asia/Chungking",
+    "Asia/Harbin", "Asia/Kashgar", "PRC",
+})
+CN_HKMO_ZONES = frozenset({"Asia/Hong_Kong", "Asia/Macau"})
+# 简体中文字体：只在装过中文语言包 / 国产软件的机器上出现。
+CN_CJK_FONTS = (
+    "Microsoft YaHei", "Microsoft YaHei UI", "SimSun", "NSimSun", "SimHei",
+    "KaiTi", "FangSong", "DengXian", "PingFang SC", "Hiragino Sans GB",
+    "STHeiti", "STSong", "Songti SC", "Source Han Sans CN", "Source Han Sans SC",
+    "Noto Sans CJK SC", "Noto Serif CJK SC", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",
+)
+# 各地系统自带的简体中文字体：全世界的同系统电脑都有，不计分。
+CN_SYSTEM_FONTS = {
+    "mac": ("PingFang SC", "Hiragino Sans GB", "STHeiti", "STSong", "Songti SC", "Heiti SC"),
+    "ios": ("PingFang SC", "Hiragino Sans GB", "STHeiti", "STSong", "Songti SC", "Heiti SC"),
+    "windows": ("Microsoft YaHei", "Microsoft YaHei UI", "SimSun", "NSimSun"),
+    "linux": ("Noto Sans CJK SC", "Noto Serif CJK SC", "Source Han Sans SC", "Source Han Sans CN"),
+    "android": ("Noto Sans CJK SC", "Noto Serif CJK SC", "Source Han Sans SC", "Source Han Sans CN"),
+}
+CN_TRADITIONAL_FONTS = (
+    "Microsoft JhengHei", "PMingLiU", "MingLiU", "DFKai-SB", "PingFang TC",
+    "PingFang HK", "Source Han Sans TW", "Noto Sans CJK TC",
+)
+# 国产厂商字体：几乎只在国产设备 / 国产软件环境里出现，命中即强信号。
+CN_VENDOR_FONTS = (
+    "MiSans", "MIUI", "HarmonyOS Sans SC", "HarmonyOS Sans", "HONOR Sans",
+    "OPPO Sans", "vivo Sans", "Alibaba PuHuiTi", "Alibaba Sans",
+    "DingTalk JinBuTi", "Douyin Sans", "HYQiHei", "FZShuSong-Z01S",
+    "FZKai-Z03S", "FZHei-B01S", "FZFangSong-Z02S",
+)
+# 国产浏览器 / App 内置 WebView。只用于识别，不据此下「违规」结论。
+CN_BROWSER_PATTERNS = (
+    ("微信 / 企业微信", re.compile(r"micromessenger|wxwork", re.I)),
+    ("QQ 浏览器", re.compile(r"mqqbrowser|qqbrowser|\bqq/", re.I)),
+    ("夸克", re.compile(r"quark", re.I)),
+    ("UC 浏览器", re.compile(r"ucbrowser|ucweb", re.I)),
+    ("百度", re.compile(r"baiduboxapp|bidubrowser|baidubrowser", re.I)),
+    ("小米浏览器", re.compile(r"miuibrowser|xiaomi/|mibrowser", re.I)),
+    ("华为浏览器", re.compile(r"huaweibrowser", re.I)),
+    ("OPPO 浏览器", re.compile(r"heytapbrowser|oppobrowser", re.I)),
+    ("vivo 浏览器", re.compile(r"vivobrowser", re.I)),
+    ("搜狗", re.compile(r"sogoumobilebrowser|\bmetasr\b|\bse 2\.x\b", re.I)),
+    ("傲游", re.compile(r"maxthon", re.I)),
+    ("360 浏览器", re.compile(r"360se|360ee|qihoobrowser|\bqhbrowser\b", re.I)),
+    ("2345", re.compile(r"2345explorer|2345browser", re.I)),
+    ("猎豹", re.compile(r"lbbrowser", re.I)),
+    ("世界之窗", re.compile(r"theworld", re.I)),
+    ("抖音 / 今日头条", re.compile(r"aweme|bytedancewebview|newsarticle|toutiaomicroapp", re.I)),
+    ("支付宝", re.compile(r"alipayclient", re.I)),
+    ("钉钉", re.compile(r"dingtalk", re.I)),
+    ("微博", re.compile(r"weibo", re.I)),
+    ("小红书", re.compile(r"xiaohongshu|xhsminiapp", re.I)),
+    ("哔哩哔哩", re.compile(r"\bbilibili\b", re.I)),
+)
+# 国产设备品牌（UA-CH 或 UA 里的机型 / 厂商）。分数同 CleanIP。
+CN_DEVICE_PATTERNS = (
+    ("鸿蒙 HarmonyOS", re.compile(r"harmonyos|openharmony", re.I), 1.0),
+    ("华为 / 荣耀", re.compile(r"huawei|\bhonor\b", re.I), 0.8),
+    ("魅族", re.compile(r"meizu", re.I), 0.8),
+    ("中兴 / 努比亚", re.compile(r"nubia|\bzte\b", re.I), 0.7),
+    ("小米", re.compile(r"xiaomi|redmi|\bpoco\b|\bm2\d{3}[a-z0-9]+\b", re.I), 0.6),
+    ("OPPO", re.compile(r"oppo|\bpd[a-z]m\d{2}\b", re.I), 0.6),
+    ("vivo", re.compile(r"vivo|\bv2\d{3}[a-z]{1,2}\b", re.I), 0.6),
+    ("realme", re.compile(r"realme|\brmx\d{4}\b", re.I), 0.6),
+    ("一加", re.compile(r"oneplus", re.I), 0.6),
+    ("联想", re.compile(r"\blenovo\b|\bzuk\b", re.I), 0.5),
+)
+
+
+def _trace_exit(host: str) -> dict:
+    """读一个 Claude 域名的 Cloudflare trace。trace 里的 loc 就是 Claude 看到的国家。"""
+    entry = {"host": host, "ip": None, "loc": None, "colo": None, "error": None}
+    code, body = run(["curl", "-s", "--max-time", "10", "--noproxy", "*",
+                      f"https://{host}/cdn-cgi/trace"])
+    if code or not body.strip():
+        entry["error"] = "trace 读取失败"
+        return entry
+    for line in body.splitlines():
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key in ("ip", "loc", "colo") and value:
+            entry[key] = value
+    if not entry["ip"]:
+        entry["error"] = "trace 里没有 ip 字段"
+    return entry
+
+
+def check_claude_exits() -> dict:
+    """Claude 各域名在 Cloudflare 眼里看到的出口（CleanIP「域出口一致性」用这个）。
+
+    三个域名并发查：串行会多等两轮，而它们互相独立、只读。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(CLAUDE_TRACE_HOSTS)) as pool:
+        exits = list(pool.map(_trace_exit, CLAUDE_TRACE_HOSTS))
+    out = {"exits": exits, "checkedAt": now_stamp()}
+    if not any(e["ip"] for e in exits):
+        out["error"] = "三个 Claude 域名都没取到 trace；可能代理没放行它们"
+    return out
+
+
+def check_region_eligibility(ip: dict, exits: dict) -> dict:
+    """Claude 支持地区（官方 185 国白名单）。优先 Cloudflare 的定位，再与地理库交叉。
+
+    这是硬门槛：名单之外即使没有代理特征也用不了 Claude。Cloudflare 与地理库
+    打架时分开报，不替用户合并成一个「不支持」。
+    """
+    cf_entry = next((e for e in exits.get("exits") or []
+                     if e.get("host") == "claude.ai" and e.get("loc")), None)
+    cf_code = (cf_entry or {}).get("loc", "").upper() or None
+    db_code = (ip.get("country") or "").upper() or None
+    out = {"cloudflare": cf_code, "database": db_code, "country": None,
+           "supported": None, "status": "unknown", "facts": []}
+    codes = [c for c in (cf_code, db_code) if c]
+    if not codes:
+        out["facts"].append("Cloudflare trace 与地理库都没给出国家，无法对照官方名单")
+        return out
+    out["country"] = cf_code or db_code
+    unsupported = [c for c in codes if c not in SUPPORTED_REGIONS]
+    out["unsupported_regions"] = unsupported
+    if cf_code and cf_code not in SUPPORTED_REGIONS:
+        out["status"] = "blocked"
+    elif unsupported:
+        # Cloudflare 说支持、另一个库说不支持：先按分歧报，不直接判死，
+        # 但「至少一方不在名单内」意味着不能把这一项标成支持。
+        out["status"] = "conflict" if cf_code else "blocked"
+    elif cf_code and db_code and cf_code != db_code:
+        # 两边都在官方名单里，只是国家归属不一致：不是地区硬门槛，是归属不稳。
+        out["status"] = "geo"
+    else:
+        out["status"] = "ok"
+    out["supported"] = (out["status"] in ("ok", "geo")) and \
+        out["country"] in SUPPORTED_REGIONS
+    return out
+
+
+def check_exit_consistency(ip: dict, exits: dict, ipv6: dict | None = None) -> dict:
+    """Claude 各域名是否从同一出口出去；有 IPv6 时顺带比一次双栈国别。
+
+    分流本身不是问题（CleanIP 的 FAQ 也这么说）；有问题的是 Anthropic 各域名
+    看到不同出口，或者 IPv4 / IPv6 落在不同国家。
+    """
+    entries = [e for e in (exits.get("exits") or []) if e.get("ip")]
+    out = {"status": "unknown", "exits": entries, "facts": [], "ipv6": None}
+    if len(entries) < 2:
+        out["facts"].append("至少要有两个 Claude 域名的 trace 才能比较")
+        return out
+    by_family = {"v4": set(), "v6": set()}
+    for entry in entries:
+        by_family["v6" if ":" in entry["ip"] else "v4"].add(entry["ip"])
+    countries = {(e.get("loc") or "").upper() for e in entries if e.get("loc")}
+    split_family = any(len(ips) > 1 for ips in by_family.values())
+    dual_stack = sum(1 for ips in by_family.values() if ips) > 1
+    cf_code = next(((e.get("loc") or "").upper() for e in entries
+                    if e.get("host") == "claude.ai"), "") or None
+    db_code = (ip.get("country") or "").upper() or None
+    out.update(
+        all_same_ip=len(set().union(*by_family.values())) == 1,
+        dual_stack=dual_stack, split_family=split_family,
+        countries=sorted(countries), cloudflare=cf_code, database=db_code,
+        geo_conflict=bool(cf_code and db_code and cf_code != db_code),
+    )
+    # IPv6：本机没有全局地址时无从比较（行里会写明）；有的话问一次 trace。
+    if (ipv6 or {}).get("global_addresses"):
+        out["ipv6"] = {"global": True, "loc": None, "error": None}
+        code, body = run(["curl", "-6", "-s", "--max-time", "10", "--noproxy", "*",
+                          "https://www.cloudflare.com/cdn-cgi/trace"])
+        v6_loc = None
+        if not code and body.strip():
+            for line in body.splitlines():
+                if line.startswith("loc="):
+                    v6_loc = line.split("=", 1)[1].strip().upper() or None
+        out["ipv6"]["loc"] = v6_loc
+        if not v6_loc:
+            out["ipv6"]["error"] = "IPv6 trace 读取失败"
+        elif db_code and v6_loc != db_code:
+            out["status"] = "family"
+            return out
+    else:
+        out["ipv6"] = {"global": False}
+    if split_family or len(countries) > 1:
+        out["status"] = "split"
+    elif out["geo_conflict"]:
+        out["status"] = "geo"
+    elif dual_stack:
+        out["status"] = "dual"
+    else:
+        out["status"] = "ok"
+    return out
+
+
+def _dnsbl_answers(ip: str) -> list:
+    """用 Cloudflare DoH 查反向地址的黑名单记录。
+
+    Spamhaus 一类的源会拒绝公共解析器（返回 127.255.255.x 错误码），那就如实
+    标成「未确认」，不把「查不了」当成「没列入」。
+    """
+    results = []
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return [{"zone": "(全部)", "listed": None, "note": "IP 无法解析"}]
+    if addr.version != 4:
+        return [{"zone": "(全部)", "listed": None, "note": "IPv6 不做 DNSBL 查询"}]
+    reversed_ip = ".".join(reversed(str(addr).split(".")))
+
+    def one(zone: str) -> dict:
+        url = ("https://cloudflare-dns.com/dns-query?name="
+               f"{reversed_ip}.{zone}&type=A")
+        code, body = run(["curl", "-s", "--max-time", "6", "--noproxy", "*",
+                          "-H", "accept: application/dns-json", url])
+        record = {"zone": zone, "listed": None, "note": ""}
+        data = _json_object(body) if not code and body.strip() else None
+        if data is None:
+            record["note"] = "查询失败"
+            return record
+        status = data.get("Status")
+        answers = [a.get("data") for a in (data.get("Answer") or [])
+                   if isinstance(a, dict) and a.get("type") == 1]
+        if status == 3 or (status == 0 and not answers):
+            record["listed"] = False
+        elif any(isinstance(a, str) and a.startswith("127.255.255.") for a in answers):
+            record["note"] = "源拒绝公共解析器查询（未确认）"
+        elif answers:
+            record["listed"] = True
+            record["answers"] = answers
+        else:
+            record["note"] = f"响应状态 {status}（未确认）"
+        return record
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(DNSBL_ZONES)) as pool:
+        results = list(pool.map(one, DNSBL_ZONES))
+    return results
+
+
+def check_ip_purity(ip_info: dict) -> dict:
+    """出口 IP 的代理 / VPN / 中继 / 黑名单画像（CleanIP 的 network + reputation）。
+
+    和「出口 ASN 类型」分开：普通机房 / IDC 标签本身按 CleanIP 与官方 FAQ 不单独
+    扣分，这里只报代理、匿名网络、黑名单这类更强信号；拿不到的源如实标未确认。
+    """
+    ip = ip_info.get("ip")
+    out = {
+        "ip": ip, "status": "unknown", "flags": {}, "sources": {},
+        "dnsbl": [], "facts": [], "unconfirmed": [],
+    }
+    if not ip:
+        out["facts"].append("没有出口 IP，无法查纯净度")
+        return out
+    addr_label = " ".join(str(ip_info.get(k) or "")
+                          for k in ("org", "verdict", "asn", "asname")).lower()
+
+    # 一、ip-api 的 proxy / hosting / mobile 标记
+    code, body = run(["curl", "-s", "--max-time", "10", "--noproxy", "*",
+                      f"http://ip-api.com/json/{ip}?fields=status,isp,org,as,asname,"
+                      "mobile,proxy,hosting"])
+    api = _json_object(body) if not code and body.strip() else None
+    if api is not None and api.get("status") == "success":
+        out["sources"]["ip-api"] = {
+            "proxy": bool(api.get("proxy")), "hosting": bool(api.get("hosting")),
+            "mobile": bool(api.get("mobile")),
+        }
+        out["flags"]["proxy"] = bool(api.get("proxy"))
+        out["flags"]["hosting"] = bool(api.get("hosting"))
+        out["flags"]["mobile"] = bool(api.get("mobile"))
+        label = " ".join(str(api.get(k) or "")
+                         for k in ("isp", "org", "as", "asname")).lower()
+        out["facts"].append("ip-api：proxy=" + ("yes" if api.get("proxy") else "no")
+                            + " hosting=" + ("yes" if api.get("hosting") else "no"))
+    else:
+        out["unconfirmed"].append("ip-api 未返回结果")
+
+    # 二、proxycheck.io 的代理类型（免费额度，每日 100 次；一次体检只查一次）
+    code, body = run(["curl", "-s", "--max-time", "12", "--noproxy", "*",
+                      f"https://proxycheck.io/v2/{ip}?vpn=1&asn=1"])
+    pc = _json_object(body) if not code and body.strip() else None
+    entry = (pc or {}).get(ip) if isinstance(pc, dict) else None
+    if isinstance(entry, dict) and (pc or {}).get("status") == "ok":
+        proxy_yes = str(entry.get("proxy") or "").lower() in ("yes", "true")
+        kind = str(entry.get("type") or "")
+        lower_kind = kind.lower()
+        out["sources"]["proxycheck.io"] = {"proxy": proxy_yes, "type": kind or None}
+        out["flags"]["proxy"] = out["flags"].get("proxy") or proxy_yes
+        if "vpn" in lower_kind:
+            out["flags"]["vpn"] = True
+        if "tor" in lower_kind:
+            out["flags"]["tor"] = True
+        if "residential" in lower_kind and "proxy" in lower_kind:
+            out["flags"]["residential_proxy"] = True
+        out["facts"].append("proxycheck.io：proxy=" + ("yes" if proxy_yes else "no")
+                            + " type=" + (kind or "未知"))
+    else:
+        out["unconfirmed"].append("proxycheck.io 未返回结果（可能超出免费额度）")
+
+    # 三、已知匿名网络 / VPN 厂商的名字（只命中 org / ASN 名，不是行为判定）
+    hit = [word for word in VPN_ORG_KEYWORDS if word in addr_label]
+    if hit:
+        out["flags"]["known_vpn_name"] = hit[0]
+        out["facts"].append("出口的 org / ASN 名里出现已知匿名网络：" + "、".join(hit))
+    # 四、DNSBL 黑名单
+    out["dnsbl"] = _dnsbl_answers(ip)
+    listed_zones = [r["zone"] for r in out["dnsbl"] if r.get("listed")]
+    if listed_zones:
+        out["flags"]["blacklisted"] = listed_zones
+        out["facts"].append("黑名单命中：" + "、".join(listed_zones))
+    elif all(r.get("listed") is False for r in out["dnsbl"]):
+        out["facts"].append("黑名单：查询的 "
+                            + str(len([r for r in out["dnsbl"] if r.get("listed") is False]))
+                            + " 个源都未列入")
+    for record in out["dnsbl"]:
+        if record.get("listed") is None:
+            out["unconfirmed"].append(f"{record['zone']}：{record.get('note') or '未确认'}")
+
+    if out["flags"].get("tor"):
+        out["status"] = "tor"
+    elif any(out["flags"].get(k) for k in
+             ("proxy", "vpn", "residential_proxy", "blacklisted", "known_vpn_name")):
+        out["status"] = "flagged"
+    elif out["unconfirmed"] and not out["facts"]:
+        out["status"] = "unknown"
+    else:
+        out["status"] = "ok"
+    return out
+
+
+def _cn_platform(ua: str) -> str:
+    """从 UA 判断大致平台，用来区分「系统自带中文字体」和「后装的简体字体」。"""
+    text = (ua or "").lower()
+    if re.search(r"iphone|ipad|ipod", text):
+        return "ios"
+    if "android" in text:
+        return "android"
+    if re.search(r"mac os|macintosh", text):
+        return "mac"
+    if "windows" in text:
+        return "windows"
+    if re.search(r"linux|cros", text):
+        return "linux"
+    return "other"
+
+
+def _cn_timezone_frac(time_zone: str | None) -> float:
+    if not time_zone:
+        return 0.0
+    if time_zone in CN_MAINLAND_ZONES:
+        return 1.0
+    return 0.6 if time_zone in CN_HKMO_ZONES else 0.0
+
+
+def _cn_language_frac(languages) -> float:
+    """浏览器首选项语言里的大陆特征（港台部分计分，纯 zh-TW 不计分）。"""
+    langs = [str(l).lower() for l in (languages or []) if l]
+    if not langs:
+        return 0.0
+
+    def is_tw(tag: str) -> bool:
+        return tag.startswith("zh-tw") or ("hant" in tag and "tw" in tag)
+
+    def is_hkmo(tag: str) -> bool:
+        return tag.startswith("zh-hk") or tag.startswith("zh-mo")
+
+    def is_simplified(tag: str) -> bool:
+        return tag.startswith("zh-cn") or "hans" in tag
+
+    first = langs[0]
+    if is_tw(first):
+        return 0.0
+    if is_simplified(first) or first == "zh":
+        return 1.0
+    if is_hkmo(first) or "hant" in first:
+        return 0.5
+    # 首位不是中文时，往后看：有 zh-CN / zh-Hans 记 .7，有其它 zh 记 .4。
+    if any(is_simplified(tag) for tag in langs[1:]):
+        return 0.7
+    if any(tag.startswith("zh") and not is_tw(tag) for tag in langs[1:]):
+        return 0.4
+    return 0.0
+
+
+def _cn_locale_frac(locale: str | None) -> float:
+    if not locale:
+        return 0.0
+    low = locale.lower()
+    if low.startswith("zh-cn") or "hans" in low or low == "zh":
+        return 1.0
+    if low.startswith("zh") and not low.startswith("zh-tw"):
+        return 0.5
+    return 0.0
+
+
+def _cn_fonts_frac(platform: str, fonts) -> tuple[float, str]:
+    """非系统预装的简体中文字体数。全系统都自带的字体不算证据。"""
+    detected = [f for f in (fonts or []) if f]
+    system = CN_SYSTEM_FONTS.get(platform, ())
+    extra = [f for f in detected if f not in system]
+    if len(extra) >= 2:
+        return 1.0, "、".join(extra[:4])
+    if len(extra) == 1:
+        return 0.8, extra[0]
+    leftovers = [f for f in detected if f in CN_TRADITIONAL_FONTS
+                 and not (platform == "windows" and f == "Microsoft JhengHei")]
+    return (0.2, "、".join(leftovers[:3])) if leftovers else (0.0, "仅系统自带字体")
+
+
+def _cn_vendor_fonts_frac(fonts) -> tuple[float, str]:
+    detected = [f for f in (fonts or []) if f in CN_VENDOR_FONTS]
+    if len(detected) >= 2:
+        return 1.0, "、".join(detected[:3])
+    if len(detected) == 1:
+        return 0.8, detected[0]
+    return 0.0, "未检测到"
+
+
+def _cn_browser_frac(ua: str, brands: str) -> tuple[float, str]:
+    text = f"{ua or ''} {brands or ''}"
+    for name, pattern in CN_BROWSER_PATTERNS:
+        if pattern.search(text):
+            return 1.0, name
+    return 0.0, "未检测到"
+
+
+def _cn_device_vendor_frac(ua: str) -> tuple[float, str]:
+    text = ua or ""
+    for name, pattern, score in CN_DEVICE_PATTERNS:
+        if pattern.search(text):
+            return score, name
+    return 0.0, "未检测到"
+
+
+def _cn_env_fracs(env: dict) -> dict:
+    """把浏览器回传的原始环境特征折成每项的 0–1 分（权重在 CN_ENV_WEIGHTS）。"""
+    ua = str(env.get("userAgent") or "")
+    brands = str(env.get("uaBrands") or "")
+    platform = _cn_platform(ua)
+    fonts_frac, fonts_value = _cn_fonts_frac(platform, env.get("fonts") or [])
+    vendor_frac, vendor_value = _cn_vendor_fonts_frac(env.get("vendorFonts") or [])
+    browser_frac, browser_value = _cn_browser_frac(ua, brands)
+    device_frac, device_value = _cn_device_vendor_frac(ua)
+    return {
+        "timezone": (_cn_timezone_frac(env.get("timeZone")), env.get("timeZone") or "未知"),
+        "language": (_cn_language_frac(env.get("languages") or [env.get("language")]),
+                     ", ".join(env.get("languages") or []) or env.get("language") or "未知"),
+        "fonts": (fonts_frac, fonts_value),
+        "vendorFonts": (vendor_frac, vendor_value),
+        "cnBrowser": (browser_frac, browser_value),
+        "deviceVendor": (device_frac, device_value),
+        "locale": (_cn_locale_frac(env.get("locale")), env.get("locale") or "未知"),
+    }
+
+
+def check_cn_environment() -> dict:
+    """大陆环境特征估算（CleanIP 的 browser 维度，7 项加权）。
+
+    只看本轮浏览器复核页回传的原始事实；没有本轮数据就报未测到，不回退。
+    分数是估算：7 项里只有「系统时区」对应社区披露的机制，其余是相关特征。
+    """
+    cache = load_browser_locale()
+    fresh, reason = cache_is_fresh(cache)
+    env = cache.get("cnEnv") if isinstance(cache, dict) else None
+    if not fresh or not isinstance(env, dict):
+        return {"status": "unknown", "reason": reason or "本轮没有浏览器复核数据",
+                "estimate": True}
+    fracs = _cn_env_fracs(env)
+    signals = []
+    score = 0
+    for key, weight in CN_ENV_WEIGHTS.items():
+        frac, value = fracs[key]
+        points = round(frac * weight)
+        score += points
+        signals.append({"id": key, "weight": weight, "frac": frac,
+                        "points": points, "value": value})
+    level = "high" if score >= 61 else "medium" if score >= 31 else "low"
+    automation = {
+        "webdriver": env.get("webdriver") is True,
+        "cookieEnabled": env.get("cookieEnabled") is not False,
+    }
+    status = "bad" if (level == "high" or automation["webdriver"]) else (
+        "medium" if level == "medium" else "low")
+    return {
+        "status": status, "score": score, "level": level, "signals": signals,
+        "automation": automation, "estimate": True,
+        "checkedAt": cache.get("checkedAt"), "openedBy": cache.get("openedBy"),
+        "summary": "估算，不是 Anthropic 的官方判定",
+    }
+
+
 def build_summary(report: dict) -> list:
     """把体检报告压成「哪些解决了、哪些没有」的行。
 
@@ -4436,6 +5011,74 @@ def build_summary(report: dict) -> list:
         add("出口 ASN 类型", S_BAD, f"{verdict}——机房 IP 是文章 2.3 明确要避开的")
     else:
         add("出口 ASN 类型", S_NA, "未取到 ASN 判定")
+
+    purity = report.get("A33_ip_purity") or {}
+    if missing("A33_ip_purity"):
+        add("出口 IP 纯净度", S_NA, "未检测")
+    elif purity.get("status") == "tor":
+        add("出口 IP 纯净度", S_BAD,
+            "出口被识别为 Tor 出口——CleanIP 把这一类列为最重的网络特征，换线路")
+    elif purity.get("status") == "flagged":
+        hits = list(purity.get("facts") or [])
+        add("出口 IP 纯净度", S_FIX,
+            "命中：" + "；".join(hits[:3]) + "；这属于网络特征，不是本机配置问题，建议换独享住宅出口")
+    elif purity.get("status") == "ok":
+        facts = "；".join((purity.get("facts") or [])[:3])
+        unconfirmed = purity.get("unconfirmed") or []
+        detail = facts or "公开数据源未发现代理 / 黑名单标记"
+        if unconfirmed:
+            detail += "；未确认：" + "、".join(unconfirmed[:2])
+        add("出口 IP 纯净度", S_OK, detail)
+    else:
+        add("出口 IP 纯净度", S_NA, "数据源未给出结论；不会拿旧结果顶替")
+
+    region = report.get("A31_supported_region") or {}
+    if missing("A31_supported_region"):
+        add("Claude 支持地区", S_NA, "未检测")
+    elif region.get("status") == "ok":
+        add("Claude 支持地区", S_OK,
+            f"出口 {region.get('country')} 在 Anthropic 官方 185 个支持地区名单内"
+            f"（Cloudflare loc={region.get('cloudflare') or '—'}，地理库={region.get('database') or '—'}）")
+    elif region.get("status") == "conflict":
+        add("Claude 支持地区", S_FIX,
+            f"Cloudflare 与地理库国家不一致：{region.get('cloudflare') or '—'} vs "
+            f"{region.get('database') or '—'}；至少一方不在官方名单内，先换线路再复核")
+    elif region.get("status") == "geo":
+        add("Claude 支持地区", S_FIX,
+            f"两边都在官方名单内，但国家归属不一致：{region.get('cloudflare') or '—'} vs "
+            f"{region.get('database') or '—'}；出口地理不稳定，换线路或复核")
+    elif region.get("status") == "blocked":
+        add("Claude 支持地区", S_BAD,
+            f"出口 {region.get('country')} 不在 Anthropic 官方支持地区名单内——硬门槛，"
+            f"Claude 会直接拒绝（Cloudflare {region.get('cloudflare') or '—'} / "
+            f"地理库 {region.get('database') or '—'}）")
+    else:
+        add("Claude 支持地区", S_NA, "取不到出口国家，无法对照官方名单")
+
+    cons = report.get("A32_exit_consistency") or {}
+    if missing("A32_exit_consistency"):
+        add("Claude 域名出口一致性", S_NA, "未检测")
+    elif cons.get("status") == "ok":
+        first = (cons.get("exits") or [{}])[0]
+        add("Claude 域名出口一致性", S_OK,
+            f"三个域名的出口一致：{first.get('ip')} / {first.get('loc')}"
+            f"（colo {first.get('colo') or '—'}）")
+    elif cons.get("status") == "dual":
+        add("Claude 域名出口一致性", S_OK,
+            f"双栈出口国家一致（{cons.get('countries')}），IP 不同但国别没分叉")
+    elif cons.get("status") == "geo":
+        add("Claude 域名出口一致性", S_FIX,
+            f"Cloudflare 与地理库的国家不一致：{cons.get('cloudflare') or '—'} vs "
+            f"{cons.get('database') or '—'}；各域名看到的出口可能是同一个，但归属不稳")
+    elif cons.get("status") in ("split", "family"):
+        add("Claude 域名出口一致性", S_BAD,
+            "Claude 各域名 / 双栈出口不一致："
+            + "  ".join(f"{e.get('host')}={e.get('ip')}/{e.get('loc')}"
+                        for e in (cons.get("exits") or []))
+            + (f"；IPv6 loc={cons['ipv6'].get('loc')}" if (cons.get("ipv6") or {}).get("loc") else ""))
+    else:
+        add("Claude 域名出口一致性", S_NA,
+            "；".join(cons.get("facts") or []) or "取不到至少两个域名的 trace")
 
     # ── 泄漏面 ──
     if missing("A1_proxy_residue"):
@@ -4579,6 +5222,30 @@ def build_summary(report: dict) -> list:
         # 不能替本轮下判断（--no-browser 会走到这里，且上一轮结果已在开始时作废）。
         note = wr.get("note") or "本轮没有做 WebRTC 探测（--no-browser 显式关闭）"
         add("WebRTC 泄漏", S_NA, note + "；不会用上一轮的结果顶替")
+
+    cn = report.get("A34_cn_env") or {}
+    if missing("A34_cn_env"):
+        add("大陆环境特征（估算）", S_NA, "未检测")
+    elif cn.get("status") == "unknown":
+        add("大陆环境特征（估算）", S_NA,
+            (cn.get("reason") or "本轮没有浏览器复核数据")
+            + "；不会拿上一轮结果顶替")
+    else:
+        hits = [f"{sig.get('value')}（{sig.get('points')}）"
+                for sig in (cn.get("signals") or []) if sig.get("frac", 0) > 0]
+        base = (f"估算 {cn.get('score')}/100（{cn.get('level')}）"
+                + ("；命中：" + "、".join(hits) if hits else "；7 项信号都未命中"))
+        base += "；CleanIP 口径的加权估算，不是 Anthropic 的官方判定"
+        if cn.get("status") == "bad":
+            if (cn.get("automation") or {}).get("webdriver"):
+                add("大陆环境特征（估算）", S_BAD,
+                    base + "；另外检测到 webdriver 自动化痕迹")
+            else:
+                add("大陆环境特征（估算）", S_BAD, base)
+        elif cn.get("status") == "medium":
+            add("大陆环境特征（估算）", S_FIX, base + "；可对照命中的信号逐项调整")
+        else:
+            add("大陆环境特征（估算）", S_OK, base)
 
     v6g = v6.get("global_addresses") or []
     if missing("A5_ipv6"):
@@ -5328,7 +5995,7 @@ RESIDENT_PROTECTS = {
         "不对外网、不上传任何数据",
     ],
     "体检与清理": [
-        "按需跑一遍 28 项体检",
+        "按需跑一遍 32 项体检",
         "默认只读；自动修之前先备份",
     ],
 }
@@ -8075,6 +8742,14 @@ def audit(*, persist: bool = False, expected_country: str | None = None,
         "E1_keychain": check_keychain(),
         "A30_resident": check_resident_tasks(),
     }
+    # CleanIP 口径的补充检查：三个 Claude 域名的 trace 只取一次，供两项复用。
+    exits = check_claude_exits()
+    region = check_region_eligibility(ip, exits)
+    region["exits"] = exits.get("exits") or []
+    report["A31_supported_region"] = region
+    report["A32_exit_consistency"] = check_exit_consistency(ip, exits, report.get("A5_ipv6"))
+    report["A33_ip_purity"] = check_ip_purity(ip)
+    report["A34_cn_env"] = check_cn_environment()
     report["A1_export_ip"]["expected"] = expected
     return report
 
@@ -8096,6 +8771,19 @@ def print_audit(r: dict) -> None:
     print(f"  预期出口：{expected.get('expected')} → {expected.get('status')}；"
           f"{expected.get('reason') or ''}")
     print(f"  ASN 判定：{ip.get('verdict')}")
+    region = r.get("A31_supported_region") or {}
+    if region:
+        print(f"  Claude 地区：{region.get('country') or '?'} → {region.get('status')}"
+              f"（Cloudflare {region.get('cloudflare') or '—'} / 地理库 {region.get('database') or '—'}）")
+    cons = r.get("A32_exit_consistency") or {}
+    if cons.get("exits"):
+        exits_text = "  ".join(
+            f"{e['host']}={e.get('ip') or '?'}/{e.get('loc') or '?'}" for e in cons["exits"])
+        print(f"  域名出口：{exits_text}")
+    purity = r.get("A33_ip_purity") or {}
+    if purity:
+        print(f"  IP 纯净度：{purity.get('status')}"
+              + ("；" + "；".join(purity.get("facts") or []) if purity.get("facts") else ""))
     c = r["A15_consistency"]
     print(f"  时区    ：{c.get('timezone')}  (UTC{c.get('offset')})")
     print(f"  语言    ：LANG={c.get('lang')}  AppleLocale={c.get('apple_locale')}")

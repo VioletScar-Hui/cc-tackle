@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/runtime-Python%203-111827?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3" />
     <img src="https://img.shields.io/badge/core-Python%20stdlib-111827?style=flat-square" alt="Core uses Python standard library" />
     <a href="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml"><img src="https://github.com/VioletScar-Hui/cc-tackle/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-    <img src="https://img.shields.io/badge/version-1.4.0-111827?style=flat-square" alt="version 1.3.1" />
+    <img src="https://img.shields.io/badge/version-1.5.0-111827?style=flat-square" alt="version 1.3.1" />
   </p>
   <p>
     <a href="#what-it-does">它能做什么</a> ·
@@ -140,7 +140,7 @@ python3 scripts/account_guard.py --audit \
 
 ### 3. 报告页：静态 HTML 与可点修复
 
-完整加固与 `--fix-auto` 都在收尾**生成一份**自包含的 HTML 报告，落在 `~/ClaudeGuardBackups/report-<时间戳>.html`——那一页就是前后对照：顶上是「修复前 → 修复后」的分数，下面逐项列出两次真读数。分数是**加分制**：27 个基础项合计 100 分（每项 100/27，通过拿满、待处理拿一半、未通过 0 分），「没测到」也按 0 分计，分母固定 27 项；「登录方式」是第 28 行但不在 27 项里，通过再加 5 分，所以页面满分 105。
+完整加固与 `--fix-auto` 都在收尾**生成一份**自包含的 HTML 报告，落在 `~/ClaudeGuardBackups/report-<时间戳>.html`——那一页就是前后对照：顶上是「修复前 → 修复后」的分数，下面逐项列出两次真读数。分数是**加分制**：31 个基础项合计 100 分（每项 100/31，通过拿满、待处理拿一半、未通过 0 分），「没测到」也按 0 分计，分母固定 31 项；「登录方式」是第 32 行但不在 31 项里，通过再加 5 分，所以页面满分 105。
 
 页面里另有一节「常驻保护」：列出**所有和保护 Claude 环境相关的后台项**，按功能分组（网络防护 / 住宅链路锁定 / 代理客户端 / 报告服务 / 体检与清理），每项标出来源（本 skill / 文章早期手工装 / 住宅链路锁定 / 代理客户端）、在不在跑、有没有设开机自启、有没有被禁用，以及「这个进程保护什么」。**没安装的防护层也列出来**，并给安装命令和注意事项；无关的系统与其它 App 的 agent 仍然不往里塞。它只是清单，不计分，也不改任何 plist。整页不引用任何外部资源（没有 CDN、没有 web font、没有 JS），页面上的数字全部来自报告本身——判定与终端输出同源，都是 `build_summary`。
 
@@ -269,11 +269,13 @@ python3 scripts/account_guard.py --restore "$HOME/ClaudeGuardBackups/guard-<时�
 
 | 组别 | 典型检查 |
 | --- | --- |
-| 网络身份 | 出口 IP 与归属、ASN 类型、出口一致性、DNS、WebRTC、IPv6、Claude 域名路由 |
+| 网络身份 | 出口 IP 与归属、Claude 支持地区、出口 IP 纯净度、ASN 类型、Claude 域名出口一致性、DNS、WebRTC、IPv6 |
 | 代理链路 | 系统代理、shell 配置、npm/git 全局代理、代理后端的模式与 DNS |
 | 账号环境 | 时区层级、浏览器 Intl、浏览器资料复用、多账号痕迹、钥匙串条目 |
 | Claude Code | `settings.json` 端点与凭据、遥测开关、第三方客户端、CLI 签名完整性、CLI 登录凭据 |
 | 环境卫生 | 项目级 `.claude`、失效权限、过期工作树登记、可回收系统体积 |
+
+另外把 [CleanIP 的 Claude IP 风险检测](https://cleanip.io/claude) 里能在本机复现的四项并进了总表：**Claude 支持地区**（对照 Anthropic 官方 185 国白名单）、**出口 IP 纯净度**（代理 / VPN / Tor / 黑名单的公开数据源交叉）、**Claude 域名出口一致性**（claude.ai / api.anthropic.com / platform.claude.com 的 Cloudflare trace 与 IPv4/IPv6 国别）、**大陆环境特征（估算）**（浏览器侧 7 项加权）。它的私有信誉库和账号层面的手机号 / 付款卡 / 股权归属不照搬；判据、数据源与边界见 [`references/cleanip-checklist.md`](references/cleanip-checklist.md)。
 
 浏览器两类结果只在产生它的那一轮里算数：审计/加固开始前会删掉上一轮的复核暂存文件，再强制重开复核页（资料范围按实际打开的那个资料记，没声明就是 Chrome 默认资料；多资料时用 `CLAUDE_GUARD_BROWSER_PROFILE` 钉到某个名字上）。没测成本轮结果就报未测到，不会回退到旧值；页面上写的是「浏览器实测（脚本打开的复核页，资料 Profile 1）」而不是一句「通过」。
 
@@ -425,6 +427,7 @@ python3 tools/package_skill.py --check
 | WebRTC 判据与实测 | [`references/webrtc.md`](references/webrtc.md) |
 | 本机接了 Tailscale、DNS 被接管 / `*.ts.net` 解析不了 | [`references/tailscale.md`](references/tailscale.md)、[`scripts/tailscale_hosts.py`](scripts/tailscale_hosts.py) |
 | 报告页与可点修复的安全边界 | [`references/report-page.md`](references/report-page.md) |
+| CleanIP 那页的 Claude 检查维度怎么落地、哪些没照搬 | [`references/cleanip-checklist.md`](references/cleanip-checklist.md) |
 | 历史判断背景、缓存与工作树边界 | [`references/maintenance-notes.md`](references/maintenance-notes.md) |
 | 脚本清单与「什么时候用哪条」 | [`references/scripts-index.md`](references/scripts-index.md) |
 | 为什么这么设计（决策记录） | [`docs/decisions.md`](docs/decisions.md) |

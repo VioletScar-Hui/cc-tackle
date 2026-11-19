@@ -234,6 +234,36 @@ python3 -c "import json;print(json.load(open('$HOME/.claude/settings.json')).get
 
 想关就在这里加 `DISABLE_TELEMETRY` 与 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` 为 `1`。有副作用，Remote Control 可能失效。
 
+## CleanIP 口径的四个补充检查（2026-11-19）
+
+这四个维度来自 <https://cleanip.io/claude>，体检已尽量自动跑；想手工核对时用：
+
+```bash
+# 1) Claude 支持地区：三个域名的 trace 里 loc 就是 Claude 看到的国家
+for h in claude.ai api.anthropic.com platform.claude.com; do
+  echo "--- $h"; curl -s "https://$h/cdn-cgi/trace" | grep -E '^(ip|loc|colo)='
+done
+# 官方 185 国名单：https://www.anthropic.com/legal/supported-regions
+
+# 2) 出口 IP 纯净度（公开源）
+IP=$(curl -s https://ipinfo.io/json | /usr/bin/python3 -c 'import json,sys;print(json.load(sys.stdin)["ip"])')
+curl -s "http://ip-api.com/json/$IP?fields=status,isp,org,as,proxy,hosting,mobile"
+curl -s "https://proxycheck.io/v2/$IP?vpn=1&asn=1"
+# 反查 DNSBL（把 IP 反转后拼到 blacklist 域名前；127.0.0.x 才是命中，127.255.* 是拒查）
+
+# 3) 域名出口一致性：上面三个 trace 的 ip / loc 应当一致；有 IPv6 时
+curl -6 -s https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc)='
+
+# 4) 大陆环境特征：浏览器控制台里看这 7 项（体检的复核页会自动算）
+Intl.DateTimeFormat().resolvedOptions().timeZone   // 时区
+navigator.languages                                 // 语言
+Intl.DateTimeFormat().resolvedOptions().locale      // Intl 区域
+navigator.userAgent                                 // 国产浏览器 / 设备
+document.fonts.check('12px "SimSun"')               // 非系统预装中文字体
+document.fonts.check('12px "MiSans"')               // 国产厂商字体
+navigator.webdriver                                 // 自动化痕迹
+```
+
 ## 文章里给的检测网站
 
 | 用途 | 网站 | 说明 |

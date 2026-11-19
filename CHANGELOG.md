@@ -2,6 +2,32 @@
 
 本文件按交付批次记录变化，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。版本号与 `SKILL.md` frontmatter 里的 `metadata.version` 保持一致；`1.0.4` 及更早的版本号是事后回填的，依据见文末「版本号说明」。
 
+## [1.5.0] - 2026-11-19
+
+### Added
+
+- 把 CleanIP 的 Claude IP 风险检测（<https://cleanip.io/claude>）里能在本机复现的四个维度
+  并进体检总表（28 → 32 行）：
+  **Claude 支持地区**（对照 Anthropic 官方 185 国白名单，Cloudflare trace 与地理库交叉）、
+  **出口 IP 纯净度**（ip-api / proxycheck.io / DNSBL 公开源，拿不到就报「未确认」）、
+  **Claude 域名出口一致性**（claude.ai / api.anthropic.com / platform.claude.com 的
+  `cdn-cgi/trace`，有 IPv6 时再比双栈国别）、**大陆环境特征（估算）**（本轮浏览器复核页回传
+  7 项信号，权重取自 CleanIP 页内同一组配置）。
+- `references/cleanip-checklist.md`：逐维度的落地方式、数据源、故意没照搬的部分与已知边界。
+- 浏览器复核页多收一组 `cnEnv` 事实（时区 / 语言 / Intl / 中文字体 / 国产字体 / UA /
+  webdriver），只在本机计算、随本轮复核结果回传本机脚本，不上传。
+
+### Changed
+
+- HTML 报告计分分母随基础项从 27 改为 31（满分仍是 105：基础 100 + 登录方式 5）。
+- 报告页「检测站入口」补 cleanip.io/claude；README / SKILL / 验证状态表同步到 32 行。
+
+### Tests
+
+- 新增 `TestCleanipDerivedChecks` 30 个用例：白名单形状、地区门控与分歧、域名出口一致性、
+  纯净度数据源缺失、大陆特征权重与阈值、旧测量不复用、新行文案。
+- 本机 `/usr/bin/python3` 3.9.6 全量 891 个用例通过；CI 覆盖 Python 3.11 / 3.13。
+
 ## [1.4.0] - 2026-11-18
 
 ### Changed

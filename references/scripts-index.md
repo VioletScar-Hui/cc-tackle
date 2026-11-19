@@ -6,7 +6,7 @@
 
 | 脚本 | 一行说明 | 主要参数 |
 | --- | --- | --- |
-| [`account_guard.py`](../scripts/account_guard.py) | 主体：28 项只读体检、确认后加固、显式恢复、HTML 报告 | `--audit`、`--audit --json`、`--audit --save-audit`、`--preflight`、`--fix-auto`、`--yes`（只配 `--fix-auto`）、`--no-browser`、`--verify-browser` / `--webrtc`（兼容保留）、`--check-media`、`--check-locale`、`--install-webrtc-limiter`、`--expected-country`、`--expected-exit-ip`、`--fix-unverified`、`--manual`、`--commands`、`--report`（兼容写法）、`--restore`、`--restore-preview`、`--restore-item` |
+| [`account_guard.py`](../scripts/account_guard.py) | 主体：32 项只读体检、确认后加固、显式恢复、HTML 报告 | `--audit`、`--audit --json`、`--audit --save-audit`、`--preflight`、`--fix-auto`、`--yes`（只配 `--fix-auto`）、`--no-browser`、`--verify-browser` / `--webrtc`（兼容保留）、`--check-media`、`--check-locale`、`--install-webrtc-limiter`、`--expected-country`、`--expected-exit-ip`、`--fix-unverified`、`--manual`、`--commands`、`--report`（兼容写法）、`--restore`、`--restore-preview`、`--restore-item` |
 | [`selfcheck.py`](../scripts/selfcheck.py) | 七项串联自检：技能文件 → 编译 → 单测 → 守护脚本 → Clash → 系统代理 → 完整体检；只读，不出 HTML | `--fast`（跳过单测）、`--no-audit`（跳过体检）、`--no-browser`（不弹复核页，浏览器两项改为未测到） |
 | [`report_html.py`](../scripts/report_html.py) | 把审计 JSON 重渲染成自包含 HTML；页面数字来自 `build_summary`，不在这里另写判定 | `[报告.json]`（默认取最新）、`--out`、`--open` |
 | [`report_serve.py`](../scripts/report_serve.py) | 回环服务 + 页面上的修复按钮；URL 带令牌、POST 需自定义头、动作白名单；空闲自动退出 | `--no-open`、`--timeout`（默认 1800 秒）、`--roots` |
