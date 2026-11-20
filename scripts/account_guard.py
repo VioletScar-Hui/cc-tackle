@@ -3331,45 +3331,75 @@ const fmt = s => s==="denied" ? '<span class="bad">denied（已禁止）</span>'
                : s==="prompt" ? '<span class="warn">prompt（每次询问）</span>'
                : '<span class="warn">'+s+'</span>';
 (async () => {
+  const post = payload => fetch(location.pathname.replace(/\/+$/,"")+"/result",
+    {method:"POST", headers:{"Content-Type":"application/json"},
+     body: JSON.stringify(payload)}).catch(()=>{});
+  // 只回传一次；另外挂一个 15 秒安全网，避免页面卡在某一步时脚本干等 240 秒。
+  let posted = false;
+  const postOnce = p => { if (posted) return; posted = true; clearTimeout(fallback); post(p); };
+  let camState = "unknown", micState = "unknown";
+  const fallback = setTimeout(() => postOnce({
+    camera: camState, microphone: micState, request: "timeout",
+    detail: "页面 15 秒内没拿到结论（大概率是权限弹窗没点）",
+    candidates: [], ips: [], mdns: false, ok: false
+  }), 15000);
+
   const cam = await perm("camera"), mic = await perm("microphone");
+  camState = cam; micState = mic;
   $("cam").innerHTML = fmt(cam); $("mic").innerHTML = fmt(mic);
 
-  let req = "granted", detail = "";
-  try {
-    const s = await navigator.mediaDevices.getUserMedia({audio:true, video:true});
-    s.getTracks().forEach(t => t.stop());
-    detail = "拿到了媒体流";
-  } catch (e) { req = "denied"; detail = e.name; }
-  $("req").innerHTML = req==="denied"
-    ? '<span class="ok">被拒绝</span> <code>'+detail+'</code>'
-    : '<span class="bad">拿到了</span> <code>'+detail+'</code>';
+  let req, detail = "";
+  if (cam === "denied" && mic === "denied") {
+    // 已经明确禁止：不再申请（申请在 prompt 状态下会弹窗，并可能永远等下去）
+    req = "denied"; detail = "permission.state=denied";
+    $("req").innerHTML = '<span class="ok">已禁止（未再申请）</span>';
+  } else if (cam === "prompt" || mic === "prompt") {
+    // 「每次询问」意味着页面一申请就弹窗；没人点就一直等。不要卡住，直接把状态报回去。
+    req = "prompt"; detail = "Chrome 里还是「每次询问」；先设成不允许再复核";
+    $("req").innerHTML = '<span class="warn">还没决定（每次询问）</span>';
+  } else {
+    try {
+      const s = await Promise.race([
+        navigator.mediaDevices.getUserMedia({audio:true, video:true}),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 8000))
+      ]);
+      req = "granted"; detail = "拿到了媒体流";
+      s.getTracks().forEach(t => t.stop());
+    } catch (e) { req = "denied"; detail = e.name || String(e); }
+    $("req").innerHTML = req === "denied"
+      ? '<span class="ok">被拒绝</span> <code>'+detail+'</code>'
+      : '<span class="warn">拿到了</span> <code>'+detail+'</code>';
+  }
 
-  const raw = [];
-  const pc = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
-  pc.onicecandidate = e => { if (e.candidate) raw.push(e.candidate.candidate); };
-  pc.createDataChannel("x");
-  await pc.setLocalDescription(await pc.createOffer());
-  await new Promise(r => setTimeout(r, 5000));
-  pc.close();
-
-  const ips = [];
-  raw.forEach(c => { const m = c.match(/\\b(\\d{1,3}(?:\\.\\d{1,3}){3})\\b/); if (m && !ips.includes(m[1])) ips.push(m[1]); });
-  const mdns = raw.some(c => c.includes(".local"));
+  let raw = [], ips = [], mdns = false;
+  if (req !== "denied") {
+    // 只有真拿到权限（或状态不明）时才做 ICE 探测，避免在「每次询问」下白等。
+    try {
+      const pc = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
+      pc.onicecandidate = e => { if (e.candidate) raw.push(e.candidate.candidate); };
+      pc.createDataChannel("x");
+      await pc.setLocalDescription(await pc.createOffer());
+      await new Promise(r => setTimeout(r, 3000));
+      pc.close();
+    } catch (e) {}
+    raw.forEach(c => { const m = c.match(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/); if (m && !ips.includes(m[1])) ips.push(m[1]); });
+    mdns = raw.some(c => c.includes(".local"));
+  }
   $("ips").innerHTML = ips.length ? '<span class="bad">'+ips.join(", ")+'</span>'
     : '<span class="ok">无'+(mdns?'（候选被 mDNS 混淆成 .local）':'')+'</span>';
 
-  const v = $("verdict");
   const good = req === "denied" && ips.length === 0;
-  v.className = good ? "v-ok" : "v-bad";
-  v.textContent = good
-    ? "✓ 已闭合：拿不到摄像头/麦克风权限，WebRTC 候选里看不到任何真实地址。"
-    : req === "denied"
-      ? "⚠ 权限挡住了但仍出现 IP：" + ips.join(", ") + " —— 这不该发生，请把结果发我。"
+  const v = $("verdict");
+  v.className = good ? "v-ok" : (req === "prompt" ? "v-bad" : "v-bad");
+  v.textContent = req === "denied"
+    ? (ips.length ? "⚠ 权限挡住了但仍出现 IP：" + ips.join(", ") + " —— 这不该发生，请把结果发我。"
+                  : "✓ 已闭合：拿不到摄像头/麦克风权限，WebRTC 候选里看不到任何真实地址。")
+    : req === "prompt"
+      ? "⚠ Chrome 里摄像头/麦克风还是「每次询问」。把它设成「不允许」（chrome://settings/content/camera）后再跑一次，这一项才会判通过。"
       : "✗ 仍能拿到媒体权限，mDNS 混淆会关掉，候选里露出了：" + (ips.join(", ") || "(无)");
 
-  fetch(location.pathname.replace(/\/+$/,"")+"/result", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({camera:cam, microphone:mic, request:req, detail:detail,
-                          candidates:raw, ips:ips, mdns:mdns, ok:good})}).catch(()=>{});
+  postOnce({camera:cam, microphone:mic, request:req, detail:detail,
+            candidates:raw, ips:ips, mdns:mdns, ok:good});
 })();
 </script>"""
 
@@ -3532,6 +3562,13 @@ def verify_media_permission(timeout: int = 240, auto_open: bool = False) -> dict
     print(f"    候选里出现的 IP：{got.get('ips') or '（无）'}")
     if ok:
         print("\n  这表示：网站拿不到摄像头/麦克风权限 → mDNS 混淆一直生效 → WebRTC 不泄漏。")
+    elif got.get("request") == "prompt":
+        print("\n  这表示：Chrome 里摄像头/麦克风还是「每次询问」，复核页一申请就会弹窗并卡住，")
+        print("  所以没能在无授权状态下完成检测。去 Chrome 设置把 127.0.0.1 的摄像头/麦克风")
+        print("  设为「不允许」（chrome://settings/content/camera），再跑一次 --check-media / 体检。")
+    elif got.get("request") == "timeout":
+        print("\n  这表示：复核页 15 秒内没拿到结论，大概率是权限弹窗没点。")
+        print("  处理同上：Chrome 设置 → 隐私和安全 → 网站设置 → 摄像头/麦克风 → 把 127.0.0.1 设成「不允许」。")
     else:
         print("\n  这表示：仍能拿到媒体权限，mDNS 混淆会被关掉，真实内网地址会出现在候选里。")
         print("  修法一：Chrome 设置 → 隐私和安全 → 网站设置 → 摄像头/麦克风 → 不允许网站使用。")
@@ -5175,8 +5212,23 @@ def build_summary(report: dict) -> list:
         # 就是挂着一个已经修好的项。所以先看复核结果。
         mp = load_media_permission()
         media_cache_ok, media_cache_note = cache_is_fresh(mp)
+        mp_request = mp.get("request")
         if wr.get("leaked_public"):
             add("WebRTC 泄漏", S_BAD, f"探测到公网地址：{wr['leaked_public']}")
+            _webrtc_row_done = True
+        elif media_cache_ok and mp_request in ("prompt", "timeout"):
+            # 复核页在「每次询问」状态下会卡在权限弹窗上，拿不到结论。
+            # 这一行不能因此报「未测到」了事——它其实在说「去把权限设成不允许」。
+            if mp_request == "prompt":
+                add("WebRTC 泄漏", S_FIX,
+                    "Chrome 里摄像头/麦克风还是「每次询问」：复核页一申请就会弹窗并卡住，"
+                    "没法在无授权状态下测完。去 Chrome 设置 → 隐私和安全 → 网站设置 → "
+                    "摄像头/麦克风，把 127.0.0.1 设为「不允许」，再跑一轮体检。")
+            else:
+                add("WebRTC 泄漏", S_FIX,
+                    "媒体权限复核页 15 秒内没拿到结论（大概率是权限弹窗没点）。"
+                    "去 Chrome 设置 → 隐私和安全 → 网站设置 → 摄像头/麦克风，"
+                    "把 127.0.0.1 设为「不允许」，再跑一轮体检。")
             _webrtc_row_done = True
         elif mp.get("ok") and media_cache_ok and (tun or media_ips):
             # 探测量的是「拿到媒体权限会怎样」。如果复核页（脚本自己打开的）显示

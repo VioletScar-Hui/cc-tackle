@@ -8333,6 +8333,49 @@ class TestCleanipDerivedChecks(unittest.TestCase):
         self.assertIs(rows["大陆环境特征（估算）"][0], g.S_NA)
         self.assertIn("不会拿上一轮结果顶替", rows["大陆环境特征（估算）"][1])
 
+class TestMediaPermissionPromptState(unittest.TestCase):
+    """Chrome 权限还是「每次询问」时，复核页不能在权限弹窗上干等 240 秒。
+
+    2026-11-20 真机：v1.4.0 改成每轮强制重测之后，媒体复核页一申请媒体权限就被
+    Chrome 弹窗挡住，页面回传不了，体检里 WebRTC 那行只能退化成兜底文案。
+    正确做法是：识别出 prompt / timeout 状态，直接把「去设置里改成不允许」给出来。
+    """
+
+    def _row(self, request: str):
+        report = {"A7_webrtc": {
+            "available": True, "candidates": 1, "mdns": True, "leaked_public": [],
+            "tun_leak": [], "note": "", "browser": "chrome",
+            "with_media": {"tun_leak": ["198.18.0.1"],
+                           "local_ips": [{"ip": "198.18.0.1", "private": False}],
+                           "leaked_public": ["198.18.0.1"]},
+        }}
+        media = {"request": request, "checkedAt": g.now_stamp(),
+                 "openedBy": "script", "profileScope": "Claude",
+                 "camera": "prompt", "microphone": "prompt", "ok": False}
+        with mock.patch.object(g, "load_media_permission", return_value=media), \
+             mock.patch.object(g, "cache_is_fresh", return_value=(True, "")):
+            rows = dict((n, (s, d)) for n, s, d in g.build_summary(report))
+        return rows["WebRTC 泄漏"]
+
+    def test_prompt_state_points_at_chrome_settings(self):
+        status, detail = self._row("prompt")
+        self.assertIs(status, g.S_FIX)
+        self.assertIn("每次询问", detail)
+        self.assertIn("不允许", detail)
+
+    def test_timeout_state_points_at_chrome_settings(self):
+        status, detail = self._row("timeout")
+        self.assertIs(status, g.S_FIX)
+        self.assertIn("没拿到结论", detail)
+
+    def test_page_guards_against_a_hanging_prompt(self):
+        page = g.MEDIA_VERIFY_PAGE
+        self.assertIn("每次询问", page)
+        self.assertIn("chrome://settings/content/camera", page)
+        self.assertIn("postOnce", page)
+        self.assertIn("permission.state=denied", page)
+
+
 if __name__ == "__main__":
     # 这个块必须待在文件最末尾。2026-10-10 发现它一度停在中间（第 2403 行），
     # 于是它后面定义的 6 个类、40 个用例从来没被执行过——`unittest.main()` 在第 2403
